@@ -1,0 +1,26 @@
+# Nginx reverse proxy for the Mentimeter clone backend.
+# Copy to /etc/nginx/sites-available/mentimeter on the VM, replace
+# YOUR_DOMAIN, symlink into sites-enabled, then run certbot (see DEPLOY.md).
+#
+# The `Upgrade`/`Connection` headers are required for Socket.IO's WebSocket
+# transport to work through the proxy — without them it silently falls back
+# to (slower, flakier) HTTP long-polling or fails outright.
+
+server {
+    listen 80;
+    server_name YOUR_DOMAIN;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout 60s;
+    }
+}

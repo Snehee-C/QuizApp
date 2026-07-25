@@ -1,0 +1,80 @@
+// Prisma schema — Postgres (local dev via docker-compose.yml, production on
+// the Oracle Cloud VM). Note: we use String for "enum" fields and
+// JSON-as-String rather than native Json/enum types, mainly a holdover from
+// when this also ran on SQLite — kept as-is since it still works fine and
+// avoids a data-shape migration.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(cuid())
+  email         String         @unique
+  passwordHash  String
+  name          String
+  createdAt     DateTime       @default(now())
+  presentations Presentation[]
+}
+
+model Presentation {
+  id        String    @id @default(cuid())
+  ownerId   String
+  owner     User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title     String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  slides    Slide[]
+  sessions  Session[]
+}
+
+model Slide {
+  id             String       @id @default(cuid())
+  presentationId String
+  presentation   Presentation @relation(fields: [presentationId], references: [id], onDelete: Cascade)
+  order          Int
+  // type: MULTIPLE_CHOICE | WORD_CLOUD | SCALE | OPEN_ENDED
+  type           String
+  question       String
+  // config: JSON string, e.g. {"options":["A","B"],"allowMultiple":false,"scaleMin":1,"scaleMax":5}
+  config         String       @default("{}")
+  responses      Response[]
+
+  @@index([presentationId])
+}
+
+model Session {
+  id             String       @id @default(cuid())
+  presentationId String
+  presentation   Presentation @relation(fields: [presentationId], references: [id], onDelete: Cascade)
+  joinCode       String       @unique
+  // status: LOBBY | ACTIVE | ENDED
+  status         String       @default("LOBBY")
+  currentSlideId String?
+  startedAt      DateTime     @default(now())
+  responses      Response[]
+}
+
+model Response {
+  id            String   @id @default(cuid())
+  sessionId     String
+  session       Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  slideId       String
+  slide         Slide    @relation(fields: [slideId], references: [id], onDelete: Cascade)
+  participantId String
+  // value: JSON string, shape depends on slide type
+  value         String
+  // quiz scoring (only meaningful when the slide is a quiz question)
+  correct       Boolean  @default(false)
+  points        Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  // one response per participant per slide (per session)
+  @@unique([sessionId, slideId, participantId])
+  @@index([sessionId, slideId])
+}
