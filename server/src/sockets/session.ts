@@ -70,10 +70,17 @@ async function computeLeaderboard(s: LiveSession, limit = 10) {
 // any scores exist yet, for showing the leaderboard button at all). It does
 // NOT make the leaderboard visible to participants; that's a separate,
 // explicit show/hide broadcast below, so everyone sees it at the same time.
-async function sendLeaderboardToPresenter(io: Server, s: LiveSession) {
+// Takes already-computed entries so callers that just ran computeLeaderboard
+// (e.g. to grade a submission) don't pay for a second identical query.
+function sendLeaderboardToPresenter(io: Server, s: LiveSession, entries: LeaderboardEntryRow[]) {
   if (!s.presenterSocketId) return;
-  const { entries } = await computeLeaderboard(s);
   io.to(s.presenterSocketId).emit("leaderboard:updated", { entries });
+}
+
+interface LeaderboardEntryRow {
+  participantId: string;
+  name: string;
+  score: number;
 }
 
 export function registerSessionHandlers(io: Server, socket: Socket) {
@@ -157,7 +164,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
 
     // push existing results for the new slide (in case of late reveal)
     if (slide) await emitResults(io, joinCode, slide.id);
-    await sendLeaderboardToPresenter(io, s);
+    const { entries } = await computeLeaderboard(s);
+    sendLeaderboardToPresenter(io, s, entries);
 
     cb?.({ ok: true, index: s.currentIndex, currentSlide: slide });
   }
@@ -275,10 +283,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     await emitResults(io, joinCode, slideId);
 
     if (slide.config?.isQuiz) {
-      const { fullEntries } = await computeLeaderboard(s);
+      // Single leaderboard query, reused for both this participant's ack and
+      // the presenter's live view — was previously computed twice per submit.
+      const { entries, fullEntries } = await computeLeaderboard(s);
       const rank = fullEntries.findIndex((e) => e.participantId === participantId) + 1;
       const totalScore = fullEntries.find((e) => e.participantId === participantId)?.score ?? 0;
-      await sendLeaderboardToPresenter(io, s);
+      sendLeaderboardToPresenter(io, s, entries);
       cb?.({ ok: true, isQuiz: true, correct: graded.correct, points: graded.points, totalScore, rank });
     } else {
       cb?.({ ok: true, isQuiz: false });
