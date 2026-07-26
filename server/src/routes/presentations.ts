@@ -105,10 +105,14 @@ presentationsRouter.patch("/:id/slides/:slideId", async (req: AuthedRequest, res
   if (type !== undefined && VALID_TYPES.includes(type)) data.type = type;
   if (config !== undefined) data.config = JSON.stringify(config);
 
-  const slide = await prisma.slide.update({
-    where: { id: req.params.slideId },
+  // Scope the write to this presentation so a slideId belonging to someone
+  // else's presentation can't be edited by passing your own :id.
+  const result = await prisma.slide.updateMany({
+    where: { id: req.params.slideId, presentationId: req.params.id },
     data,
   });
+  if (result.count === 0) return res.status(404).json({ error: "Not found" });
+  const slide = await prisma.slide.findUnique({ where: { id: req.params.slideId } });
   res.json(slide);
 });
 
@@ -116,7 +120,10 @@ presentationsRouter.patch("/:id/slides/:slideId", async (req: AuthedRequest, res
 presentationsRouter.delete("/:id/slides/:slideId", async (req: AuthedRequest, res) => {
   const owned = await assertOwnedPresentation(req.auth!.userId, req.params.id);
   if (!owned) return res.status(404).json({ error: "Not found" });
-  await prisma.slide.delete({ where: { id: req.params.slideId } });
+  const result = await prisma.slide.deleteMany({
+    where: { id: req.params.slideId, presentationId: req.params.id },
+  });
+  if (result.count === 0) return res.status(404).json({ error: "Not found" });
   res.json({ ok: true });
 });
 
@@ -125,6 +132,16 @@ presentationsRouter.post("/:id/slides/reorder", async (req: AuthedRequest, res) 
   const owned = await assertOwnedPresentation(req.auth!.userId, req.params.id);
   if (!owned) return res.status(404).json({ error: "Not found" });
   const order: string[] = req.body?.order ?? [];
+  // Only reorder slides that actually belong to this presentation — reject if
+  // the request references any foreign slideId.
+  const ownedSlides = await prisma.slide.findMany({
+    where: { presentationId: req.params.id },
+    select: { id: true },
+  });
+  const ownedIds = new Set(ownedSlides.map((s) => s.id));
+  if (!order.every((slideId) => ownedIds.has(slideId))) {
+    return res.status(400).json({ error: "Invalid slide in order" });
+  }
   await prisma.$transaction(
     order.map((slideId, idx) =>
       prisma.slide.update({ where: { id: slideId }, data: { order: idx } })

@@ -105,11 +105,11 @@ export default function Present() {
   // presenter's own screen.
   function showLeaderboard() {
     setViewMode("leaderboard");
-    getSocket().emit("presenter:show-leaderboard", { joinCode: joinCodeRef.current }, () => {});
+    getSocket().emit("presenter:show-leaderboard", { joinCode: joinCodeRef.current, token: getToken() }, () => {});
   }
   function hideLeaderboard() {
     setViewMode("question");
-    getSocket().emit("presenter:hide-leaderboard", { joinCode: joinCodeRef.current }, () => {});
+    getSocket().emit("presenter:hide-leaderboard", { joinCode: joinCodeRef.current, token: getToken() }, () => {});
   }
 
   function next() {
@@ -120,20 +120,20 @@ export default function Present() {
       return;
     }
     setViewMode("question");
-    getSocket().emit("presenter:next", { joinCode: joinCodeRef.current }, () => {});
+    getSocket().emit("presenter:next", { joinCode: joinCodeRef.current, token: getToken() }, () => {});
   }
   function prev() {
     if (viewMode === "leaderboard") {
       hideLeaderboard();
       return;
     }
-    getSocket().emit("presenter:prev", { joinCode: joinCodeRef.current }, () => {});
+    getSocket().emit("presenter:prev", { joinCode: joinCodeRef.current, token: getToken() }, () => {});
   }
   function start() {
-    getSocket().emit("presenter:goto", { joinCode: joinCodeRef.current, index: 0 }, () => {});
+    getSocket().emit("presenter:goto", { joinCode: joinCodeRef.current, index: 0, token: getToken() }, () => {});
   }
   function endSession() {
-    getSocket().emit("presenter:end", { joinCode: joinCodeRef.current }, (res: any) => {
+    getSocket().emit("presenter:end", { joinCode: joinCodeRef.current, token: getToken() }, (res: any) => {
       setFinalEntries(res?.entries ?? []);
     });
   }
