@@ -1,9 +1,21 @@
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import { prisma } from "../db.js";
 import { signToken } from "../auth.js";
 
 export const authRouter = Router();
+
+// Throttle auth endpoints per IP to blunt credential stuffing / brute force on
+// login and mass account creation on signup.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Try again later." },
+});
+authRouter.use(authLimiter);
 
 authRouter.post("/signup", async (req, res) => {
   const { email, password, name } = req.body ?? {};

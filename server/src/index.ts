@@ -9,10 +9,22 @@ import { sessionsRouter } from "./routes/sessions.js";
 import { registerSessionHandlers } from "./sockets/session.js";
 
 const PORT = Number(process.env.PORT) || 3000;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
+
+// Restrict cross-origin access to the configured client origin(s). CLIENT_ORIGIN
+// may be a comma-separated list (e.g. prod GitHub Pages + a staging origin).
+// When unset (local dev), fall back to reflecting any origin so LAN/phone
+// testing keeps working.
+const allowedOrigins = process.env.CLIENT_ORIGIN
+  ? process.env.CLIENT_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean)
+  : null;
+const corsOrigin: boolean | string[] = allowedOrigins ?? true;
 
 const app = express();
-app.use(cors({ origin: true }));
+// Render (and most PaaS) put the app behind a reverse proxy, so the client IP
+// is in X-Forwarded-For. Trust one proxy hop so req.ip is accurate for rate
+// limiting.
+app.set("trust proxy", 1);
+app.use(cors({ origin: corsOrigin }));
 app.use(express.json());
 
 app.get("/api/health", (_req, res) => {
@@ -25,7 +37,7 @@ app.use("/api/sessions", sessionsRouter);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: true },
+  cors: { origin: corsOrigin },
 });
 
 io.on("connection", (socket) => {

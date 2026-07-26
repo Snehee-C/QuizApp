@@ -20,6 +20,41 @@ interface LiveSession {
 
 const live = new Map<string, LiveSession>();
 
+// Throttle join-code guessing: the 6-digit space is only 900k, so an attacker
+// could enumerate live sessions. Track failed join attempts per client IP in a
+// sliding window and reject once too many pile up.
+const JOIN_WINDOW_MS = 60_000;
+const JOIN_MAX_FAILURES = 10;
+const joinFailures = new Map<string, { count: number; resetAt: number }>();
+
+function tooManyJoinFailures(ip: string): boolean {
+  const rec = joinFailures.get(ip);
+  return !!rec && Date.now() < rec.resetAt && rec.count >= JOIN_MAX_FAILURES;
+}
+
+function recordJoinFailure(ip: string) {
+  const now = Date.now();
+  const rec = joinFailures.get(ip);
+  if (!rec || now >= rec.resetAt) {
+    joinFailures.set(ip, { count: 1, resetAt: now + JOIN_WINDOW_MS });
+  } else {
+    rec.count++;
+  }
+}
+
+// socket.handshake.address is the raw TCP peer, which behind a reverse proxy
+// (Render, nginx, ...) is the proxy itself — the SAME for every client, so the
+// throttle above would apply globally instead of per-client. Engine.IO does not
+// honor Express's `trust proxy`, so we read the forwarded header ourselves,
+// taking the left-most (original client) hop. Falls back to the peer address
+// locally where no proxy sets the header.
+function clientIp(socket: Socket): string {
+  const xff = socket.handshake.headers["x-forwarded-for"];
+  const forwarded = Array.isArray(xff) ? xff[0] : xff;
+  const first = forwarded?.split(",")[0]?.trim();
+  return first || socket.handshake.address || "unknown";
+}
+
 function genJoinCode(): string {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
@@ -84,6 +119,25 @@ interface LeaderboardEntryRow {
 }
 
 export function registerSessionHandlers(io: Server, socket: Socket) {
+  // Authorize a presenter command: the caller must supply a valid token whose
+  // user owns this session. The join code alone is NOT sufficient — it's shown
+  // on screen to every participant. On success we also refresh presenterSocketId
+  // so presenter-only pushes (e.g. leaderboard:updated) survive a reconnect.
+  function requirePresenter(payload: any, cb?: Function): LiveSession | null {
+    const s = payload?.joinCode ? live.get(payload.joinCode) : undefined;
+    if (!s) {
+      cb?.({ error: "Session not found" });
+      return null;
+    }
+    const auth = payload?.token ? verifyToken(payload.token) : null;
+    if (!auth || auth.userId !== s.ownerId) {
+      cb?.({ error: "Unauthorized" });
+      return null;
+    }
+    s.presenterSocketId = socket.id;
+    return s;
+  }
+
   // ---- Presenter: create a live session from a presentation ----
   socket.on("presenter:create-session", async ({ token, presentationId }, cb) => {
     const auth = token ? verifyToken(token) : null;
@@ -139,10 +193,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   });
 
   // ---- Presenter: navigate slides (used by goto / next / prev) ----
-  async function goto(joinCode: string, index: number, cb?: Function) {
-    const s = live.get(joinCode);
-    if (!s) return cb?.({ error: "Session not found" });
-
+  // Callers must authorize via requirePresenter and pass the resolved session.
+  async function goto(s: LiveSession, joinCode: string, index: number, cb?: Function) {
     const clamped = Math.max(-1, Math.min(index, s.slides.length - 1));
     s.currentIndex = clamped;
     s.status = clamped < 0 ? "LOBBY" : "ACTIVE";
@@ -170,24 +222,28 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     cb?.({ ok: true, index: s.currentIndex, currentSlide: slide });
   }
 
-  socket.on("presenter:goto", ({ joinCode, index }, cb) => goto(joinCode, index, cb));
+  socket.on("presenter:goto", (args, cb) => {
+    const s = requirePresenter(args, cb);
+    if (!s) return;
+    goto(s, args.joinCode, args.index, cb);
+  });
 
   socket.on("presenter:next", (args, cb) => {
-    const s = live.get(args?.joinCode);
-    if (!s) return cb?.({ error: "Session not found" });
-    goto(args.joinCode, s.currentIndex + 1, cb);
+    const s = requirePresenter(args, cb);
+    if (!s) return;
+    goto(s, args.joinCode, s.currentIndex + 1, cb);
   });
 
   socket.on("presenter:prev", (args, cb) => {
-    const s = live.get(args?.joinCode);
-    if (!s) return cb?.({ error: "Session not found" });
-    goto(args.joinCode, s.currentIndex - 1, cb);
+    const s = requirePresenter(args, cb);
+    if (!s) return;
+    goto(s, args.joinCode, s.currentIndex - 1, cb);
   });
 
   // ---- Presenter: request the current leaderboard on demand ----
-  socket.on("presenter:get-leaderboard", async ({ joinCode }, cb) => {
-    const s = live.get(joinCode);
-    if (!s) return cb?.({ error: "Session not found" });
+  socket.on("presenter:get-leaderboard", async (args, cb) => {
+    const s = requirePresenter(args, cb);
+    if (!s) return;
     const { entries } = await computeLeaderboard(s);
     cb?.({ ok: true, entries });
   });
@@ -195,24 +251,25 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   // ---- Presenter: reveal / hide the leaderboard for EVERYONE (presenter +
   // participants) at the same moment — this is what makes it a shared
   // "big screen" moment instead of presenter-only data. ----
-  socket.on("presenter:show-leaderboard", async ({ joinCode }, cb) => {
-    const s = live.get(joinCode);
-    if (!s) return cb?.({ error: "Session not found" });
+  socket.on("presenter:show-leaderboard", async (args, cb) => {
+    const s = requirePresenter(args, cb);
+    if (!s) return;
     const { entries } = await computeLeaderboard(s);
-    io.to(joinCode).emit("leaderboard:show", { entries });
+    io.to(args.joinCode).emit("leaderboard:show", { entries });
     cb?.({ ok: true, entries });
   });
 
-  socket.on("presenter:hide-leaderboard", ({ joinCode }, cb) => {
-    const s = live.get(joinCode);
-    if (!s) return cb?.({ error: "Session not found" });
-    io.to(joinCode).emit("leaderboard:hide", {});
+  socket.on("presenter:hide-leaderboard", (args, cb) => {
+    const s = requirePresenter(args, cb);
+    if (!s) return;
+    io.to(args.joinCode).emit("leaderboard:hide", {});
     cb?.({ ok: true });
   });
 
-  socket.on("presenter:end", async ({ joinCode }, cb) => {
-    const s = live.get(joinCode);
-    if (!s) return cb?.({ error: "Session not found" });
+  socket.on("presenter:end", async (args, cb) => {
+    const s = requirePresenter(args, cb);
+    if (!s) return;
+    const joinCode = args.joinCode;
     s.status = "ENDED";
     await prisma.session.update({ where: { id: s.sessionId }, data: { status: "ENDED" } });
     const { entries } = await computeLeaderboard(s);
@@ -222,8 +279,15 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
 
   // ---- Participant: join by code ----
   socket.on("participant:join", ({ joinCode, participantId, name }, cb) => {
+    const ip = clientIp(socket);
+    if (tooManyJoinFailures(ip)) {
+      return cb?.({ error: "Too many attempts. Try again in a minute." });
+    }
     const s = live.get(joinCode);
-    if (!s) return cb?.({ error: "Invalid code" });
+    if (!s) {
+      recordJoinFailure(ip);
+      return cb?.({ error: "Invalid code" });
+    }
     if (s.status === "ENDED") return cb?.({ error: "Session has ended" });
 
     socket.join(joinCode);
@@ -252,6 +316,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     const s = live.get(joinCode);
     if (!s) return cb?.({ error: "Session not found" });
     if (s.status === "ENDED") return cb?.({ error: "Session has ended" });
+    // Bind the answer to the connection that joined: a socket can only submit
+    // as the participantId it joined with, so one student can't overwrite
+    // another's answer or inject leaderboard scores under an arbitrary id.
+    if (socket.data.role !== "participant" || socket.data.participantId !== participantId) {
+      return cb?.({ error: "Join the session before submitting" });
+    }
     const slide = s.slides.find((x) => x.id === slideId);
     if (!slide) return cb?.({ error: "Slide not found" });
 
