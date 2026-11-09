@@ -23,14 +23,30 @@ model User {
 }
 
 model Presentation {
-  id        String    @id @default(cuid())
-  ownerId   String
-  owner     User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
-  title     String
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  slides    Slide[]
-  sessions  Session[]
+  id         String    @id @default(cuid())
+  ownerId    String
+  owner      User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title      String
+  // Stage palette key, resolved client-side against lib/themes.ts.
+  theme      String    @default("floodlight")
+  // Templates are decks a user can clone into a new deck of their own.
+  isTemplate Boolean   @default(false)
+  // PRESENTER = host drives the deck. AUDIENCE = each participant moves at
+  // their own pace through the slides.
+  pacing     String    @default("PRESENTER")
+  // off | mask | block — how participant-authored text is treated before it
+  // reaches the projected screen.
+  filterMode String    @default("mask")
+  // Multiplies every quiz countdown. Time pressure is a known barrier for
+  // dyslexic and ADHD players (DESIGN.md §6), so a host can lengthen it for
+  // the whole deck without editing each slide.
+  timeScale  Float     @default(1.0)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  slides     Slide[]
+  sessions   Session[]
+
+  @@index([isTemplate])
 }
 
 model Slide {
@@ -43,6 +59,23 @@ model Slide {
   question       String
   // config: JSON string, e.g. {"options":["A","B"],"allowMultiple":false,"scaleMin":1,"scaleMax":5}
   config         String       @default("{}")
+  // Speaker notes — never sent to participants.
+  notes          String       @default("")
+  // Slides are soft-deleted, never removed. A Response points at the slide it
+  // answered, so a real DELETE cascaded straight through the finished
+  // sessions' rows: deleting one slide from a deck in the editor silently
+  // rewrote the history, the standings and the CSV export of every session
+  // ever run from that deck. A deck is an editable, living document; a session
+  // is a permanent record of something that already happened, and an edit to
+  // the former must not reach back into the latter.
+  //
+  // So removal is a tombstone: the row stays for the responses that depend on
+  // it, and EVERY read that lists slides (editor, deck export, duplicate,
+  // create-session, reconcile) filters on `deletedAt: null`, so a deleted
+  // slide is gone from the editor and unreachable in any future session.
+  // History and CSV deliberately do NOT filter — resolving a tombstone is the
+  // whole point.
+  deletedAt      DateTime?
   responses      Response[]
 
   @@index([presentationId])
@@ -57,7 +90,44 @@ model Session {
   status         String       @default("LOBBY")
   currentSlideId String?
   startedAt      DateTime     @default(now())
+  // Set when the host ends the session, so history can show real durations
+  // and distinguish a finished run from one that was abandoned.
+  endedAt        DateTime?
   responses      Response[]
+  questions      Question[]
+
+  @@index([presentationId, startedAt])
+}
+
+// Audience Q&A: questions are asked by participants, upvoted by the room, and
+// moderated by the host before they reach the big screen.
+model Question {
+  id            String         @id @default(cuid())
+  sessionId     String
+  session       Session        @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  participantId String
+  authorName    String         @default("Anonymous")
+  text          String
+  // PENDING -> APPROVED -> ANSWERED, or HIDDEN. Only APPROVED/ANSWERED are
+  // ever shown on the projected screen.
+  status        String         @default("PENDING")
+  createdAt     DateTime       @default(now())
+  votes         QuestionVote[]
+
+  @@index([sessionId, status])
+}
+
+// One row per (question, participant) so a vote is idempotent and the count is
+// derived rather than a mutable counter that can drift.
+model QuestionVote {
+  id            String   @id @default(cuid())
+  questionId    String
+  question      Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  participantId String
+  createdAt     DateTime @default(now())
+
+  @@unique([questionId, participantId])
+  @@index([questionId])
 }
 
 model Response {
@@ -65,10 +135,32 @@ model Response {
   sessionId     String
   session       Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   slideId       String
+  // The cascade stays, but it now has exactly one reachable caller: deleting
+  // the whole Presentation, which also cascades away the Sessions these rows
+  // belong to — there is no record left to orphan, so the responses should go
+  // too. Removing a single slide no longer deletes the row (see
+  // Slide.deletedAt); nothing in the codebase calls slide.delete any more, and
+  // nothing should.
   slide         Slide    @relation(fields: [slideId], references: [id], onDelete: Cascade)
   participantId String
   // value: JSON string, shape depends on slide type
   value         String
+  // The question AS ASKED, frozen at submit time. The slide row is mutable —
+  // the host can retitle a question, swap its options or change its type long
+  // after the session is over — and the export renders `value` THROUGH the
+  // slide's type and config (a MULTIPLE_CHOICE answer is stored as an option
+  // index, so re-labelled options silently relabel last term's answers). A
+  // live session already serves the snapshot it started with rather than the
+  // current row, so the permanent record has to be frozen the same way or the
+  // CSV disagrees with what the room was actually looking at.
+  //
+  // Nullable because rows written before this existed have no snapshot; the
+  // export falls back to the live slide for those, which is the behaviour they
+  // already had. Duplicating a few hundred bytes per response is the price of
+  // a record that is readable on its own terms.
+  slideQuestion String?
+  slideType     String?
+  slideConfig   String?
   // quiz scoring (only meaningful when the slide is a quiz question)
   correct       Boolean  @default(false)
   points        Int      @default(0)

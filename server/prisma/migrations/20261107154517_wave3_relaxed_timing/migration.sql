@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Presentation" ADD COLUMN     "timeScale" DOUBLE PRECISION NOT NULL DEFAULT 1.0;

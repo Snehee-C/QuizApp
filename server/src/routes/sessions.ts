@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../db.js";
 import { requireAuth, type AuthedRequest } from "../auth.js";
+import { formatForExport } from "../slides/registry.js";
 
 export const sessionsRouter = Router();
 
@@ -21,11 +22,22 @@ sessionsRouter.get("/:sessionId/export", async (req: AuthedRequest, res) => {
 
   const rows = [["Slide Question", "Slide Type", "Participant", "Answer", "Submitted At"]];
   for (const r of session.responses) {
+    // Read the question as it was ASKED, not as the deck reads today. A
+    // session is a record of something that already happened; the slide row is
+    // a living document the host keeps editing, and `value` is only meaningful
+    // through the type and config it was answered under (a MULTIPLE_CHOICE
+    // answer is an option index — re-label the options and every past export
+    // starts reporting a different answer). The deliberate join on `slide` is
+    // the fallback for rows written before the snapshot columns existed, and
+    // it is also why the export must NOT filter `deletedAt`: a deleted slide
+    // is exactly the one whose responses we still have to name.
+    const type = r.slideType ?? r.slide.type;
+    const config = r.slideConfig ?? r.slide.config;
     rows.push([
-      r.slide.question,
-      r.slide.type,
+      r.slideQuestion ?? r.slide.question,
+      type,
       r.participantId,
-      formatValue(r.value),
+      formatForExport(type, safeParse(config), safeParse(r.value)),
       r.createdAt.toISOString(),
     ]);
   }
@@ -39,10 +51,9 @@ sessionsRouter.get("/:sessionId/export", async (req: AuthedRequest, res) => {
   res.send(csv);
 });
 
-function formatValue(raw: string): string {
+function safeParse(raw: string): any {
   try {
-    const v = JSON.parse(raw);
-    return Array.isArray(v) ? v.join("; ") : String(v);
+    return JSON.parse(raw);
   } catch {
     return raw;
   }
