@@ -117,12 +117,42 @@ export default function History() {
     <div className="min-h-[100dvh] bg-canvas text-ink">
       <header className="sticky top-0 z-20 bg-canvas/80 backdrop-blur border-b border-hairline">
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
-          <Link to="/" className="font-display font-bold text-title3">
-            Floodlight
-          </Link>
-          <Link to="/dashboard">
-            <Button variant="ghost" size="sm">
-              Back to decks
+          {/* A trail, not a single door.
+
+              A deck's history sits under that deck, which sits under Decks —
+              but the one control here used to be "Back to decks", which threw
+              a host who arrived from the editor two levels up and left them to
+              find their way back in. Reaching this page from two places
+              (the editor and the dashboard) means a single "back" cannot be
+              right for both; naming the whole path is right for both, and it
+              also answers "where am I" without anyone having to press
+              anything (NN/g: recognition over recall). */}
+          <nav aria-label="Breadcrumb" className="min-w-0 flex items-center gap-2 text-subhead">
+            <Link
+              to="/dashboard"
+              className="shrink-0 text-ink-subtle hover:text-ink transition-colors duration-fast rounded-xs outline-none focus-visible:shadow-focus"
+            >
+              Decks
+            </Link>
+            <span className="text-ink-subtle shrink-0" aria-hidden="true">
+              /
+            </span>
+            <Link
+              to={id ? `/edit/${id}` : "/dashboard"}
+              className="min-w-0 truncate text-ink-subtle hover:text-ink transition-colors duration-fast rounded-xs outline-none focus-visible:shadow-focus"
+            >
+              {title ?? "Deck"}
+            </Link>
+            <span className="text-ink-subtle shrink-0" aria-hidden="true">
+              /
+            </span>
+            <span className="shrink-0 font-semibold text-ink" aria-current="page">
+              History
+            </span>
+          </nav>
+          <Link to={id ? `/present/${id}` : "/dashboard"} className="shrink-0">
+            <Button variant="secondary" size="sm">
+              Present
             </Button>
           </Link>
         </div>
@@ -130,10 +160,11 @@ export default function History() {
 
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="mb-7">
+          {/* The deck's name is in the breadcrumb above; repeating it here
+              would be two spellings of the same fact (DESIGN.md P1). */}
           <h1 className="font-display text-large-title font-bold leading-none">
             Session history
           </h1>
-          {title && <p className="text-ink-subtle text-subhead mt-2 truncate">{title}</p>}
         </div>
 
         {loading && <p className="text-ink-subtle">Loading…</p>}

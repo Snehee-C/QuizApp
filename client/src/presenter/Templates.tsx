@@ -52,7 +52,11 @@ export default function Templates() {
     <div className="min-h-[100dvh] bg-canvas text-ink">
       <header className="sticky top-0 z-20 bg-canvas/80 backdrop-blur border-b border-hairline">
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
-          <Link to="/" className="font-display font-bold text-title3">
+          {/* Inside the app, a wordmark means "home" and home is the deck
+              list — not the marketing page, which is where this pointed from
+              every signed-in screen. Clicking a logo should never log you out
+              of the feeling of being in the product. */}
+          <Link to="/dashboard" className="font-display font-bold text-title3">
             Floodlight
           </Link>
           <Link to="/dashboard">

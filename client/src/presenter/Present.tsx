@@ -26,6 +26,7 @@ import { FitText } from "../components/ui/FitText";
 import { Button } from "../components/ui/Button";
 import { SoundToggle } from "../components/ui/SoundToggle";
 import { initSound, playSound } from "../lib/sound";
+import { clearPresenting, markPresenting } from "../lib/liveSession";
 import { burstAt, burstFrom } from "../lib/confetti";
 
 interface CurrentSlide {
@@ -118,6 +119,12 @@ export default function Present() {
     function adoptSession(res: any) {
       setJoinCode(res.joinCode);
       joinCodeRef.current = res.joinCode;
+      // The trail back. Written here rather than at the exit, because the
+      // exits we care about are the ones we do not control: browser Back, a
+      // bookmark, a reload, a host who alt-tabs to the editor in another tab.
+      // Adopting a session is the one moment every one of those paths has
+      // already passed through (lib/liveSession.ts).
+      if (id && res.joinCode) markPresenting(id, res.joinCode);
       if (res.sessionId) setSessionId(res.sessionId);
       setStatus(res.status);
       setIndex(res.index ?? res.currentIndex ?? -1);
@@ -356,6 +363,12 @@ export default function Present() {
 
   function endSession() {
     getSocket().emit("presenter:end", { joinCode: joinCodeRef.current, token: getToken() }, (res: any) => {
+      // The room is gone, so the trail back to it must go too — otherwise the
+      // editor greets the host with "you're presenting this deck" pointing at
+      // a session that just died. LiveRoomBar re-checks with the server and
+      // would stay silent anyway; clearing here saves it the round trip and
+      // keeps the crumb honest.
+      clearPresenting();
       setFinalEntries(res?.entries ?? []);
     });
   }
@@ -461,7 +474,21 @@ export default function Present() {
   if (finalEntries) {
     return (
       <div ref={rootRef} className="contents">
-        <FinalResults entries={finalEntries} onBack={() => navigate("/dashboard")} />
+        <FinalResults
+          entries={finalEntries}
+          canExport={!!sessionId}
+          onExport={exportCsv}
+          onAgain={() => {
+            // A finished session cannot be revived, so "again" means a new
+            // one — and a new one must be minted by the same hard-won path a
+            // cold load takes (resume-session first, create only if nothing
+            // is live). Reloading this route runs that path exactly as
+            // written instead of growing a second spelling of it beside it.
+            window.location.reload();
+          }}
+          onEdit={() => navigate(`/edit/${id}`)}
+          onBack={() => navigate("/dashboard")}
+        />
       </div>
     );
   }
@@ -571,6 +598,11 @@ export default function Present() {
       <ControlBar
         status={status}
         stage={stage}
+        // The room survives this: the server holds the session and
+        // presenter:resume-session re-attaches when the host comes back. The
+        // editor shows a LiveRoomBar for exactly this crumb, so the door is
+        // visible from both sides.
+        onEditDeck={() => navigate(`/edit/${id}`)}
         onToggleStage={toggleStage}
         onFullscreen={toggleFullscreen}
         onStart={start}
@@ -780,6 +812,7 @@ function QuestionStage({
 function ControlBar(props: {
   status: string;
   stage: Stage;
+  onEditDeck: () => void;
   onToggleStage: () => void;
   onFullscreen: () => void;
   onStart: () => void;
@@ -832,6 +865,23 @@ function ControlBar(props: {
           backdropFilter: "blur(16px)",
         }}
       >
+        {/* The way OUT, and the first thing in the bar because that is where
+            every system on earth puts "back" (Jakob's Law) and because a
+            corner-adjacent target is the cheapest one to hit.
+            
+            Before this, the presenter view had nine buttons and no door: the
+            only exits were the browser's Back button — invisible in
+            fullscreen, which is where a projector lives — and "End", which
+            destroys the room. A host who wanted to fix a typo had to choose
+            between an invisible control and an irreversible one. It is
+            deliberately NOT spelled "← Back": that arrow already means "the
+            previous slide" two buttons along, and one glyph cannot mean two
+            different journeys in the same bar (DESIGN.md P1). */}
+        <Button variant="ghost" size="md" onClick={props.onEditDeck} title="The room stays open">
+          Edit deck
+        </Button>
+        <span className="w-px h-6 bg-hairline mx-1" aria-hidden="true" />
+
         {props.status === "LOBBY" ? (
           <Button variant="primary" size="lg" disabled={!props.canStart} onClick={props.onStart}>
             Start
@@ -891,11 +941,45 @@ function ControlBar(props: {
         <Button variant="ghost" size="md" onClick={props.onExport}>
           Export
         </Button>
-        <Button variant="danger" size="md" onClick={props.onEnd}>
-          End
-        </Button>
+        <EndButton onEnd={props.onEnd} />
       </div>
     </motion.footer>
+  );
+}
+
+// Ending a session is irreversible, kicks every phone in the room out of the
+// game, and sat one pixel away from "Export" in a row of identically-sized
+// ghost buttons. One mis-click in front of an audience and the room is gone
+// with no undo — the single worst thing a stray press can do in this product.
+//
+// The confirmation is INLINE rather than a window.confirm() for two reasons
+// specific to this surface: a native dialog drops the browser out of
+// fullscreen on some engines (so the projector flashes desktop at the room),
+// and it is rendered by the OS at OS size, which is not a size this stage
+// controls. A button that asks again in place does neither.
+//
+// It disarms itself after four seconds. A confirmation left armed is a trap of
+// its own: a host who walked away and came back would find "Sure?" sitting
+// where "End" used to be, and press it believing it is the first press.
+function EndButton({ onEnd }: { onEnd: () => void }) {
+  const [armed, setArmed] = useState(false);
+
+  useEffect(() => {
+    if (!armed) return;
+    const t = window.setTimeout(() => setArmed(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [armed]);
+
+  return (
+    <Button
+      variant="danger"
+      size="md"
+      onClick={() => (armed ? onEnd() : setArmed(true))}
+      aria-live="polite"
+      title={armed ? "Press again to end the session for everyone" : "End the session"}
+    >
+      {armed ? "End for everyone?" : "End"}
+    </Button>
   );
 }
 
@@ -903,9 +987,17 @@ function ControlBar(props: {
 // floods the screen (DESIGN.md §5).
 function FinalResults({
   entries,
+  canExport,
+  onExport,
+  onAgain,
+  onEdit,
   onBack,
 }: {
   entries: LeaderboardEntry[];
+  canExport: boolean;
+  onExport: () => void;
+  onAgain: () => void;
+  onEdit: () => void;
   onBack: () => void;
 }) {
   useEffect(() => {
@@ -937,9 +1029,38 @@ function FinalResults({
       ) : (
         <p className="relative z-10 text-stage-name text-ink-muted">No quiz scores in this session.</p>
       )}
-      <Button variant="secondary" size="lg" onClick={onBack} className="relative z-10">
-        Back to dashboard
-      </Button>
+      {/* Four doors, because this screen used to have one and it led away
+          from everything the host actually wanted next.
+          
+          The three most likely next moves — run it for the group waiting
+          outside, take the data, fix the question that confused everyone —
+          each cost a trip out to the dashboard and back in: 3 clicks to reach
+          an Export button that had been on screen one press earlier, 2 to
+          start the deck again. An ending is where the next thing begins; a
+          screen that only offers "leave" treats it as a full stop.
+          
+          All four are quiet. The winner's colour is the subject here
+          (DESIGN.md §5) and a row of accent buttons underneath would argue
+          with it — these are chrome at the edge of a celebration, not the
+          celebration. */}
+      <div className="relative z-10 flex flex-wrap items-center justify-center gap-2.5">
+        <Button variant="secondary" size="lg" onClick={onAgain}>
+          Present again
+        </Button>
+        {/* Hidden rather than disabled when there is no session to export:
+            a dead control invites a press and explains nothing. */}
+        {canExport && (
+          <Button variant="secondary" size="lg" onClick={onExport}>
+            Download results
+          </Button>
+        )}
+        <Button variant="ghost" size="lg" onClick={onEdit}>
+          Edit deck
+        </Button>
+        <Button variant="ghost" size="lg" onClick={onBack}>
+          Done
+        </Button>
+      </div>
     </div>
   );
 }

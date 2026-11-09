@@ -13,6 +13,41 @@ import { Input, Label } from "../components/ui/Card";
 import { cn } from "../lib/cn";
 import { SLIDE_GROUPS, labelFor, slideType, typesInGroup } from "../slides/registry";
 import { ThemePicker } from "../components/ThemePicker";
+import { LiveRoomBar } from "../components/LiveRoomBar";
+
+// Where the host was last working in this deck, per deck, for this tab.
+//
+// Every re-entry used to drop the host on slide 1: back from the presenter
+// view, back from history, back from the dashboard, or just a reload. On a
+// six-slide deck that is a scan and a click; on a thirty-slide deck it is a
+// scroll, a scan and a click, every single time, to get back to the slide you
+// were looking at four seconds ago. A place you return to should look the way
+// you left it.
+//
+// sessionStorage for the same reason as the live-room crumb: this is where
+// *this visit* was, not a permanent property of the deck. Writing it on every
+// selection is cheap — one small string, and the alternative is losing it on
+// the navigation that matters most.
+const SEL_KEY = "menti_editor_slide";
+
+function rememberSlide(deckId: string, slideId: string | null): void {
+  try {
+    const map = JSON.parse(sessionStorage.getItem(SEL_KEY) || "{}");
+    if (slideId) map[deckId] = slideId;
+    else delete map[deckId];
+    sessionStorage.setItem(SEL_KEY, JSON.stringify(map));
+  } catch {
+    // Private-mode quota. Costs us the restore, nothing more.
+  }
+}
+
+function recallSlide(deckId: string): string | null {
+  try {
+    return JSON.parse(sessionStorage.getItem(SEL_KEY) || "{}")[deckId] ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
@@ -22,12 +57,27 @@ export default function Editor() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const navigate = useNavigate();
 
+  // One place that moves the selection, so remembering it cannot be forgotten
+  // at a call site. Every `setSelectedId` in this file goes through here.
+  function select(slideId: string | null) {
+    setSelectedId(slideId);
+    if (id) rememberSlide(id, slideId);
+  }
+
   async function load(keepSelection = true) {
     if (!id) return;
     const data = await api.getPresentation(id);
     setPres(data);
     setSelectedId((cur) => {
       if (keepSelection && cur && data.slides.some((s) => s.id === cur)) return cur;
+      // Nothing selected yet — this is a fresh mount, so restore where the
+      // host was rather than resetting them to the top. Validated against the
+      // deck as it is NOW: a slide remembered from before a delete is a
+      // dangling id, and falling through to slide 1 is the right answer then.
+      const remembered = recallSlide(id);
+      if (!cur && remembered && data.slides.some((s) => s.id === remembered)) {
+        return remembered;
+      }
       return data.slides[0]?.id ?? null;
     });
   }
@@ -42,7 +92,7 @@ export default function Editor() {
     const def = slideType(type);
     const slide = await api.addSlide(id, type, "", def ? def.defaultConfig() : {});
     await load(false);
-    setSelectedId(slide.id);
+    select(slide.id);
   }
 
   async function duplicate(slide: Slide) {
@@ -54,14 +104,14 @@ export default function Editor() {
       parseConfig(slide)
     );
     await load(false);
-    setSelectedId(created.id);
+    select(created.id);
   }
 
   async function deleteSlide(slideId: string) {
     if (!id) return;
     if (!confirm("Delete this slide?")) return;
     await api.deleteSlide(id, slideId);
-    if (selectedId === slideId) setSelectedId(null);
+    if (selectedId === slideId) select(null);
     await load();
   }
 
@@ -115,12 +165,16 @@ export default function Editor() {
     <div className="h-[100dvh] flex flex-col bg-canvas text-ink overflow-hidden">
       <header className="shrink-0 border-b border-hairline px-5 h-16 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3 min-w-0">
+          {/* A back control names where it goes. A bare arrow is a direction,
+              not a destination: it tells you that leaving is possible and
+              nothing about where you land, so the only way to find out is to
+              press it and see — which is the opposite of the confidence a
+              back button exists to give. */}
           <Link
             to="/dashboard"
-            className="text-ink-subtle hover:text-ink transition-colors duration-fast shrink-0"
-            aria-label="Back to dashboard"
+            className="shrink-0 flex items-center gap-1.5 -ml-1 px-1.5 py-1 rounded-xs text-subhead text-ink-subtle hover:text-ink transition-colors duration-fast focus-visible:shadow-focus outline-none"
           >
-            ←
+            <span aria-hidden="true">←</span> Decks
           </Link>
           <input
             className="font-display font-bold text-body bg-transparent outline-none min-w-0 flex-1 rounded-xs px-1 -mx-1 focus:shadow-focus"
@@ -152,6 +206,11 @@ export default function Editor() {
         </div>
       </header>
 
+      {/* Renders only when a room for THIS deck is still open (and the server
+          agrees it is). The host ducked in here to fix something; this is the
+          thread back out. */}
+      <LiveRoomBar deckId={id} />
+
       {settingsOpen && (
         <DeckSettings
           pres={pres}
@@ -166,7 +225,7 @@ export default function Editor() {
           {pres.slides.map((s, i) => (
             <div key={s.id} className="group relative">
               <button
-                onClick={() => setSelectedId(s.id)}
+                onClick={() => select(s.id)}
                 className={cn(
                   "w-full text-left px-3 py-2.5 rounded-md transition-colors duration-fast",
                   selectedId === s.id

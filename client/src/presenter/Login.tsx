@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
 import { useAuth } from "../auth";
 import { Button } from "../components/ui/Button";
@@ -15,6 +15,11 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const { login, signup } = useAuth();
   const navigate = useNavigate();
+  // Where the gate bounced them from (App.tsx). Only in-app paths are honoured:
+  // this value arrives through router state, which a crafted link can set, and
+  // "log in and get sent to //evil.example" is an open redirect.
+  const from = (useLocation().state as { from?: string } | null)?.from;
+  const destination = from && /^\/(?!\/)/.test(from) ? from : "/dashboard";
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -23,7 +28,7 @@ export default function Login() {
     try {
       if (mode === "login") await login(email, password);
       else await signup(email, password, name);
-      navigate("/dashboard");
+      navigate(destination, { replace: true });
     } catch (err: any) {
       setError(err.message || "Something went wrong");
     } finally {

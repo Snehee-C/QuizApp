@@ -1,5 +1,5 @@
 import type { JSX } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useAuth } from "./auth";
 import Login from "./presenter/Login";
 import Dashboard from "./presenter/Dashboard";
@@ -12,9 +12,22 @@ import History from "./presenter/History";
 import Templates from "./presenter/Templates";
 import DeckTransfer from "./presenter/DeckTransfer";
 
+// A signed-out visit to a real destination used to end at the dashboard: the
+// place you asked for was thrown away at the gate, and after logging in you
+// had to go and find it again. A shared "/edit/<id>" link, a bookmark, or a
+// session that expired mid-edit all landed in the same wrong room.
+//
+// So the gate carries the destination with it and Login hands it back. `replace`
+// keeps the gate out of history — a bounced visit must not become a page the
+// Back button can return to, or Back would bounce them again.
 function RequireAuth({ children }: { children: JSX.Element }) {
   const { user } = useAuth();
-  return user ? children : <Navigate to="/login" replace />;
+  const location = useLocation();
+  return user ? (
+    children
+  ) : (
+    <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />
+  );
 }
 
 export default function App() {

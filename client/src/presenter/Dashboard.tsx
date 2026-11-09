@@ -5,6 +5,9 @@ import { api, type Presentation } from "../lib/api";
 import { useAuth } from "../auth";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
+import { LiveRoomBar } from "../components/LiveRoomBar";
+import { MoreMenu } from "../components/MoreMenu";
+import { getPresenting } from "../lib/liveSession";
 
 export default function Dashboard() {
   const [items, setItems] = useState<Presentation[]>([]);
@@ -39,7 +42,11 @@ export default function Dashboard() {
     <div className="min-h-[100dvh] bg-canvas text-ink">
       <header className="sticky top-0 z-20 bg-canvas/80 backdrop-blur border-b border-hairline">
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
-          <Link to="/" className="font-display font-bold text-title3">
+          {/* Inside the app, a wordmark means "home" and home is the deck
+              list — not the marketing page, which is where this pointed from
+              every signed-in screen. Clicking a logo should never log you out
+              of the feeling of being in the product. */}
+          <Link to="/dashboard" className="font-display font-bold text-title3">
             Floodlight
           </Link>
           <div className="flex items-center gap-2">
@@ -60,6 +67,16 @@ export default function Dashboard() {
           </div>
         </div>
       </header>
+
+      {/* The other end of the same thread as the editor's bar. A host who
+          closed the presenter tab, or wandered here to start something else,
+          gets told the room is still open and handed the way back — rather
+          than discovering it later from a message asking why the screen never
+          changed. Named, because from here "this deck" means nothing. */}
+      <LiveRoomBar
+        title={items.find((p) => p.id === getPresenting()?.deckId)?.title}
+        contentClassName="max-w-4xl mx-auto px-6"
+      />
 
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="flex items-end justify-between gap-4 mb-7">
@@ -106,28 +123,30 @@ export default function Dashboard() {
                     {p._count?.slides ?? 0} slide{(p._count?.slides ?? 0) === 1 ? "" : "s"}
                   </p>
                 </Link>
+                {/* Two verbs on the row, the rest one layer in. These are the
+                    two things a host opens this page to do; History,
+                    Duplicate and Delete are occasional, and one of them is
+                    irreversible and used to sit a pixel from "Present" at
+                    identical weight (MoreMenu.tsx). */}
                 <div className="flex items-center gap-1.5 shrink-0">
                   <Link to={`/edit/${p.id}`}>
                     <Button variant="ghost" size="sm">
                       Edit
                     </Button>
                   </Link>
-                  <Link to={`/history/${p.id}`}>
-                    <Button variant="ghost" size="sm">
-                      History
-                    </Button>
-                  </Link>
-                  <Button variant="ghost" size="sm" onClick={() => duplicate(p.id)}>
-                    Duplicate
-                  </Button>
                   <Link to={`/present/${p.id}`}>
                     <Button variant="secondary" size="sm">
                       Present
                     </Button>
                   </Link>
-                  <Button variant="danger" size="sm" onClick={() => remove(p.id)}>
-                    Delete
-                  </Button>
+                  <MoreMenu
+                    label={`More actions for "${p.title}"`}
+                    actions={[
+                      { label: "Session history", onSelect: () => navigate(`/history/${p.id}`) },
+                      { label: "Duplicate", onSelect: () => duplicate(p.id) },
+                      { label: "Delete deck", onSelect: () => remove(p.id), danger: true },
+                    ]}
+                  />
                 </div>
               </Card>
             </motion.div>

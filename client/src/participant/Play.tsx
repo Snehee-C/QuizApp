@@ -480,7 +480,20 @@ export default function Play() {
   if (ended) {
     const mine = finalEntries.find((e) => e.participantId === participantId.current);
     const myRank = mine ? finalEntries.indexOf(mine) + 1 : null;
-    return <SessionEnded entries={finalEntries} mine={mine} myRank={myRank} />;
+    return (
+      <SessionEnded
+        entries={finalEntries}
+        mine={mine}
+        myRank={myRank}
+        onLeave={() => {
+          // The seat is what makes a reload land back in the room (B4). This
+          // room is over, so holding the seat would send them straight back to
+          // this podium on the next load — a game they already finished.
+          leaveSeat();
+          navigate("/join");
+        }}
+      />
+    );
   }
 
   if (error) {
@@ -756,10 +769,12 @@ function SessionEnded({
   entries,
   mine,
   myRank,
+  onLeave,
 }: {
   entries: LeaderboardEntry[];
   mine?: LeaderboardEntry;
   myRank: number | null;
+  onLeave: () => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -794,6 +809,17 @@ function SessionEnded({
           </p>
         </div>
       )}
+      {/* This screen had no controls at all — not one. A player whose host ran
+          a second deck, or who was handed a new code, had no way forward from
+          their own podium except finding the browser's address bar on a phone
+          that was probably in a standalone-looking tab. A celebration is still
+          a place you have to be able to walk out of.
+          
+          It sits below the result on purpose: the rank is the moment, and the
+          door is for afterwards. */}
+      <Button variant="secondary" size="lg" className="relative z-10" onClick={onLeave}>
+        Join another game
+      </Button>
     </div>
   );
 }
