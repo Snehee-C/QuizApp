@@ -29,11 +29,31 @@ worse than no skill.
 **Must be verifiable:** ship a validator the agent can run on its own output
 before handing the file over, so correctness is checked rather than hoped for.
 
-Status: **in progress** (subagent).
+Status: **done** — `.claude/skills/quiz-deck/` (`1fb1ce0`). Validator catches
+9 of 9 broken decks; the real importer catches 5 of 9.
 
 ---
 
 ## Known gaps
+
+### The importer does not validate slide config — it accepts decks that cannot work
+Found while building the skill, and verified directly. `POST /transfer/import`
+checks the envelope, the type allow-list and the config's *shape* (plain
+object, ≤20KB, no `__proto__`) and stops. The slide modules' `validate()`
+grades a **participant's answer**, not an author's config, and the importer
+never calls it.
+
+So a `MULTIPLE_CHOICE` with `correctIndices: [4]` on four options, or with
+zero options, or a quiz with no answer key at all, returns **200 OK** — and
+fails in front of a room. Measured: validator 3 errors, importer 200.
+
+The skill's `validate-deck.mjs` already encodes the missing rules and catches
+9 of 9 where the importer catches 5. The server fix is to apply the same
+checks at import, ideally sharing one implementation so the two cannot drift.
+Related: `order` is ignored and renumbered; `timeLimitSec` is clamped at
+runtime rather than at import, so `0` is accepted and silently rewritten; an
+unknown `theme` falls back silently; `timeScale` is missing from the envelope
+so it does not round-trip.
 
 ### Self-paced players get no answer feedback
 `3271aff` stopped AUDIENCE decks auto-revealing (it was closing questions
