@@ -734,6 +734,25 @@ function armRevealTimer(io: Server, joinCode: string, s: LiveSession, remainingM
     clearTimeout(s.revealTimer);
     s.revealTimer = null;
   }
+
+  // AUDIENCE pacing never auto-reveals. A reveal is a SHARED moment -- one
+  // room-wide frame that closes a question for everyone at once -- and in a
+  // self-paced deck there is no shared moment to synchronise to, because at
+  // any instant different people are on different slides.
+  //
+  // What it did instead was punish the slowest reader. A host pressing Next
+  // once armed a 20s timer on slide 3; twenty seconds later the answer landed
+  // on the screen of everyone still reading slide 3, closed it against them,
+  // and pre-spoiled it for everyone who had not reached it yet. That is the
+  // exact axis `timeScale` (relaxed timing) exists to protect.
+  //
+  // Not fixed by making the reveal per-player: the lockout and the broadcast
+  // have to move together, or a player sees the key and can still submit.
+  // Deleting the shared reveal here is the smaller, coherent change --
+  // per-player clocks still score speed (see `audienceArrivals`), and the
+  // room still watches results grow live on the projector.
+  if (s.pacing === "AUDIENCE") return;
+
   const idx = s.currentIndex;
   if (idx < 0 || idx >= s.slides.length) return;
   const slideObj = s.slides[idx];
