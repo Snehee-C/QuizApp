@@ -240,6 +240,67 @@ that, browsing the map with the keyboard would have been driving the room:
 `ArrowRight` there is `presenter:next`. Verified — the room's frame count does
 not move while the navigator is open.
 
+### Host, mid-session: the editor meets you where the room is
+F3 and F4 genuinely disagreed here, and the tie is now broken toward F4 — with
+an asymmetry that makes it the right call rather than a coin toss. A host
+ducking out mid-session is almost always going to fix *what the room is looking
+at*, and being dropped somewhere else costs them time in front of an audience.
+
+The crumb the presenter already writes on adopt now carries the slide the room
+is on — **by id, not index**, because an index does not survive the deck being
+edited, which is the exact thing this host is about to do. A dead id is
+self-describing; a stale index silently lands them on someone else's question.
+
+The rule is *the room moving is news*:
+
+| What happens | Where the editor opens |
+|---|---|
+| Prepare slide 6, present, room reaches slide 3, duck out | **slide 3** — what the room sees |
+| Then pick slide 5 yourself, go to history, come back | **slide 5** — your choice stands; the room has not moved |
+| Back to the room, advance to 4, duck out again | **slide 4** — the room moved, so it wins |
+| Session ends | the marker and the band both disappear |
+
+All four verified end to end. The rail also marks that slide `· on screen`, so
+the host can see *why* it opened there and can still see where the room is
+after they navigate elsewhere in the deck. That marker and the live band share
+one verification — `LiveRoomBar` reports upward once the server has confirmed
+the session — because two components independently deciding whether a room is
+live is two answers to one question, and the one that skips the server check is
+the one that will be wrong in front of a room.
+
+### Host, presenting: the control bar
+It had grown to twelve controls in one flat row, mixing four unrelated jobs —
+driving the deck, running the room, configuring the host's own screen, and
+ending the session — separated only by dividers, which is grouping *drawn on*
+rather than grouping that exists. The slide jump would have made it thirteen.
+
+The split is by **when**, not by category, because that is the question the
+host's hand is asking. Back / Next / Slides / Scores / Q&A / Moderate are
+touched throughout a session; speaker notes, room lighting, fullscreen, sound
+and the CSV are touched once at the start or once at the end. Those five
+collapse into one `More`.
+
+| | Before | After |
+|---|---|---|
+| Controls in the bar | 12 | **8** (9 with Scores) |
+| Bar width at 1920 | 1231px | **830px** |
+| Slack at 1152 × 648 | would have clipped | **322px** |
+
+The menu reads `noun → current value` (`Speaker notes · Closed`, `Sound · On`),
+because a setting that does not say what it is set to answers "what can I
+change" and not "what is it now". Toggles keep the menu open — flipping sound
+and then the lighting is one errand — while actions close it, because they have
+taken you somewhere. It opens upward, since downward from a bar pinned to the
+bottom of the viewport is off-screen.
+
+Two naming consequences, both resolved by deleting rather than duplicating.
+`Export` became `Download results`, which is what the final-results screen and
+the deck list already call the same file. And the lighting row is named for the
+setting (`Room lighting · Dim`) rather than the action: as a bar button
+"Bright room" was right, because a button says what pressing it does, but in a
+menu of `noun → value` rows an action label beside a value fights itself —
+"Bright room … Dim" reads as two claims about one row.
+
 ### Host, first run
 | | Before | After |
 |---|---|---|
@@ -333,6 +394,7 @@ redirect).
 | `components/LastRunBar.tsx` | The session you just finished, one press from its CSV. |
 | `lib/scrollMemory.ts` | Lists come back to where you left them — and deliberately do not when the page has news. |
 | `components/SpeakerWindow.ts` | Carries the same slide list, clickable, on the one surface a projector never shows. |
+| `components/MoreMenu.tsx` | Grew `placement`, `size`, per-row `detail` and `menuitemcheckbox` so one disclosure mechanism serves both a dense list row and the presenter's bar. |
 
 **`End` is now two presses.** It is irreversible, it ejects every phone in the
 room, and it sat in a row of identically-sized ghost buttons one pixel from
@@ -345,17 +407,15 @@ came back would press "Sure?" believing it to be the first press.
 
 **A bug the screenshots found, which no audit could have.** The navigator's
 scrim was in the right place, the right size and the right z-index, and
-completely invisible. `bg-canvas/80` computes to `rgba(0, 0, 0, 0)`: every
-colour in this system is an `oklch()` token, and Tailwind's slash-alpha can
-only inject an alpha channel into a colour it can decompose. Grepping for the
-pattern found **four more** — the sticky headers on the deck list, templates,
-transfer and history had all been relying on `backdrop-blur` alone, with page
-content scrolling underneath them blurred but untinted, since they were
-written. All five are now `color-mix(in oklch, …)`, which is the spelling the
-rest of the codebase already used for exactly this reason (`DESIGN.md` P1).
-Worth recording as a class: a colour that silently resolves to transparent is
-invisible in a diff, invisible to a type checker, invisible to the design lint,
-and looks like a z-index problem.
+completely invisible — `bg-canvas/80` computes to `rgba(0, 0, 0, 0)`. Grepping
+the pattern found **four more**, all wrong since the day they were written.
+The mechanism, and the rule that replaces it, now live in **`DESIGN.md` §4**,
+next to the colour ladder, because that is where someone reaching for a
+translucent surface will be standing. It is recorded there rather than here
+because it is a property of the colour system, not of the flow — and because
+the failure is silent in every channel we have: invisible in a diff, to the
+type checker, and to `lint:design`, and at runtime it looks like a
+stacking-context bug rather than a colour one.
 
 Constraints held: `npx tsc -p tsconfig.app.json --noEmit` and
 `npm run lint:design` clean; the overshoot budget is still exactly three
@@ -368,7 +428,9 @@ controls fits 1280 × 720 with 102px to spare and wraps rather than clips below
 that; `prefers-reduced-motion` verified on the navigator and the type picker
 (both settle at `opacity 1`, `transform: none`); the jump verified against a
 real phone in the room at **1 broadcast, not 8**, with the room's frame count
-unmoved while the panel is open and no answer-key string anywhere in it.
+unmoved while the panel is open and no answer-key string anywhere in it; the
+full 24px stage-floor audit clean (`stage text below 24px: 0`) across lobby,
+question and navigator-open.
 
 ---
 
@@ -393,67 +455,70 @@ unmoved while the panel is open and no answer-key string anywhere in it.
 
 ## 6. What is still wrong
 
-Six of the ten findings in the first pass are now fixed (slide jump, the
-seventeen-type wall, the player's position and room code, the run that just
-happened, scroll on every return, and — partly — the page-swap complaint).
-What is left, plus what the second pass added, in the order it costs a person
-something.
+Counting honestly, because this document's standard is that a system wrong
+about itself cannot be trusted about anything else. Of the first pass's ten
+findings: **six are fully fixed** (the seventeen-type wall, ±1 stepping, the
+control bar, the player's position, the lobby code echo, and the run that just
+happened), **one is partly fixed** (the page-swap complaint — scroll survives
+every return now, `/transfer` is still a page), and **three remain** (deletion
+confirms, the editor pane's scroll, the deck-title drill-in). The second pass's
+open question — where the editor opens when you duck out of a live room — is
+settled in §3. What is left, in the order it costs a person something.
 
 1. **`confirm()` still guards both deletions.** A native modal with no undo,
    for an irreversible act. F5 is half-satisfied: `Delete deck` moved a layer
    into the `•••` menu, but it is still confirm-then-destroy rather than
    destroy-then-undo, which is what NN/g actually recommend and what the
    product should do. It needs a server-side tombstone, and `server/` is out of
-   scope for this pass.
-2. **The control bar is now twelve controls at one level** — one worse than
-   last pass, because the jump had to go somewhere. It fits every width we
-   target and wraps rather than clips below them, but it mixes transport, room
-   tools, display settings and session lifecycle in a single row with dividers
-   doing work the structure should do. The honest fix is two clusters, not a
-   thirteenth button.
-3. **The stage navigator shows upcoming questions to the room.** Argued in §3
+   scope.
+2. **The stage navigator shows upcoming questions to the room.** Argued in §3
    as the smaller of two leaks, and it is — but "smaller" is not "none". A
    trivia host running a paid quiz night has a real objection. The unbuilt
    better answer is a numbers-and-type-only mode for the stage panel, with full
    titles reserved for the speaker window, chosen once in deck settings rather
    than guessed at per press.
-4. **`slideTitles` is issued once and never re-pushed.** A slide added or
+3. **`slideTitles` is issued once and never re-pushed.** A slide added or
    deleted mid-session invalidates the list; the client notices (the
    authoritative `totalSlides` stops matching) and degrades to numbers,
-   re-learning a title each time the host lands on a slide. That is honest but
-   it is a client working around a protocol gap — the real fix is the server
-   re-issuing titles on `slide:changed`, which is not ours to write.
+   re-learning a title each time the host lands on a slide. Honest, but it is a
+   client working around a protocol gap — the real fix is the server re-issuing
+   titles on `slide:changed`, which is not ours to write.
+4. **Every live-session memory is tab-scoped.** The breadcrumb is
+   `sessionStorage`, deliberately — a crumb that outlives its tab greets a host
+   on Monday with a room that died on Friday. The cost is that a host who opens
+   the editor in a *second tab* gets neither the live band nor the `on screen`
+   marker, and the editor will not follow the room. The marker makes a
+   limitation that was always there easier to notice. A durable fix needs the
+   server to answer "is anything live for me", which it has no endpoint for.
 5. **The editor restores selection but not scroll.** Come back to a long slide
    form and you are at the top of it. F3 is satisfied for the rail and for every
    list in the product, and not for that one pane.
 6. **`/transfer` should be a sheet.** Import and export is a genuinely
    self-contained task — file in, file out — and it is a full page swap with its
    own header. Now that scroll survives the round trip the remaining cost is
-   structural rather than measurable, which is exactly why it is listed here and
-   not done on the way past.
-7. **The `•••` menu has no arrow-key navigation between items.** It opens,
+   structural rather than measurable, which is why it is listed rather than done
+   on the way past. (`/templates` is a destination, not a task — §5.)
+7. **Neither menu has arrow-key navigation between items.** `MoreMenu` opens,
    closes on Escape and on an outside click, and returns focus to its trigger,
-   but moving between three items is Tab, not Down. The slide navigator does
-   implement arrow movement; the menu should match it. Same gap in the type
-   picker, where only "filter, then Enter for the first match" is wired.
+   but moving between rows is Tab, not Down — and it is now the presenter's
+   settings cluster, not just a row overflow. `SlideNavigator` does implement
+   arrow movement; the menus should match it, and so should the type picker,
+   where only "filter, then Enter for the first match" is wired.
 8. **`LastRunBar` only knows about runs that ended in this tab.** Close the
    browser and the pointer to your last session is gone — the results are still
    in `Session history`, three presses away, which is where everyone was before.
    A durable answer needs a "recent sessions" endpoint that does not exist.
-9. **The deck title is still an unlabelled drill-in.** Now redundant rather
-   than load-bearing — `Edit` sits beside it — so a consistency wrinkle rather
-   than a trap. It stays listed because the original defect in this product was
-   exactly this affordance being the *only* way in, and a system that forgets
-   its own near-misses re-earns them.
-10. **Ducking out of a live room lands you on the slide you last *edited*, not
-    the one on the projector.** Two principles disagree here and the tie was
-    broken toward F3: the host explicitly selected that slide, and overriding
-    their selection with the live index is the system second-guessing them. The
-    answer that satisfies both is to mark which slide is on screen in the rail
-    without moving the selection — F4 without overruling F3 — and the editor
-    cannot currently know the live index, because the crumb carries only a deck
-    id and a join code and there is no socket on that page. Listed as an open
-    question rather than a defect.
+9. **`components/ui/SoundToggle.tsx` is now unreferenced.** Its logic moved
+   into the presenter's settings menu, which was the only place it was used.
+   P1 says delete the weaker mechanism rather than leave it lying about, but it
+   is a well-built accessible toggle and the participant view may want it, so
+   the call is flagged rather than taken. It is dead code either way until
+   someone decides.
+10. **The deck title is still an unlabelled drill-in.** Now redundant rather
+    than load-bearing — `Edit` sits beside it — so a consistency wrinkle rather
+    than a trap. It stays listed because the original defect in this product was
+    exactly this affordance being the *only* way in, and a system that forgets
+    its own near-misses re-earns them.
 11. **The type picker has no "recently used".** The filter pays back most of
     what progressive disclosure costs an expert, but an author building a
     twelve-question quiz types the same three letters twelve times. Remembering

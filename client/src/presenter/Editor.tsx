@@ -14,6 +14,7 @@ import { cn } from "../lib/cn";
 import { SLIDE_GROUPS, labelFor, slideType, typesInGroup } from "../slides/registry";
 import { ThemePicker } from "../components/ThemePicker";
 import { LiveRoomBar } from "../components/LiveRoomBar";
+import { getPresenting } from "../lib/liveSession";
 import { SlideTypePicker } from "../components/SlideTypePicker";
 import { AnimatePresence } from "motion/react";
 
@@ -51,6 +52,34 @@ function recallSlide(deckId: string): string | null {
   }
 }
 
+// The last live slide this editor already opened on, per deck.
+//
+// A host ducking out of a live room is almost always going to fix the thing
+// the room is looking at, so the editor follows the projector rather than its
+// own memory — but only when the projector has MOVED. Following it on every
+// mount would mean a host who deliberately clicked slide 12 to prepare it,
+// then glanced at the session history and came back, gets yanked to slide 3
+// again by a room that never budged. So: the room moving is news and wins; the
+// room standing still is not news, and the host's own choice stands.
+const LIVE_KEY = "menti_editor_lastlive";
+
+function readMap(key: string): Record<string, string> {
+  try {
+    return JSON.parse(sessionStorage.getItem(key) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function noteLiveHonoured(deckId: string, slideId: string): void {
+  try {
+    sessionStorage.setItem(LIVE_KEY, JSON.stringify({ ...readMap(LIVE_KEY), [deckId]: slideId }));
+  } catch {
+    // Private-mode quota. The editor then follows the room on every mount
+    // rather than only when it moves — noisier, never wrong.
+  }
+}
+
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
   const [pres, setPres] = useState<PresentationWithSlides | null>(null);
@@ -58,6 +87,9 @@ export default function Editor() {
   const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Set only once LiveRoomBar has confirmed the room with the server, so the
+  // rail's "on screen" marker and the banner can never disagree.
+  const [roomLive, setRoomLive] = useState(false);
   const navigate = useNavigate();
 
   // One place that moves the selection, so remembering it cannot be forgotten
@@ -73,14 +105,28 @@ export default function Editor() {
     setPres(data);
     setSelectedId((cur) => {
       if (keepSelection && cur && data.slides.some((s) => s.id === cur)) return cur;
-      // Nothing selected yet — this is a fresh mount, so restore where the
-      // host was rather than resetting them to the top. Validated against the
-      // deck as it is NOW: a slide remembered from before a delete is a
-      // dangling id, and falling through to slide 1 is the right answer then.
-      const remembered = recallSlide(id);
-      if (!cur && remembered && data.slides.some((s) => s.id === remembered)) {
-        return remembered;
+
+      // A fresh mount. Two memories can answer "where should this open", and
+      // they are consulted in order of how much the host is likely to care.
+      const has = (sid: string | null | undefined) =>
+        !!sid && data.slides.some((s) => s.id === sid);
+
+      // 1. The room, if it has moved since we last opened on it. Checked first
+      //    because a live session is the most urgent fact about this deck, and
+      //    the slide on the projector is what the host walked in here to fix.
+      const live = getPresenting(id)?.slideId;
+      if (!cur && has(live) && readMap(LIVE_KEY)[id] !== live) {
+        noteLiveHonoured(id, live!);
+        rememberSlide(id, live!);
+        return live!;
       }
+
+      // 2. Otherwise where this host was last working. Validated against the
+      //    deck as it is NOW: a slide remembered from before a delete is a
+      //    dangling id, and falling through to slide 1 is right then.
+      const remembered = recallSlide(id);
+      if (!cur && has(remembered)) return remembered;
+
       return data.slides[0]?.id ?? null;
     });
   }
@@ -156,6 +202,11 @@ export default function Editor() {
   }
 
   const selected = pres?.slides.find((s) => s.id === selectedId) ?? null;
+  // Which slide the room is looking at. Null unless a session is genuinely
+  // open — the editor follows the projector on arrival, and the marker is how
+  // the host can see that it did, and see where the room is if they then
+  // navigate somewhere else in the deck.
+  const liveSlideId = roomLive ? (getPresenting(id)?.slideId ?? null) : null;
 
   if (!pres) {
     return (
@@ -213,7 +264,7 @@ export default function Editor() {
       {/* Renders only when a room for THIS deck is still open (and the server
           agrees it is). The host ducked in here to fix something; this is the
           thread back out. */}
-      <LiveRoomBar deckId={id} />
+      <LiveRoomBar deckId={id} onLive={(code) => setRoomLive(!!code)} />
 
       {settingsOpen && (
         <DeckSettings
@@ -237,8 +288,23 @@ export default function Editor() {
                     : "hover:bg-surface-1"
                 )}
               >
-                <p className="nums text-caption2 font-semibold uppercase track-label text-ink-subtle mb-0.5">
-                  {i + 1} · {labelFor(s.type)}
+                {/* The live marker sits next to the NUMBER, not at the end,
+                    and the line truncates rather than wraps. Both follow from
+                    the same thing: a marker that wrapped made one row in the
+                    rail taller than its neighbours, and a marker at the end of
+                    a truncating line is the first thing to disappear. Ordered
+                    by what must survive — which slide, whether it is the live
+                    one, then what kind it is. */}
+                <p className="nums text-caption2 font-semibold uppercase track-label text-ink-subtle mb-0.5 truncate">
+                  {i + 1}
+                  {s.id === liveSlideId && (
+                    <>
+                      {" · "}
+                      <span className="text-accent">on screen</span>
+                    </>
+                  )}
+                  {" · "}
+                  {labelFor(s.type)}
                   {parseConfig(s).isQuiz ? " · quiz" : ""}
                 </p>
                 <p className="text-subhead font-medium truncate">

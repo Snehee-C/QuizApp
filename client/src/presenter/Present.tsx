@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
 import { motion, AnimatePresence } from "motion/react";
@@ -24,8 +24,8 @@ import { NumberTicker } from "../components/ui/NumberTicker";
 import { TimerRing } from "../components/ui/TimerRing";
 import { FitText } from "../components/ui/FitText";
 import { Button } from "../components/ui/Button";
-import { SoundToggle } from "../components/ui/SoundToggle";
-import { initSound, playSound } from "../lib/sound";
+import { initSound, isMuted, playSound, subscribeMuted, toggleMuted, unlockAudio } from "../lib/sound";
+import { MoreMenu } from "../components/MoreMenu";
 import { clearPresenting, markPresenting, markRunFinished } from "../lib/liveSession";
 import { SlideNavigator } from "../components/SlideNavigator";
 import { burstAt, burstFrom } from "../lib/confetti";
@@ -126,7 +126,7 @@ export default function Present() {
       // bookmark, a reload, a host who alt-tabs to the editor in another tab.
       // Adopting a session is the one moment every one of those paths has
       // already passed through (lib/liveSession.ts).
-      if (id && res.joinCode) markPresenting(id, res.joinCode);
+      if (id && res.joinCode) markPresenting(id, res.joinCode, res.currentSlide?.id ?? null);
       if (res.sessionId) setSessionId(res.sessionId);
       setStatus(res.status);
       setIndex(res.index ?? res.currentIndex ?? -1);
@@ -269,6 +269,13 @@ export default function Present() {
         if (payload.currentSlide) base[payload.index] = payload.currentSlide.question;
         return base;
       });
+      // Keep the trail pointing at what the ROOM is looking at, not merely at
+      // which deck is live. A host who ducks into the editor from here is
+      // almost always going to fix the thing on the projector, and the editor
+      // can only open there if the crumb says where "there" is (FLOW.md F4).
+      if (id && joinCodeRef.current) {
+        markPresenting(id, joinCodeRef.current, payload.currentSlide?.id ?? null);
+      }
       setIndex(payload.index);
       setStatus(payload.status);
       setCurrentSlide(payload.currentSlide);
@@ -887,6 +894,57 @@ function QuestionStage({
 // The one place glassmorphism is allowed in the product: a floating control
 // bar that is not content and that the audience is not reading (DESIGN.md §7).
 // Auto-hides so it isn't burned into the projection.
+// The settings cluster, assembled here rather than at the call site because
+// every switch it contains is already wired to a handler on this component —
+// passing five callbacks up and a list back down would be the same decision
+// made twice.
+function useSettingsActions(props: {
+  stage: Stage;
+  onToggleStage: () => void;
+  onFullscreen: () => void;
+  speakerOpen: boolean;
+  onToggleSpeaker: () => void;
+  onExport: () => void;
+}) {
+  // The mute flag lives in lib/sound, not in React, and can be changed from
+  // another surface — so it is subscribed to rather than mirrored.
+  const muted = useSyncExternalStore(subscribeMuted, isMuted, () => true);
+  return [
+    {
+      label: "Speaker notes",
+      detail: props.speakerOpen ? "Open" : "Closed",
+      checked: props.speakerOpen,
+      onSelect: props.onToggleSpeaker,
+    },
+    {
+      // Named for the setting, not the action. As a bar button "Bright room"
+      // was right — a button says what pressing it does. In a menu where every
+      // other row is `noun → current value`, an action label beside a value
+      // fights itself: "Bright room … Dim" reads as two claims about one row.
+      // The old spelling is gone rather than duplicated, so this is one name,
+      // not a synonym (DESIGN.md P1).
+      label: "Room lighting",
+      detail: props.stage === "dark" ? "Dim" : "Bright",
+      onSelect: props.onToggleStage,
+    },
+    { label: "Fullscreen", onSelect: props.onFullscreen },
+    {
+      label: "Sound",
+      detail: muted ? "Off" : "On",
+      checked: !muted,
+      onSelect: () => {
+        // Prime the audio context from this gesture, or the next cue is
+        // swallowed waiting for one (ui/SoundToggle.tsx).
+        unlockAudio();
+        toggleMuted();
+      },
+    },
+    // One name for one file, product-wide: the final-results screen and the
+    // deck list both call this "Download results".
+    { label: "Download results", onSelect: props.onExport },
+  ];
+}
+
 function ControlBar(props: {
   status: string;
   stage: Stage;
@@ -916,6 +974,7 @@ function ControlBar(props: {
   speakerOpen: boolean;
   onToggleSpeaker: () => void;
 }) {
+  const moreActions = useSettingsActions(props);
   const [visible, setVisible] = useState(true);
   const timer = useRef<number | null>(null);
 
@@ -1029,32 +1088,31 @@ function ControlBar(props: {
         <Button variant="ghost" size="md" onClick={props.onOpenQaPanel} title="Moderate questions">
           Moderate
         </Button>
-        <Button
-          variant={props.speakerOpen ? "secondary" : "ghost"}
-          size="md"
-          onClick={props.onToggleSpeaker}
-          title="Open notes in a second window for your own screen"
-        >
-          Notes
-        </Button>
 
         <span className="w-px h-6 bg-hairline mx-1" aria-hidden="true" />
 
-        <Button
-          variant="ghost"
+        {/* Everything you set once and stop thinking about.
+        
+            The bar had grown to twelve controls in one flat row, mixing four
+            unrelated jobs — driving the deck, running the room, configuring
+            the host's own screen, and ending the session — separated only by
+            dividers, which is grouping drawn on rather than grouping that
+            exists. Adding a thirteenth for the slide jump would have been the
+            move that made it unarguable.
+        
+            The split is by WHEN, not by category, because that is the question
+            the host's hand is actually asking: Back/Next/Slides/Scores/Q&A are
+            touched throughout a session; notes, room lighting, fullscreen,
+            sound and the CSV are touched once at the start or once at the end.
+            Five of those collapse to one, and the bar reads as what it is —
+            transport, room, settings, stop. */}
+        <MoreMenu
+          label="Presenter settings"
+          triggerLabel="More"
+          placement="above"
           size="md"
-          onClick={props.onToggleStage}
-          title="Switch stage theme for the room's lighting"
-        >
-          {props.stage === "dark" ? "Bright room" : "Dim room"}
-        </Button>
-        <Button variant="ghost" size="md" onClick={props.onFullscreen} title="Fullscreen (f)">
-          Fullscreen
-        </Button>
-        <SoundToggle />
-        <Button variant="ghost" size="md" onClick={props.onExport}>
-          Export
-        </Button>
+          actions={moreActions}
+        />
         <EndButton onEnd={props.onEnd} />
       </div>
     </motion.footer>

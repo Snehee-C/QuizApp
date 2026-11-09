@@ -31,6 +31,7 @@ import { cn } from "../lib/cn";
 export function LiveRoomBar({
   deckId,
   title,
+  onLive,
   contentClassName,
 }: {
   /**
@@ -41,6 +42,15 @@ export function LiveRoomBar({
   deckId?: string;
   /** Shown only when the bar isn't already sitting inside the deck it names. */
   title?: string;
+  /**
+   * Fired once this bar has CONFIRMED with the server that the room is open
+   * (or confirmed that it isn't). Exists so a page can hang other live-session
+   * UI off the same verification instead of reading the breadcrumb itself —
+   * two components independently deciding whether a session is live is two
+   * answers to one question, and the one that skips the server check is the
+   * one that will be wrong in front of a room (DESIGN.md P1).
+   */
+  onLive?: (joinCode: string | null) => void;
   /**
    * The band is always full-bleed — a status strip that stops short of the
    * window edge reads as a card, and a card implies something dismissible.
@@ -74,17 +84,23 @@ export function LiveRoomBar({
           setCode(open.joinCode);
           setTarget(deck);
         }
+        onLive?.(open ? open.joinCode : null);
       })
       .catch(() => {
         // Offline or a failed read. Stay silent rather than guess: the cost of
         // a missing banner is one extra navigation, the cost of a wrong one is
         // a host walking back to a room that isn't there in front of an
-        // audience.
+        // audience. Subscribers hear "not live" for the same reason.
+        if (live) onLive?.(null);
       });
 
     return () => {
       live = false;
     };
+    // `onLive` is deliberately not a dependency: callers pass an inline arrow,
+    // and depending on it would re-run this verification — a network call —
+    // on every render of the host page.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deckId]);
 
   if (!code || !target) return null;

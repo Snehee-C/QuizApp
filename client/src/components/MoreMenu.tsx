@@ -8,6 +8,19 @@ export interface MoreAction {
   onSelect: () => void;
   /** Destructive actions are tinted and sorted last by the caller. */
   danger?: boolean;
+  /**
+   * Current value, shown right-aligned. A setting in a menu has to say what it
+   * is set to — otherwise the menu answers "what can I change" and not "what
+   * is it now", and the host has to open it, act, and look at the result to
+   * find out (NN/g: visibility of system status).
+   */
+  detail?: string;
+  /**
+   * Present for an on/off setting. Switches the row to `menuitemcheckbox`,
+   * which is the difference between "do this" and "this is on" to a screen
+   * reader — and the two are genuinely different rows here.
+   */
+  checked?: boolean;
 }
 
 /**
@@ -31,7 +44,28 @@ export interface MoreAction {
  * and does not return focus to its trigger — three things a menu has to do
  * before it is a menu rather than a trapdoor.
  */
-export function MoreMenu({ label, actions }: { label: string; actions: MoreAction[] }) {
+export function MoreMenu({
+  label,
+  actions,
+  triggerLabel = "•••",
+  placement = "below",
+  size = "sm",
+}: {
+  label: string;
+  actions: MoreAction[];
+  /**
+   * What the trigger reads. The glyph is right on a row repeated eighty times,
+   * where density is the whole problem and the idiom is universal. In a bar of
+   * eight word-labelled verbs it is the odd one out and the least discoverable
+   * thing there, so the presenter's bar passes "More". One mechanism, pitched
+   * to the density it sits in.
+   */
+  triggerLabel?: React.ReactNode;
+  /** "above" for a bar pinned to the bottom of the viewport. */
+  placement?: "below" | "above";
+  /** Match the row it sits in: the deck list is sm, the control bar is md. */
+  size?: "sm" | "md";
+}) {
   const [open, setOpen] = useState(false);
   const wrap = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -72,13 +106,15 @@ export function MoreMenu({ label, actions }: { label: string; actions: MoreActio
         aria-expanded={open}
         aria-label={label}
         onClick={() => setOpen((v) => !v)}
+        title={label}
         className={cn(
           "inline-flex items-center justify-center font-ui font-semibold press select-none",
-          "h-9 px-3.5 text-footnote rounded-sm transition-colors duration-fast",
+          "transition-colors duration-fast",
+          size === "md" ? "h-11 px-5 text-subhead rounded-md" : "h-9 px-3.5 text-footnote rounded-sm",
           open ? "bg-surface-2 text-ink" : "bg-transparent text-ink-muted hover:text-ink hover:bg-surface-1"
         )}
       >
-        <span aria-hidden="true">•••</span>
+        <span aria-hidden="true">{triggerLabel}</span>
       </button>
 
       <AnimatePresence>
@@ -89,29 +125,43 @@ export function MoreMenu({ label, actions }: { label: string; actions: MoreActio
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, scale: reduced ? 1 : 0.98 }}
             transition={{ duration: dur.fast, ease: ease.standard }}
-            // Anchored to the trigger's right edge and below it, so it opens
-            // where the finger already is (Fitts) and never covers the row it
-            // belongs to.
-            className="absolute right-0 top-full mt-1.5 z-30 min-w-[11rem] p-1 rounded-md bg-surface-2 shadow-elev-2 origin-top-right"
+            // Anchored to the trigger's right edge, so it opens where the
+            // finger already is (Fitts) and never covers the row it belongs
+            // to. A bar pinned to the bottom of the viewport opens upward for
+            // the same reason: downward would be off-screen.
+            className={cn(
+              "absolute right-0 z-30 min-w-[13rem] p-1 rounded-md bg-surface-2 shadow-elev-2",
+              placement === "above"
+                ? "bottom-full mb-1.5 origin-bottom-right"
+                : "top-full mt-1.5 origin-top-right"
+            )}
           >
             {actions.map((a) => (
               <button
                 key={a.label}
-                role="menuitem"
+                role={a.checked === undefined ? "menuitem" : "menuitemcheckbox"}
+                aria-checked={a.checked}
                 type="button"
                 onClick={() => {
-                  setOpen(false);
+                  // A toggle stays open: flipping sound off and the stage
+                  // theme after it is one errand, and closing between them
+                  // would make the host re-open the same menu to finish it.
+                  // An action closes, because it has taken them somewhere.
+                  if (a.checked === undefined) setOpen(false);
                   a.onSelect();
                 }}
                 className={cn(
-                  "w-full text-left px-3 h-9 rounded-xs text-subhead font-medium",
+                  "w-full flex items-center gap-4 text-left px-3 h-9 rounded-xs text-subhead font-medium",
                   "transition-colors duration-fast outline-none focus-visible:shadow-focus",
                   a.danger
                     ? "text-danger hover:bg-[color-mix(in_oklch,var(--danger),transparent_88%)]"
                     : "text-ink-muted hover:text-ink hover:bg-surface-3"
                 )}
               >
-                {a.label}
+                <span className="flex-1 min-w-0 truncate">{a.label}</span>
+                {a.detail && (
+                  <span className="shrink-0 text-footnote text-ink-subtle">{a.detail}</span>
+                )}
               </button>
             ))}
           </motion.div>

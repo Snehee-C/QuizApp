@@ -24,13 +24,32 @@ const KEY = "menti_presenting";
 export interface LiveCrumb {
   deckId: string;
   joinCode: string;
+  /**
+   * The slide the ROOM is looking at right now, by id rather than index.
+   *
+   * By id because the editor thinks in ids and an index does not survive the
+   * deck being edited — which is the exact thing a host ducking out of a live
+   * room is about to do. An id that no longer exists is self-describing (it
+   * simply will not be found in the deck); an index that no longer means what
+   * it meant is silently wrong and lands them on someone else's question.
+   *
+   * Absent in the lobby, where there is genuinely no slide on screen.
+   */
+  slideId?: string | null;
   /** When the crumb was written, so a caller can age it out without a fetch. */
   at: number;
 }
 
-export function markPresenting(deckId: string, joinCode: string): void {
+export function markPresenting(
+  deckId: string,
+  joinCode: string,
+  slideId?: string | null
+): void {
   try {
-    sessionStorage.setItem(KEY, JSON.stringify({ deckId, joinCode, at: Date.now() }));
+    sessionStorage.setItem(
+      KEY,
+      JSON.stringify({ deckId, joinCode, slideId: slideId ?? null, at: Date.now() })
+    );
   } catch {
     // Private mode quota. Costs us the banner, nothing more — the room is
     // still resumable by navigating to /present/:id, which is what the

@@ -136,6 +136,31 @@ Colour is authored in **OKLCH** — perceptually uniform, so equal `L` means equ
 visual weight across hues, and the second theme is arithmetic rather than a
 second hand-tuned palette.
 
+**A token colour cannot take slash-alpha. Use `color-mix`.**
+`bg-canvas/80` does not mean "the canvas at 80%" here — it computes to
+`rgba(0, 0, 0, 0)`, fully transparent. Tailwind's alpha modifier works by
+decomposing a colour into channels and re-emitting it with an alpha, and it
+cannot decompose an `oklch()` value handed to it through a CSS variable; what
+it emits is invalid, and an invalid colour falls back to transparent rather
+than erroring. The correct spelling, product-wide, is:
+
+```
+style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
+```
+
+This is recorded as a hard rule because the failure is silent in every channel
+we have. It is invisible in a diff (the class looks like every other class),
+invisible to the type checker, invisible to `lint:design` (which polices type
+sizes, not colour), and at runtime it does not look like a colour bug — it
+looks like a z-index or stacking-context bug, because the element is present,
+correctly sized and correctly ordered, and simply paints nothing. It shipped in
+**five** places and four of them had been wrong since the day they were
+written: the sticky headers on the deck list, templates, import/export and
+session history never had a background at all, and were being carried by
+`backdrop-blur` alone. Grep for `bg-[a-z-]*\/[0-9]` before reaching for a
+translucent surface; every current match in the codebase is a comment pointing
+back here.
+
 ### Type — eleven steps
 Named by role, after Apple's text styles, because a role survives a redesign and
 a pixel value does not. Tracking and line-height are properties *of the step*.
