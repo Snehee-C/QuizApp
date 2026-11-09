@@ -20,16 +20,16 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     if (this.state.error) {
       return (
-        <div className="min-h-screen flex items-center justify-center px-6 text-center">
-          <div className="max-w-sm">
-            <p className="text-xl font-bold text-red-600 mb-2">Something went wrong</p>
-            <p className="text-gray-500 text-sm mb-4">{this.state.error.message}</p>
+        <div className="min-h-[100dvh] grid place-items-center px-6 text-center bg-canvas text-ink">
+          <div className="max-w-sm flex flex-col gap-3 items-center">
+            <p className="font-display text-title2 font-bold">Something broke</p>
+            <p className="text-ink-subtle text-subhead">{this.state.error.message}</p>
             <button
               onClick={() => {
                 this.setState({ error: null });
-                window.location.href = "/";
+                window.location.hash = "#/";
               }}
-              className="bg-brand text-white px-4 py-2 rounded-lg font-medium"
+              className="mt-2 h-11 px-5 rounded-md bg-accent text-accent-ink font-semibold"
             >
               Go home
             </button>

@@ -1,5 +1,6 @@
 import { io, type Socket } from "socket.io-client";
 import { API_BASE } from "./config";
+import { avatarIndexFor } from "./avatars";
 
 let socket: Socket | null = null;
 
@@ -35,6 +36,12 @@ export function getParticipantId(): string {
     localStorage.setItem(KEY, id);
   }
   return id;
+}
+
+// The participant's preset avatar index, derived deterministically from their
+// stable participant ID so it stays the same across renders and reloads.
+export function getAvatarIndex(): number {
+  return avatarIndexFor(getParticipantId());
 }
 
 const NICKNAME_KEY = "menti_nickname";

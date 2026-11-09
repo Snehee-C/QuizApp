@@ -64,11 +64,24 @@ export const api = {
     }),
   getPresentation: (id: string) =>
     request<PresentationWithSlides>(`/presentations/${id}`),
-  updatePresentation: (id: string, title: string) =>
+  updatePresentation: (
+    id: string,
+    patch: Partial<
+      Pick<Presentation, "title" | "theme" | "pacing" | "isTemplate" | "filterMode" | "timeScale">
+    >
+  ) =>
     request<Presentation>(`/presentations/${id}`, {
       method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  duplicatePresentation: (id: string, title?: string) =>
+    request<Presentation>(`/presentations/${id}/duplicate`, {
+      method: "POST",
       body: JSON.stringify({ title }),
     }),
+  listTemplates: () => request<TemplateSummary[]>("/presentations/library/templates"),
+  listSessions: (presentationId: string) =>
+    request<SessionSummary[]>(`/presentations/${presentationId}/sessions`),
   deletePresentation: (id: string) =>
     request<{ ok: boolean }>(`/presentations/${id}`, { method: "DELETE" }),
 
@@ -81,7 +94,7 @@ export const api = {
   updateSlide: (
     presentationId: string,
     slideId: string,
-    data: { question?: string; type?: SlideType; config?: any }
+    data: { question?: string; type?: SlideType; config?: any; notes?: string }
   ) =>
     request<Slide>(`/presentations/${presentationId}/slides/${slideId}`, {
       method: "PATCH",
@@ -100,14 +113,41 @@ export const api = {
 };
 
 // --- Types ---
-export type SlideType = "MULTIPLE_CHOICE" | "WORD_CLOUD" | "SCALE" | "OPEN_ENDED";
+// Slide types are open-ended by design: the set is owned by the slide registry
+// (client/src/slides/registry.ts), and the server validates against its own
+// registry. A closed union here would mean every new type had to edit this
+// file too, which is exactly what the registry exists to avoid.
+export type SlideType = string;
 
 export interface Presentation {
   id: string;
   title: string;
+  /** Stage palette key — resolved against lib/themes.ts. */
+  theme: string;
+  pacing: "PRESENTER" | "AUDIENCE";
+  isTemplate: boolean;
+  /** off | mask | block — filtering applied to participant-authored text. */
+  filterMode: "off" | "mask" | "block";
+  /** Countdown multiplier, 1–3. Relaxed timing for accessibility. */
+  timeScale: number;
   createdAt: string;
   updatedAt: string;
   _count?: { slides: number };
+}
+
+export interface TemplateSummary extends Presentation {
+  owner?: { name: string };
+}
+
+export interface SessionSummary {
+  id: string;
+  joinCode: string;
+  status: "LOBBY" | "ACTIVE" | "ENDED";
+  startedAt: string;
+  endedAt: string | null;
+  responses: number;
+  questions: number;
+  participants: number;
 }
 
 export interface Slide {
@@ -117,6 +157,8 @@ export interface Slide {
   type: SlideType;
   question: string;
   config: string; // JSON string from API
+  /** Speaker notes. Presenter-only — never sent to participants. */
+  notes: string;
 }
 
 export interface PresentationWithSlides extends Presentation {

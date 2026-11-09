@@ -1,6 +1,10 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { motion } from "motion/react";
 import { useAuth } from "../auth";
+import { Button } from "../components/ui/Button";
+import { Input, Label } from "../components/ui/Card";
+import { spring } from "../lib/motion";
 
 export default function Login() {
   const [mode, setMode] = useState<"login" | "signup">("login");
@@ -17,11 +21,8 @@ export default function Login() {
     setError("");
     setLoading(true);
     try {
-      if (mode === "login") {
-        await login(email, password);
-      } else {
-        await signup(email, password, name);
-      }
+      if (mode === "login") await login(email, password);
+      else await signup(email, password, name);
       navigate("/dashboard");
     } catch (err: any) {
       setError(err.message || "Something went wrong");
@@ -31,60 +32,77 @@ export default function Login() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4">
-      <form
+    <div className="min-h-[100dvh] flex items-center justify-center px-6 py-10 bg-canvas text-ink">
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-0 z-0"
+        style={{
+          background:
+            "radial-gradient(760px 420px at 50% -12%, var(--accent-a18) 0%, transparent 62%)",
+        }}
+      />
+      <motion.form
+        initial={{ opacity: 0, y: 22 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={spring.slow}
         onSubmit={handleSubmit}
-        className="w-full max-w-sm bg-white rounded-xl shadow-md p-8 flex flex-col gap-4"
+        className="relative z-10 w-full max-w-sm flex flex-col gap-5"
       >
-        <h1 className="text-2xl font-bold text-center mb-2">
-          {mode === "login" ? "Log in" : "Create account"}
+        <h1 className="font-display text-title1 font-bold leading-tight text-center mb-1">
+          {mode === "login" ? "Welcome back" : "Create your account"}
         </h1>
 
         {mode === "signup" && (
-          <input
-            className="border rounded-lg px-4 py-2"
-            placeholder="Name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            required
-          />
+          <div>
+            <Label htmlFor="name">Name</Label>
+            <Input id="name" value={name} onChange={(e) => setName(e.target.value)} required autoComplete="name" />
+          </div>
         )}
-        <input
-          className="border rounded-lg px-4 py-2"
-          type="email"
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          required
-        />
-        <input
-          className="border rounded-lg px-4 py-2"
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          required
-          minLength={6}
-        />
+        <div>
+          <Label htmlFor="email">Email</Label>
+          <Input
+            id="email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+            autoComplete="email"
+          />
+        </div>
+        <div>
+          <Label htmlFor="password">Password</Label>
+          <Input
+            id="password"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            minLength={6}
+            autoComplete={mode === "login" ? "current-password" : "new-password"}
+          />
+        </div>
 
-        {error && <p className="text-red-600 text-sm">{error}</p>}
+        {error && (
+          <p role="alert" className="text-subhead font-medium text-danger">
+            {error}
+          </p>
+        )}
 
-        <button
-          type="submit"
-          disabled={loading}
-          className="bg-brand text-white rounded-lg py-2 font-medium hover:bg-brand-dark transition disabled:opacity-50"
-        >
-          {loading ? "Please wait..." : mode === "login" ? "Log in" : "Sign up"}
-        </button>
+        <Button type="submit" variant="primary" size="lg" disabled={loading} className="mt-1">
+          {loading ? "Please wait…" : mode === "login" ? "Log in" : "Sign up"}
+        </Button>
 
         <button
           type="button"
-          className="text-sm text-gray-500 hover:underline"
-          onClick={() => setMode(mode === "login" ? "signup" : "login")}
+          className="text-subhead text-ink-subtle hover:text-ink transition-colors duration-fast"
+          onClick={() => {
+            setMode(mode === "login" ? "signup" : "login");
+            setError("");
+          }}
         >
           {mode === "login" ? "Need an account? Sign up" : "Already have an account? Log in"}
         </button>
-      </form>
+      </motion.form>
     </div>
   );
 }

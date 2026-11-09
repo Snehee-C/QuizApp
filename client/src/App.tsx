@@ -8,6 +8,9 @@ import Present from "./presenter/Present";
 import Join from "./participant/Join";
 import Play from "./participant/Play";
 import Home from "./Home";
+import History from "./presenter/History";
+import Templates from "./presenter/Templates";
+import DeckTransfer from "./presenter/DeckTransfer";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const { user } = useAuth();
@@ -34,6 +37,30 @@ export default function App() {
         element={
           <RequireAuth>
             <Editor />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/templates"
+        element={
+          <RequireAuth>
+            <Templates />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/transfer"
+        element={
+          <RequireAuth>
+            <DeckTransfer />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/history/:id"
+        element={
+          <RequireAuth>
+            <History />
           </RequireAuth>
         }
       />
