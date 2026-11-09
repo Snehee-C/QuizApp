@@ -696,8 +696,25 @@ export default function Present() {
               <h2 className="font-display text-stage-q font-bold text-center leading-none">
                 Standings
               </h2>
-              {/* Top 5 only — past row 5 nothing is readable at 15ft. */}
-              <BarRaceLeaderboard entries={leaderboard.slice(0, 5)} celebrateLeader stage />
+              {/* Five rows only — past row 5 nothing is readable at 15ft.
+               *
+               * But the whole board goes IN. Slicing here was slicing the
+               * race's memory as well as its canvas: the component remembers
+               * what it last rendered, so a top-5 slice meant a player
+               * arriving from sixth had no remembered score and therefore no
+               * movement — the single most dramatic climb on the board was
+               * the one case that did not animate. `visibleRows` draws five
+               * and races all ten, so sixth-to-first crosses the cut line on
+               * the frame it earns. (Eleventh-to-first still cannot move:
+               * `computeLeaderboard` sends a top ten and we never had those
+               * rows. That is a wire limit, not a rendering one.) */}
+              <BarRaceLeaderboard
+                entries={leaderboard}
+                visibleRows={5}
+                raceKey="stage"
+                celebrateLeader
+                stage
+              />
             </motion.section>
           ) : (
             <QuestionStage

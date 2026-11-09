@@ -10,7 +10,7 @@ import {
 } from "../lib/socket";
 import { avatarFor } from "../lib/avatars";
 import { TILE_COLORS, ballBg } from "../lib/palette";
-import { spring } from "../lib/motion";
+import { ease, prefersReducedMotion, spring } from "../lib/motion";
 import { Podium, type LeaderboardEntry } from "../components/Podium";
 import { BarRaceLeaderboard } from "../components/BarRaceLeaderboard";
 import { PlayerBubbles } from "../components/PlayerBubbles";
@@ -151,6 +151,40 @@ export default function Play() {
   // Set only while the presenter has the leaderboard "on screen" — mirrors
   // the big-screen moment onto every phone at the same instant.
   const [leaderboardView, setLeaderboardView] = useState<LeaderboardEntry[] | null>(null);
+  // ── THE RANK EMBARGO ──────────────────────────────────────────────────
+  //
+  // Has the ROOM been shown the standings since this player's last answer?
+  // Until it has, nobody — including this phone — is entitled to a rank.
+  //
+  // `participant:submit` acks with `{ correct, points, totalScore, rank }`.
+  // The first three are this player's own business and go out immediately:
+  // "you were right, that was worth 973" is feedback, and withholding it
+  // would only make the phone useless. `rank` is not like them. It is a claim
+  // about everyone else, and the stage's whole second peak — the bar race, a
+  // 900ms hold in the remembered order followed by 1150ms of watching the
+  // overtakes happen — exists to deliver exactly that claim to the whole room
+  // at once.
+  //
+  // Measured before this existed: at the answer reveal, with the stage still
+  // showing the answer tiles and the standings yet to be called up, Devika's
+  // phone read "Correct +973 · 973 pts · rank #1" and Ayesha's read "Not this
+  // time · 823 pts · rank #2". Every phone in the room was holding the result
+  // of a race that had not been run. The race was theatre for a result the
+  // audience already had in their hands.
+  //
+  // So the number waits for the room. What it does NOT do is wait forever —
+  // see `visibleRank` below for the self-paced case, where the server
+  // guarantees there is no shared moment to wait for.
+  const [standingsSeen, setStandingsSeen] = useState(false);
+  // …and this player's row in that board, when it reached far enough down to
+  // list them. Preferred over the submit ack's `rank` once we have it: the
+  // ack's number is this player's place at the instant THEY answered, which
+  // everyone else answering has since moved. Showing a stale #2 directly
+  // after a race that just put them 3rd would be the same defect pointing the
+  // other way. The server sends a top ten, so a player below it is absent and
+  // we fall back to the ack — by then the moment has passed and a slightly
+  // old number spoils nothing.
+  const [publicRank, setPublicRank] = useState<number | null>(null);
   // The presenter revealed the answer for this slide. Input locks; correct
   // option(s) light up.
   const [reveal, setReveal] = useState<Reveal | null>(null);
@@ -196,6 +230,16 @@ export default function Play() {
   useEffect(() => {
     if (!joined) return;
     const socket = getSocket();
+
+    // The room has just been shown the standings. This is the ONLY thing that
+    // lifts the rank embargo in a presenter-paced deck, and it is lifted by
+    // the broadcast rather than by anything this phone did — which is the
+    // whole point: the number becomes public when it becomes public.
+    const roomSawStandings = (entries: LeaderboardEntry[]) => {
+      setStandingsSeen(true);
+      const i = entries.findIndex((e) => e.participantId === participantId.current);
+      setPublicRank(i >= 0 ? i + 1 : null);
+    };
 
     // Runs for the first join AND for every reconnect re-join — the ack is
     // specified to be correct for both, so one handler serves both.
@@ -244,7 +288,13 @@ export default function Play() {
       // `undefined` means a server that predates the field: leave whatever is
       // on screen rather than blanking a leaderboard we were legitimately shown.
       if (res.leaderboardView !== undefined) {
-        setLeaderboardView(res.leaderboardView ? (res.leaderboardView.entries ?? []) : null);
+        const live = res.leaderboardView ? (res.leaderboardView.entries ?? []) : null;
+        setLeaderboardView(live);
+        // A phone that reloads INTO the standings is in the shared moment
+        // like everyone else, so the embargo lifts for it too. Lifting it
+        // from the ack and not only from the broadcast is what stops a
+        // reload from telling a player LESS than the phone next to them.
+        if (live) roomSawStandings(live);
       }
 
       // The same audience-pacing contract `onSlideChanged` enforces: a
@@ -369,6 +419,12 @@ export default function Play() {
       setIndex(payload.index ?? 0);
       setFeedback(null);
       setLeaderboardView(null);
+      // A new question is a new claim about the room, so the embargo re-arms.
+      // The standings the room saw after the LAST question say nothing about
+      // where this one leaves anybody, and leaving the gate open would hand
+      // every phone its rank at the next reveal — the exact leak this closes.
+      setStandingsSeen(false);
+      setPublicRank(null);
       setReveal(null);
       // A new slide is a new answer: the M7 lock is per-slide, not per-session.
       setAnswered(false);
@@ -393,7 +449,11 @@ export default function Play() {
     };
 
     const onCount = (payload: any) => setParticipants(payload?.participants ?? []);
-    const onLeaderboardShow = (payload: any) => setLeaderboardView(payload.entries ?? []);
+    const onLeaderboardShow = (payload: any) => {
+      const entries: LeaderboardEntry[] = payload.entries ?? [];
+      setLeaderboardView(entries);
+      roomSawStandings(entries);
+    };
     const onLeaderboardHide = () => setLeaderboardView(null);
     const onEnded = (payload: any) => {
       setEnded(true);
@@ -631,6 +691,25 @@ export default function Play() {
     return <Lobby name={name} code={code ?? ""} participants={participants} />;
   }
 
+  // What rank, if any, this player may be shown right now. See the embargo
+  // note on `standingsSeen`.
+  //
+  // AUDIENCE pacing is the exception, and it is not a concession — it is the
+  // same rule applied to a deck that has no shared moment. `armRevealTimer`
+  // returns early for self-paced decks, by design and with a comment saying
+  // so, because at any instant different people are on different slides;
+  // there is no frame at which the room could see the standings together, and
+  // the host may never call them up at all. Withholding until a beat that
+  // never arrives is not suspense, it is a bug that looks like missing data.
+  // So a self-paced player gets the ack's rank the moment they earn it, which
+  // is also the only number that exists for them.
+  const visibleRank =
+    pacing === "AUDIENCE"
+      ? (feedback?.rank ?? null)
+      : standingsSeen
+        ? (publicRank ?? feedback?.rank ?? null)
+        : null;
+
   const isQuiz = currentSlide.type === "MULTIPLE_CHOICE" && currentSlide.config?.isQuiz;
   // A countdown is an invitation to answer. Anyone already locked in — this
   // round or before a reconnect — must not be watching one tick down.
@@ -693,6 +772,7 @@ export default function Play() {
                 reveal={reveal}
                 feedback={feedback}
                 answered={answered}
+                rank={visibleRank}
               />
             ) : feedback ? (
               <FeedbackCard key="feedback" feedback={feedback} />
@@ -884,6 +964,22 @@ function Lobby({
 function PlayerLeaderboard({ entries, meId }: { entries: LeaderboardEntry[]; meId: string }) {
   const mine = entries.find((e) => e.participantId === meId);
   const myRank = mine ? entries.indexOf(mine) + 1 : null;
+  // The phone runs the same race the stage does, so it can spoil it the same
+  // way — and it did, from its own pinned row, one surface below the leak
+  // this screen exists to protect. Measured: the row read "#1" on the frame
+  // the board landed, while the bars beside it were still held in the old
+  // order with that player's own bar sitting at 0 in sixth.
+  //
+  // So the rank arrives on the settle beat, with the +Δ chips, on the board's
+  // own clock rather than a timer of its own. The SCORE does not wait: it is
+  // this player's own number, it is already racing in their row, and holding
+  // it back would be withholding feedback rather than a result.
+  const [raceSettled, setRaceSettled] = useState(false);
+  // Read once, like the race does. Under reduced motion `onSettled` fires on
+  // mount, so this fade is all that stands between the reader and the number:
+  // §6 allows a 120ms opacity crossfade and nothing longer.
+  const reduced = useRef<boolean | null>(null);
+  if (reduced.current === null) reduced.current = prefersReducedMotion();
   return (
     <div className={cn(PHONE_SHELL, "px-5 py-7")}>
       <Bloom />
@@ -891,7 +987,12 @@ function PlayerLeaderboard({ entries, meId }: { entries: LeaderboardEntry[]; meI
         Leaderboard
       </p>
       <div className="relative z-10 flex-1 min-h-0 overflow-y-auto py-5">
-        <BarRaceLeaderboard entries={entries} celebrateLeader />
+        <BarRaceLeaderboard
+          entries={entries}
+          raceKey="phone"
+          celebrateLeader
+          onSettled={() => setRaceSettled(true)}
+        />
       </div>
       {/* The "you" row is pinned so a player never has to hunt for themselves. */}
       {mine && (
@@ -900,7 +1001,22 @@ function PlayerLeaderboard({ entries, meId }: { entries: LeaderboardEntry[]; meI
             You
           </span>
           <span className="flex items-baseline gap-2.5">
-            <span className="nums text-accent text-title3 font-bold">#{myRank}</span>
+            {/* Opacity, never mount/unmount: the number stays in the layout
+             * (so the score never shifts under it) and stays in the
+             * accessibility tree (so a screen-reader user, who is not
+             * watching bars travel, is not made to wait for a picture). With
+             * no race to wait for — a cold board, an unchanged one, or
+             * `prefers-reduced-motion` — `onSettled` fires on mount, so this
+             * is visible from frame one and the rank never ends up living
+             * only inside an animation. */}
+            <motion.span
+              className="nums text-accent text-title3 font-bold"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: raceSettled ? 1 : 0 }}
+              transition={{ duration: reduced.current ? 0.12 : 0.26, ease: ease.entrance }}
+            >
+              #{myRank}
+            </motion.span>
             <span className="nums text-ink text-title3 font-bold">{mine.score}</span>
             <span className="text-ink-subtle text-footnote">pts</span>
           </span>
@@ -1100,12 +1216,20 @@ function RevealCard({
   reveal,
   feedback,
   answered,
+  rank,
 }: {
   slide: CurrentSlide;
   reveal: Reveal;
   feedback: SubmitFeedback | null;
   /** The server has their answer even though this tab has no graded result. */
   answered: boolean;
+  /**
+   * This player's place in the room, or null while it is still embargoed.
+   * Deliberately NOT read off `feedback.rank`, which the ack has always
+   * carried: the embargo is decided by the shell, which is the only thing
+   * that knows whether the room has had its standings moment yet.
+   */
+  rank: number | null;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const RevealBody = slideType(slide.type)?.Reveal;
@@ -1143,10 +1267,27 @@ function RevealCard({
                 +{feedback.points}
               </p>
             )}
+            {/* Their own ledger. The score is theirs and goes out whole; the
+             * rank is the room's and waits for the room (see `visibleRank`).
+             *
+             * When it is withheld the line is not simply shorter — a blank
+             * where a number was reads as data we failed to fetch. It is
+             * replaced by the one true thing we can say about the missing
+             * number, which also happens to be the hook the whole moment
+             * runs on: it is about to happen over there. */}
             <p className="text-ink-subtle text-subhead mt-2">
-              <span className="nums font-bold text-ink-muted">{feedback.totalScore}</span> pts ·
-              rank <span className="nums font-bold text-ink-muted">#{feedback.rank}</span>
+              <span className="nums font-bold text-ink-muted">{feedback.totalScore}</span> pts
+              {rank !== null && (
+                <>
+                  {" · "}rank <span className="nums font-bold text-ink-muted">#{rank}</span>
+                </>
+              )}
             </p>
+            {rank === null && (
+              <p className="text-ink-subtle text-subhead mt-1">
+                Watch the big screen for where that puts you.
+              </p>
+            )}
           </>
         ) : feedback ? (
           <p className="font-display text-title2 font-bold">Answer submitted</p>

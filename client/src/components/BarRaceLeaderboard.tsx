@@ -26,8 +26,21 @@ interface BarRaceLeaderboardProps {
   celebrateLeader?: boolean;
   /** Stage sizing — bigger rows, stage type scale. */
   stage?: boolean;
+  /**
+   * How many rows to DRAW. The race still runs over the whole of `entries`,
+   * which is the point: see "RACING MORE THAN YOU DRAW" below. Default: all.
+   */
+  visibleRows?: number;
   /** Scopes the remembered board. One key per surface. */
   raceKey?: string;
+  /**
+   * Fired the frame the race resolves — the same beat the +Δ chips arrive on.
+   * For a caller that pins its own summary of the result beside the board and
+   * must not publish it before the board does. Called immediately (on mount)
+   * when there is no race to wait for, including under reduced motion, so a
+   * caller can gate on it without the gated thing becoming animation-only.
+   */
+  onSettled?: () => void;
   className?: string;
 }
 
@@ -62,6 +75,28 @@ interface BarRaceLeaderboardProps {
 //                 above it. Nothing schedules the reorder; it is a consequence.
 //   settle        +Δ chips and rank moves fade in, the chord resolves, and the
 //                 leader gets confetti if the leader changed.
+//
+// RACING MORE THAN YOU DRAW. The stage shows five rows, because past row five
+// nothing is readable at 15ft. For a while it was also only *given* five, and
+// that quietly cost the board its best moment: a player arriving from sixth
+// had no remembered score, so the one row on screen that had genuinely moved
+// was the one row that did not move. Measured on the case this is written for
+// — Devika, 6th on 0 points, first on 973 after a 973-point question — her row
+// was present in 232 of 253 sampled frames at a constant bar width of 1268px
+// and a constant score of "973", already first, from frame one. The four rows
+// she had just overtaken all carried a ↓1 chip explaining a demotion the room
+// never saw happen.
+//
+// So `entries` is now the WHOLE board the caller has (the server sends a top
+// ten) and `visibleRows` is how many of it to draw. The race, the remembered
+// baseline and the sort all run over the full set; only the render is sliced.
+// A climber enters the visible five at the exact frame her interpolated score
+// passes the fifth row's, and the row she displaced leaves on the same frame —
+// both through the same AnimatePresence the reorder already used.
+//
+// This is a window onto one race, not five rows racing. It is also why the
+// re-sort below compares the SLICE rather than the full order: in a big room
+// two players swapping 47th and 48th must not cost the stage a React render.
 //
 // WHERE THE PREVIOUS BOARD COMES FROM. Nowhere new — that is the point. The
 // server pushes `leaderboard:updated` on every single submission, so by the
@@ -130,9 +165,20 @@ export function BarRaceLeaderboard({
   previousEntries,
   celebrateLeader = false,
   stage = false,
+  visibleRows,
   raceKey = "default",
+  onSettled,
   className,
 }: BarRaceLeaderboardProps) {
+  // How many rows reach the screen. Everything else in here works on all of
+  // `entries`.
+  const drawn = visibleRows ?? entries.length;
+
+  // Held in a ref so the clock effect below can stay a mount-once effect: a
+  // caller passing an inline arrow must not be able to restart the race.
+  const settledCb = useRef(onSettled);
+  settledCb.current = onSettled;
+
   // Read once. A media-query flip mid-race would leave the animation half
   // committed, and this is a 2-second moment, not a session-long preference.
   const reduced = useRef<boolean | null>(null);
@@ -165,20 +211,18 @@ export function BarRaceLeaderboard({
   //   none  — no race; start where you end.
   //   cold  — no remembered board at all; everyone starts at zero.
   //   warm  — the remembered score. A row with NO remembered score is a row
-  //           that was not on the board the room last saw. On the stage that
-  //           board is the top five, so this is usually someone arriving from
-  //           sixth, and the one thing we must not do is invent a number for
-  //           them: racing them up from zero would put a score on the screen
-  //           they never had, and dropping them to the bottom row would claim
-  //           a position the remembered board never showed. So they do not
-  //           move, and they carry no +Δ and no rank arrow — the component
-  //           says nothing rather than something false.
-  //
-  //           This is the one place the moment is poorer than it could be,
-  //           and it is a DATA limit, not a design one: a caller that passes
-  //           the full board through `previousEntries` (or simply renders
-  //           more rows than the stage shows) gets the sixth-to-first climb
-  //           for free, with no change here.
+  //           that was not on the board the room last saw AT ALL — a player
+  //           who joined mid-session, or one the server's top ten did not
+  //           reach. (It is no longer "someone arriving from sixth": the
+  //           caller passes the whole board now and `visibleRows` decides
+  //           what is drawn, so sixth has a remembered score like everyone
+  //           else.) For a row we genuinely never showed, the one thing we
+  //           must not do is invent a number: racing them up from zero would
+  //           put a score on the screen they never had, and dropping them to
+  //           the bottom row would claim a position the remembered board
+  //           never showed. So they do not move, and they carry no +Δ and no
+  //           rank arrow — the component says nothing rather than something
+  //           false.
   const prevScoreOf = (id: string) => {
     if (base.mode === "none") return entries.find((e) => e.participantId === id)?.score ?? 0;
     if (base.mode === "cold") return 0;
@@ -223,7 +267,8 @@ export function BarRaceLeaderboard({
     return was + (will - was) * v;
   }
 
-  const [order, setOrder] = useState<string[]>(() => liveOrder(p.get()));
+  /** The rows actually on screen: the top `drawn` of the live order. */
+  const [order, setOrder] = useState<string[]>(() => liveOrder(p.get()).slice(0, drawn));
   // Captured once: the stagger delay has to come from where a row STARTS, or
   // a row that overtakes during the run would retroactively change the
   // entrance it already played.
@@ -238,7 +283,9 @@ export function BarRaceLeaderboard({
   // and fighting its own FLIP.
   useEffect(() => {
     const recompute = (v: number) => {
-      const next = liveOrder(v);
+      // Sliced before the comparison, not after: the stage draws five rows out
+      // of up to ten, and a swap below the cut line changes nothing on screen.
+      const next = liveOrder(v).slice(0, drawn);
       setOrder((cur) =>
         cur.length === next.length && cur.every((id, i) => id === next[i]) ? cur : next
       );
@@ -246,11 +293,18 @@ export function BarRaceLeaderboard({
     recompute(p.get());
     return p.on("change", recompute);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [p, entries]);
+  }, [p, entries, drawn]);
 
   // The clock.
   useEffect(() => {
-    if (!animated) return;
+    // Nothing to withhold: tell the caller the board is final NOW. Reduced
+    // motion lands here, which is deliberate — a caller gating a number on
+    // `onSettled` must not end up with a number that only exists if the
+    // animation ran.
+    if (!animated) {
+      settledCb.current?.();
+      return;
+    }
     const runMs = RACE.run;
     // One riser spanning the hold AND the run: the build has to end where the
     // picture ends, or it tells the room the moment is over early.
@@ -275,6 +329,7 @@ export function BarRaceLeaderboard({
     const toSettle = window.setTimeout(() => {
       setPhase("settled");
       if (stage) playSound("land");
+      settledCb.current?.();
     }, armMs + runMs);
 
     return () => {
@@ -366,7 +421,12 @@ export function BarRaceLeaderboard({
               reduced={reduced.current!}
               settled={settled}
               showDelta={showDelta}
-              entranceDelay={(entranceIndex.current.get(id) ?? idx) * STAGGER}
+              // No captured index means this row was not on screen when the
+              // board landed — it climbed into the visible window during the
+              // run. The stagger is the ENTRANCE's rhythm and this is not the
+              // entrance, so it gets none: a row that has just overtaken four
+              // people must appear on the frame it earned, not 175ms later.
+              entranceDelay={(entranceIndex.current.get(id) ?? 0) * STAGGER}
               onBallRef={(el) => {
                 if (el) leaderRefs.current.set(id, el);
                 else leaderRefs.current.delete(id);
