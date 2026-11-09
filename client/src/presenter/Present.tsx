@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
 import { motion, AnimatePresence } from "motion/react";
@@ -26,7 +26,8 @@ import { FitText } from "../components/ui/FitText";
 import { Button } from "../components/ui/Button";
 import { SoundToggle } from "../components/ui/SoundToggle";
 import { initSound, playSound } from "../lib/sound";
-import { clearPresenting, markPresenting } from "../lib/liveSession";
+import { clearPresenting, markPresenting, markRunFinished } from "../lib/liveSession";
+import { SlideNavigator } from "../components/SlideNavigator";
 import { burstAt, burstFrom } from "../lib/confetti";
 
 interface CurrentSlide {
@@ -70,6 +71,7 @@ export default function Present() {
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [speakerOpen, setSpeakerOpen] = useState(false);
   const [qaOpen, setQaOpen] = useState(false);
+  const [navOpen, setNavOpen] = useState(false);
 
   const joinCodeRef = useRef<string | null>(null);
   const currentSlideIdRef = useRef<string | null>(null);
@@ -253,6 +255,20 @@ export default function Present() {
     }
 
     socket.on("slide:changed", (payload) => {
+      // Re-learn the deck as the host moves through it. `totalSlides` is
+      // authoritative on every frame while `slideTitles` is issued once, so a
+      // length disagreement is the only signal we get that the session's
+      // snapshot was reconciled under us (a slide deleted from the deck
+      // mid-run). When that happens every index below is suspect, so the list
+      // drops to numbers and re-learns a title each time the host lands on a
+      // slide — a navigator showing confidently WRONG titles is worse than one
+      // showing none, because the host jumps on it in front of a room.
+      setSlideTitles((prev) => {
+        const n = payload.totalSlides ?? prev.length;
+        const base = prev.length === n ? prev.slice() : Array.from({ length: n }, () => null);
+        if (payload.currentSlide) base[payload.index] = payload.currentSlide.question;
+        return base;
+      });
       setIndex(payload.index);
       setStatus(payload.status);
       setCurrentSlide(payload.currentSlide);
@@ -353,6 +369,21 @@ export default function Present() {
     getSocket().emit("presenter:prev", { joinCode: joinCodeRef.current, token: getToken() }, () => {});
   }, [viewMode, hideLeaderboard, index]);
 
+  // One frame, where stepping there was N. `presenter:goto` runs the same
+  // validated nav chain as next/prev (including deleted-slide reconciliation),
+  // and it is what `start()` has always used to open the deck at index 0 — so
+  // this is not a new path through the server, it is the existing one finally
+  // given a surface.
+  const jumpTo = useCallback((target: number) => {
+    setNavOpen(false);
+    setViewMode("question");
+    getSocket().emit(
+      "presenter:goto",
+      { joinCode: joinCodeRef.current, index: target, token: getToken() },
+      () => {}
+    );
+  }, []);
+
   function start() {
     getSocket().emit(
       "presenter:goto",
@@ -369,6 +400,12 @@ export default function Present() {
       // would stay silent anyway; clearing here saves it the round trip and
       // keeps the crumb honest.
       clearPresenting();
+      // ...and leave a pointer to what it WAS, so the dashboard can offer the
+      // results of the run the host just finished instead of making them go
+      // and find it (FLOW.md F6).
+      if (id && sessionId && joinCodeRef.current) {
+        markRunFinished(id, sessionId, joinCodeRef.current);
+      }
       setFinalEntries(res?.entries ?? []);
     });
   }
@@ -404,6 +441,21 @@ export default function Present() {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      // While the navigator is open the arrows belong to IT. Without this,
+      // browsing the map with the keyboard would also be driving the room:
+      // ArrowRight here is `presenter:next`, a broadcast to every phone.
+      if (navOpen) {
+        if (e.key === "g") {
+          e.preventDefault();
+          setNavOpen(false);
+        }
+        return;
+      }
+      if (e.key === "g") {
+        e.preventDefault();
+        if (totalSlides > 0) setNavOpen(true);
+        return;
+      }
       if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") {
         e.preventDefault();
         if (status === "LOBBY") start();
@@ -421,9 +473,25 @@ export default function Present() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, next, prev, viewMode, showLeaderboard, hideLeaderboard]);
+  }, [status, next, prev, viewMode, showLeaderboard, hideLeaderboard, navOpen, totalSlides]);
 
-  const [slideTitles, setSlideTitles] = useState<string[]>([]);
+  // What each slide is called, for the jump navigator. Nullable per entry,
+  // because "we no longer know" is a state this has to be able to express:
+  // the titles arrive once on the session ack and nothing re-issues them, so
+  // a slide added or deleted mid-session silently invalidates the list.
+  const [slideTitles, setSlideTitles] = useState<(string | null)[]>([]);
+  // Built from `totalSlides`, never from the title array's length: the count
+  // is authoritative on every frame and the titles are not, so the navigator
+  // always offers exactly the slides that exist even when it cannot name them.
+  //
+  // Memoised because it is a dependency of the speaker-window effect, and a
+  // fresh array identity every render would re-write that window on every
+  // answer that streams in.
+  const navSlides = useMemo(
+    () => Array.from({ length: totalSlides }, (_, i) => ({ index: i, title: slideTitles[i] ?? null })),
+    [totalSlides, slideTitles]
+  );
+
   // Where phones should point. Null until resolved; falls back to this page's
   // own origin, which is correct whenever the host is not on localhost.
   const [joinOrigin, setJoinOrigin] = useState<string | null>(null);
@@ -448,8 +516,13 @@ export default function Present() {
       nextQuestion: slideTitles[index + 1] ?? null,
       participants: participantCount,
       answered: aggregate?.total ?? 0,
+      // The same deck the stage navigator offers, on the one surface the
+      // projector never shows. A host with a second screen never has to put
+      // the upcoming questions on the wall to find one.
+      slides: navSlides,
+      onJump: jumpTo,
     });
-  }, [speakerOpen, index, totalSlides, currentSlide, notes, slideTitles, participantCount, aggregate]);
+  }, [speakerOpen, index, totalSlides, currentSlide, notes, slideTitles, participantCount, aggregate, navSlides, jumpTo]);
 
   useEffect(() => () => closeSpeakerWindow(), []);
 
@@ -603,6 +676,11 @@ export default function Present() {
         // editor shows a LiveRoomBar for exactly this crumb, so the door is
         // visible from both sides.
         onEditDeck={() => navigate(`/edit/${id}`)}
+        slides={navSlides}
+        currentIndex={index}
+        navOpen={navOpen}
+        onToggleNav={() => setNavOpen((v) => !v)}
+        onJump={jumpTo}
         onToggleStage={toggleStage}
         onFullscreen={toggleFullscreen}
         onStart={start}
@@ -813,6 +891,11 @@ function ControlBar(props: {
   status: string;
   stage: Stage;
   onEditDeck: () => void;
+  slides: { index: number; title: string | null }[];
+  currentIndex: number;
+  navOpen: boolean;
+  onToggleNav: () => void;
+  onJump: (index: number) => void;
   onToggleStage: () => void;
   onFullscreen: () => void;
   onStart: () => void;
@@ -858,8 +941,22 @@ function ControlBar(props: {
       transition={{ duration: 0.22 }}
       className="relative z-30 shrink-0 flex justify-center pb-5 pt-1"
     >
+      <AnimatePresence>
+        {props.navOpen && (
+          <SlideNavigator
+            slides={props.slides}
+            currentIndex={props.currentIndex}
+            onJump={props.onJump}
+            onClose={props.onToggleNav}
+          />
+        )}
+      </AnimatePresence>
+
       <div
-        className="flex items-center gap-2 rounded-pill px-3 py-2.5 shadow-elev-2"
+        // Wrap rather than clip. Twelve controls fit every projector width we
+        // target, but a bar that silently pushes "End" off the right edge of a
+        // narrow one is a failure mode with no warning and no recovery.
+        className="flex flex-wrap justify-center items-center gap-2 max-w-[92vw] rounded-pill px-3 py-2.5 shadow-elev-2"
         style={{
           background: "color-mix(in oklch, var(--surface-1), transparent 22%)",
           backdropFilter: "blur(16px)",
@@ -900,6 +997,23 @@ function ControlBar(props: {
               </Button>
             )}
           </>
+        )}
+
+        {/* Sits with Back/Next because it is the same verb at a different
+            distance: those move one slide, this moves any number. Available
+            from the lobby too — opening a deck at slide 4 is a legitimate
+            thing to want, and `goto` has always supported it. */}
+        {props.slides.length > 0 && (
+          <Button
+            variant={props.navOpen ? "secondary" : "ghost"}
+            size="md"
+            onClick={props.onToggleNav}
+            aria-expanded={props.navOpen}
+            aria-haspopup="dialog"
+            title="Go to any slide (g)"
+          >
+            Slides
+          </Button>
         )}
 
         <span className="w-px h-6 bg-hairline mx-1" aria-hidden="true" />

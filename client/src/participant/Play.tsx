@@ -523,7 +523,7 @@ export default function Play() {
   }
 
   if (status === "LOBBY" || !currentSlide) {
-    return <Lobby name={name} participants={participants} />;
+    return <Lobby name={name} code={code ?? ""} participants={participants} />;
   }
 
   const isQuiz = currentSlide.type === "MULTIPLE_CHOICE" && currentSlide.config?.isQuiz;
@@ -540,9 +540,25 @@ export default function Play() {
        * (rather than being dropped entirely) because remote players often have
        * no shared screen at all. */}
       <header className="relative z-10 shrink-0 px-5 pt-5 pb-3 flex items-start gap-4">
-        <p className="flex-1 font-display font-bold text-body leading-snug text-ink-muted line-clamp-3">
-          {currentSlide.question}
-        </p>
+        <div className="flex-1 min-w-0">
+          {/* "Three of twelve." Status, not mirrored content — DESIGN.md
+              rejects echoing the big screen onto the phone, and this echoes
+              nothing: it answers "how much of this is left", which the shared
+              screen never says and a remote player with no shared screen
+              cannot possibly know.
+
+              Host-paced only. A self-paced deck already carries the same
+              counter in its own nav bar at the foot of the screen, and two
+              spellings of one fact is the defect P1 exists to prevent. */}
+          {pacing === "PRESENTER" && totalSlides > 0 && (
+            <p className="nums text-caption2 font-semibold uppercase track-label text-ink-subtle mb-1">
+              {index + 1} of {totalSlides}
+            </p>
+          )}
+          <p className="font-display font-bold text-body leading-snug text-ink-muted line-clamp-3">
+            {currentSlide.question}
+          </p>
+        </div>
         {showTimer && (
           <TimerRing
             key={currentSlide.id}
@@ -711,7 +727,15 @@ function NicknameGate({
   );
 }
 
-function Lobby({ name, participants }: { name: string; participants: LobbyParticipant[] }) {
+function Lobby({
+  name,
+  code,
+  participants,
+}: {
+  name: string;
+  code: string;
+  participants: LobbyParticipant[];
+}) {
   return (
     <div className={cn(PHONE_SHELL, "px-5 py-7 text-center")}>
       <Bloom />
@@ -720,6 +744,17 @@ function Lobby({ name, participants }: { name: string; participants: LobbyPartic
           You're in, {name}
         </p>
         <p className="text-ink-subtle mt-1.5 text-subhead">Waiting for the host to start…</p>
+        {/* The code they are actually in, echoed back.
+            Join codes are six digits and rooms next door have them too, so a
+            single mistyped digit lands a player in a real but wrong session —
+            and before this the phone showed nothing they could check against.
+            It waits here, where there is time to read it, and not on the
+            question screen, where it would be noise. */}
+        {code && (
+          <p className="text-caption2 font-semibold uppercase track-label text-ink-subtle mt-3">
+            Room <span className="code text-ink-muted">{code}</span>
+          </p>
+        )}
       </div>
 
       <div className="relative z-10 flex-1 min-h-0 my-3">

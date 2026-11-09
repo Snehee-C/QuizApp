@@ -7,13 +7,21 @@ import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
 import { LiveRoomBar } from "../components/LiveRoomBar";
 import { MoreMenu } from "../components/MoreMenu";
-import { getPresenting } from "../lib/liveSession";
+import { getLastRun, getPresenting } from "../lib/liveSession";
+import { LastRunBar } from "../components/LastRunBar";
+import { useScrollMemory } from "../lib/scrollMemory";
 
 export default function Dashboard() {
   const [items, setItems] = useState<Presentation[]>([]);
   const [loading, setLoading] = useState(true);
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  // Eighty rows deep is a real place to be; coming back to the top of the
+  // list is not the same page (FLOW.md F3) — unless there is a band at the top
+  // with something to say, in which case restoring the old position scrolls
+  // the host straight past it.
+  const hasBanner = !!getPresenting() || !!getLastRun();
+  useScrollMemory("dashboard", !loading, !hasBanner);
 
   useEffect(() => {
     api.listPresentations().then((data) => {
@@ -40,7 +48,14 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
-      <header className="sticky top-0 z-20 bg-canvas/80 backdrop-blur border-b border-hairline">
+      {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
+          inject an alpha channel into an `oklch()` token and computes to fully
+          transparent, so this header has been relying on `backdrop-blur`
+          alone — page content scrolled underneath it blurred but untinted. */}
+      <header
+        className="sticky top-0 z-20 backdrop-blur border-b border-hairline"
+        style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
+      >
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
           {/* Inside the app, a wordmark means "home" and home is the deck
               list — not the marketing page, which is where this pointed from
@@ -77,6 +92,16 @@ export default function Dashboard() {
         title={items.find((p) => p.id === getPresenting()?.deckId)?.title}
         contentClassName="max-w-4xl mx-auto px-6"
       />
+      {/* The run that just ended. Only when there isn't a live one — a host
+          looking at "your room is still open" does not also need to be told
+          about the session before it, and two stacked bands would be the
+          product talking over itself. */}
+      {!getPresenting() && (
+        <LastRunBar
+          title={items.find((p) => p.id === getLastRun()?.deckId)?.title}
+          contentClassName="max-w-4xl mx-auto px-6"
+        />
+      )}
 
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="flex items-end justify-between gap-4 mb-7">

@@ -14,6 +14,8 @@ import { cn } from "../lib/cn";
 import { SLIDE_GROUPS, labelFor, slideType, typesInGroup } from "../slides/registry";
 import { ThemePicker } from "../components/ThemePicker";
 import { LiveRoomBar } from "../components/LiveRoomBar";
+import { SlideTypePicker } from "../components/SlideTypePicker";
+import { AnimatePresence } from "motion/react";
 
 // Where the host was last working in this deck, per deck, for this tab.
 //
@@ -55,6 +57,7 @@ export default function Editor() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const navigate = useNavigate();
 
   // One place that moves the selection, so remembering it cannot be forgotten
@@ -89,6 +92,7 @@ export default function Editor() {
 
   async function addSlide(type: SlideType) {
     if (!id) return;
+    setPickerOpen(false);
     const def = slideType(type);
     const slide = await api.addSlide(id, type, "", def ? def.defaultConfig() : {});
     await load(false);
@@ -256,28 +260,24 @@ export default function Editor() {
             </div>
           ))}
 
-          <div className="mt-2 pt-3 border-t border-hairline flex flex-col gap-3">
-            {SLIDE_GROUPS.map((group) => {
-              const types = typesInGroup(group.key);
-              if (types.length === 0) return null;
-              return (
-                <div key={group.key} className="flex flex-col gap-1">
-                  <p className="text-caption2 font-semibold uppercase track-label text-ink-subtle px-1">
-                    {group.label}
-                  </p>
-                  {types.map((t) => (
-                    <button
-                      key={t.type}
-                      onClick={() => addSlide(t.type)}
-                      className="text-left px-3 py-2 rounded-sm text-subhead text-ink-muted hover:bg-surface-1 hover:text-ink transition-colors duration-fast"
-                      title={t.hint}
-                    >
-                      + {t.label}
-                    </button>
-                  ))}
-                </div>
-              );
-            })}
+          {/* One press, not seventeen. The rail's job is the deck you are
+              building; the catalogue of things you COULD build is a different
+              question and now waits to be asked (SlideTypePicker.tsx). This
+              also gives the slide list back the vertical space the catalogue
+              was occupying on every deck. */}
+          {/* The rule separates the deck from the thing that adds to it. With
+              no deck yet there is nothing to separate, and a hairline with
+              nothing above it is a line drawn for its own sake (DESIGN.md
+              P2/P3: a hairline SEPARATES, it does not decorate). */}
+          <div className={cn(pres.slides.length > 0 && "mt-2 pt-3 border-t border-hairline")}>
+            <Button
+              variant="secondary"
+              size="md"
+              className="w-full"
+              onClick={() => setPickerOpen(true)}
+            >
+              + Add slide
+            </Button>
           </div>
         </aside>
 
@@ -293,14 +293,88 @@ export default function Editor() {
               onDuplicate={() => duplicate(selected)}
             />
           ) : (
-            <p className="text-ink-subtle">Select or add a slide to edit it.</p>
+            <EmptyDeck onPick={addSlide} onBrowse={() => setPickerOpen(true)} />
           )}
         </main>
       </div>
+
+      <AnimatePresence>
+        {pickerOpen && (
+          <SlideTypePicker onPick={addSlide} onClose={() => setPickerOpen(false)} />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
 
+// What an empty deck should say.
+//
+// It used to say "Select or add a slide to edit it" — a sentence that describes
+// the mechanism and recommends nothing, next to a rail of seventeen equal
+// options. A first-run host's real question is not "which of these seventeen"
+// but "what does a good first slide look like", and the honest answer is: a
+// multiple-choice question. So that is offered first, by name, with the two
+// next-likeliest beside it and the full catalogue one press away.
+//
+// The three are named by wire type and resolved through the registry, so a
+// type that is renamed or removed drops out of this list instead of rendering
+// a button that adds nothing.
+const SUGGESTED = ["MULTIPLE_CHOICE", "WORD_CLOUD", "SCALE"];
+
+function EmptyDeck({
+  onPick,
+  onBrowse,
+}: {
+  onPick: (type: SlideType) => void;
+  onBrowse: () => void;
+}) {
+  const suggested = SUGGESTED.map((t) => slideType(t)).filter(
+    (d): d is NonNullable<typeof d> => !!d
+  );
+  const total = SLIDE_GROUPS.reduce((n, g) => n + typesInGroup(g.key).length, 0);
+
+  return (
+    <div className="max-w-2xl">
+      <h2 className="font-display text-title1 font-bold leading-tight">
+        Let's build your first slide
+      </h2>
+      <p className="text-ink-subtle text-subhead mt-2 mb-7 max-w-[46ch]">
+        Most decks open with a question the room answers from their phones.
+      </p>
+
+      <div className="flex flex-col gap-2">
+        {suggested.map((d, i) => (
+          <button
+            key={d.type}
+            type="button"
+            onClick={() => onPick(d.type)}
+            className={cn(
+              "text-left px-5 py-4 rounded-md outline-none transition-colors duration-fast",
+              "focus-visible:shadow-focus",
+              // Only the first one is the recommendation. Three equally
+              // weighted buttons would reproduce the problem this replaces,
+              // just with fourteen fewer of them.
+              i === 0
+                ? "bg-accent text-accent-ink"
+                : "bg-surface-2 text-ink hover:bg-surface-3"
+            )}
+          >
+            <span className="block text-body font-semibold">{d.label}</span>
+            <span
+              className={cn("block text-footnote mt-0.5", i === 0 ? "text-accent-ink" : "text-ink-subtle")}
+            >
+              {d.hint}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      <Button variant="ghost" size="sm" className="mt-3 -ml-3.5" onClick={onBrowse}>
+        Browse all {total} slide types
+      </Button>
+    </div>
+  );
+}
 
 // Deck-level settings: how the stage looks, who drives the deck, and whether
 // it is offered to others as a template.

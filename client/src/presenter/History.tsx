@@ -7,6 +7,7 @@ import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
 import { duration as dur, STAGGER, prefersReducedMotion } from "../lib/motion";
 import { cn } from "../lib/cn";
+import { useScrollMemory } from "../lib/scrollMemory";
 
 // "7 Nov, 14:32" — day + month + 24h clock. No year: the overwhelming majority
 // of runs a host looks back at are recent, and the year is noise in a list.
@@ -52,6 +53,8 @@ export default function History() {
   // Per-row so one slow or failed export never freezes the whole list.
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [exportError, setExportError] = useState<string | null>(null);
+  // Keyed by deck: two decks' histories are two different places.
+  useScrollMemory(`history:${id}`, !loading);
 
   useEffect(() => {
     if (!id) return;
@@ -115,7 +118,14 @@ export default function History() {
 
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
-      <header className="sticky top-0 z-20 bg-canvas/80 backdrop-blur border-b border-hairline">
+      {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
+          inject an alpha channel into an `oklch()` token and computes to fully
+          transparent, so this header has been relying on `backdrop-blur`
+          alone — page content scrolled underneath it blurred but untinted. */}
+      <header
+        className="sticky top-0 z-20 backdrop-blur border-b border-hairline"
+        style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
+      >
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
           {/* A trail, not a single door.
 

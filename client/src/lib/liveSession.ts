@@ -59,3 +59,55 @@ export function getPresenting(deckId?: string): LiveCrumb | null {
     return null;
   }
 }
+
+// ── The run that just finished ───────────────────────────────────────────
+//
+// Ending a session gave the host four doors on the final screen (FLOW.md F6),
+// and the moment they took any of them those doors were gone: getting back to
+// the results they had just been looking at meant finding the deck in a list
+// of eighty, opening its history, and downloading from there.
+//
+// There is no bulk "recent sessions" endpoint and the server is not ours to
+// change, so asking the API which deck ran last would mean one request per
+// deck. The host's own browser already knows — it was driving the session —
+// so the answer is remembered rather than re-derived.
+//
+// Same tab scope and same honesty rule as the live crumb above: this is a
+// pointer, and the pages that use it still link to real, authenticated
+// endpoints rather than trusting anything cached here.
+
+const LAST_KEY = "menti_last_run";
+
+export interface LastRun {
+  deckId: string;
+  sessionId: string;
+  joinCode: string;
+  at: number;
+}
+
+export function markRunFinished(deckId: string, sessionId: string, joinCode: string): void {
+  try {
+    sessionStorage.setItem(LAST_KEY, JSON.stringify({ deckId, sessionId, joinCode, at: Date.now() }));
+  } catch {
+    /* see markPresenting */
+  }
+}
+
+export function getLastRun(): LastRun | null {
+  try {
+    const raw = sessionStorage.getItem(LAST_KEY);
+    if (!raw) return null;
+    const r = JSON.parse(raw) as LastRun;
+    return r?.deckId && r?.sessionId ? r : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearLastRun(): void {
+  try {
+    sessionStorage.removeItem(LAST_KEY);
+  } catch {
+    /* see markPresenting */
+  }
+}

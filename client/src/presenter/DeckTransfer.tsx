@@ -158,7 +158,14 @@ export default function DeckTransfer() {
 
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
-      <header className="sticky top-0 z-20 bg-canvas/80 backdrop-blur border-b border-hairline">
+      {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
+          inject an alpha channel into an `oklch()` token and computes to fully
+          transparent, so this header has been relying on `backdrop-blur`
+          alone — page content scrolled underneath it blurred but untinted. */}
+      <header
+        className="sticky top-0 z-20 backdrop-blur border-b border-hairline"
+        style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
+      >
         <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
           {/* Inside the app, a wordmark means "home" and home is the deck
               list — not the marketing page, which is where this pointed from

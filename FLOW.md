@@ -192,11 +192,81 @@ reachable from two places and a single "back" cannot be right for both.
 Previously its one control, `Back to decks`, threw a host who arrived from the
 editor two levels up and left them to find their way back in.
 
+### Host, mid-deck: go to slide 9 of 20
+The presenter could only step ±1, and `presenter:next` is a **broadcast**.
+
+| | Before | After |
+|---|---|---|
+| Presses | **8** | **1** (or `g`, then click) |
+| Frames pushed to every phone in the room | **8** | **1** (measured) |
+| Countdown restarts the room watches | 8 | 1 |
+| Questions shown to the room on the way | 7 it was not meant to see yet | none |
+
+The server has had `presenter:goto` since the beginning — `start()` uses it to
+open the deck at index 0, and it runs the same validated nav chain as next/prev
+including deleted-slide reconciliation. The transport was never missing; the
+surface was. `slideTitles` was already on the session ack, unused.
+
+**Where it lives, and why.** A jump target is a navigation surface and on this
+product navigation surfaces are projected, so there are two questions: what
+classification does it carry, and who gets to read it.
+
+It renders inside the control bar's `<footer>`. That is not a convenience —
+`DESIGN.md` §6 holds the floating bar to AA at desk distance rather than the
+24px/7:1 stage floor, and the floor audit encodes that same boundary as
+`el.closest("footer")`. A desk-distance panel anywhere else would mean either
+lying to the audit or setting a slide list at 24px. If it ever moves out of
+that footer it moves onto the stage ladder with it.
+
+On who reads it: yes, the room can see the upcoming questions while it is open.
+That cost is real and it is the smaller one — the behaviour it replaces showed
+the room those same questions as full-screen slides, one after another, with
+the clock running on each. A two-second glance at a dimmed, truncated list is
+strictly less leakage than actually presenting them. It is host-initiated, it
+dismisses on Escape, on an outside click and on the jump itself, and the stage
+behind it is scrimmed so the room reads "the host is choosing", not "here is
+the deck". No config, no options and no correct answers are routed into the
+component.
+
+**On the speaker window.** It is the right home and the wrong *only* home. It
+needs a popup that can be blocked (`Present.tsx` already handles that case) and
+a second display, and a navigation surface that exists only when a popup
+succeeded is not a navigation surface. So the stage carries it always, and
+`components/SpeakerWindow.ts` now carries the same list, clickable — a
+dual-screen host never has to put the deck on the wall to find a slide.
+
+Arrow keys are suppressed on the main handler while the panel is open. Without
+that, browsing the map with the keyboard would have been driving the room:
+`ArrowRight` there is `presenter:next`. Verified — the room's frame count does
+not move while the navigator is open.
+
 ### Host, first run
-`New deck` → editor → `+ Multiple choice` → type → `Present`. Three presses,
-unchanged. The cost here was never steps: it is that the empty editor says
-*"Select or add a slide to edit it"* beside **seventeen** equally-weighted
-slide types and recommends none of them. Not fixed — §6.
+| | Before | After |
+|---|---|---|
+| The empty pane said | *"Select or add a slide to edit it"* | *"Let's build your first slide"* + the three likeliest, the first one recommended by name |
+| Choices in the rail, always | **17**, flat, three headings, no recommendation | **1** — `+ Add slide` |
+| Presses to a first slide | 1 (after scanning 17) | **1** |
+| Each type's one-line hint | written, but hidden in a `title` attribute | visible on every card |
+| Expert path | scan 17 inline | `+ Add slide`, type three letters, Enter |
+
+Hiding a catalogue taxes the person who already knows what they want, and that
+is the person using it most — so the picker opens focused on a filter. "rank" +
+Enter adds a Ranking slide. The expert comes out ahead rather than taxed.
+
+### Host, after the session — one screen later
+The four doors on the final screen vanish the moment the host takes one of
+them, and the CSV is usually wanted a minute *later*, once they have sat down.
+
+| | Before | After |
+|---|---|---|
+| Presses to the CSV from the deck list | 3 + a scan of every deck you own (104 rows on the test account) | **1** |
+| How | find the deck, `•••`, Session history, Download | `You just ran <deck> — Download results` |
+
+There is no bulk "recent sessions" endpoint and the server is not ours to
+change, so asking the API which deck ran last would be one request per deck.
+The host's own browser already knows — it was driving the session — so the
+answer is remembered rather than re-derived, and the band still links to the
+real authenticated endpoint rather than trusting anything cached.
 
 ### Player
 | | Before | After |
@@ -205,12 +275,35 @@ slide types and recommends none of them. Not fixed — §6.
 | Controls on the podium | **0** | `Join another game` |
 | Getting to the next game | find the address bar on a phone, or press browser Back | one tap |
 | Reload after the podium | returns to a game they already finished | the seat is released, so it doesn't |
+| Which room am I in? | nothing on the phone to check against — a single mistyped digit lands you in a real but wrong session | the lobby echoes `Room 157770` |
+| How far through is this? | nothing (host-paced decks) | `5 of 8` in the header |
+
+The position counter is status, not mirrored content: `DESIGN.md` rejects
+echoing the big screen onto the phone, and this echoes nothing the big screen
+says. It appears on host-paced decks only — a self-paced deck already carries
+the same counter in its own nav bar, and two spellings of one fact is the
+defect P1 exists to prevent.
 
 ### The deck list
 6 controls per row → **4** (`title`, `Edit`, `Present`, `•••`), with
 `Session history`, `Duplicate` and `Delete deck` one layer in. On a
 twenty-deck list that is 120 targets reduced to 80, and the irreversible one
 is no longer adjacent to the one you came for.
+
+### Every return to a list
+`HashRouter` has no scroll restoration, and the browser's own is defeated by a
+client-rendered list that does not exist yet when the restore would fire. The
+deck list, the template gallery and a deck's history all scrolled back to the
+top on every return. On a host with eighty decks that is a scan and a scroll
+to reach the row they were looking at four seconds earlier, paid on every
+navigation. Measured: 1400px → 0 before, 1400px → 1400px after.
+
+One exception, and it is the point rather than a carve-out: the restore is
+suppressed when a band at the top has something to say. A host who has just
+ended a session lands on the deck list with "You just ran …" on it — and was
+being scrolled eleven hundred pixels past it, to the row they happened to be
+looking at before they presented. **Arriving with news is not the same arrival
+as returning.**
 
 ### Signed-out deep links
 `/edit/<id>` while logged out used to bounce to `/login` and then land on the
@@ -235,6 +328,11 @@ redirect).
 | `presenter/History.tsx` | Breadcrumb; a `Present` button, because the commonest reason to look at a deck's history is to run it again. |
 | `participant/Play.tsx` | A door off the podium, which also releases the seat. |
 | `App.tsx` + `presenter/Login.tsx` | The gate carries the destination. |
+| `components/SlideNavigator.tsx` | Go to any slide, in one broadcast. Lives in the control bar's `<footer>` so its desk-distance classification is structural rather than an exception. |
+| `components/SlideTypePicker.tsx` | The seventeen types, behind one press, grouped, with every hint visible and a filter so the expert path is faster than before. |
+| `components/LastRunBar.tsx` | The session you just finished, one press from its CSV. |
+| `lib/scrollMemory.ts` | Lists come back to where you left them — and deliberately do not when the page has news. |
+| `components/SpeakerWindow.ts` | Carries the same slide list, clickable, on the one surface a projector never shows. |
 
 **`End` is now two presses.** It is irreversible, it ejects every phone in the
 room, and it sat in a row of identically-sized ghost buttons one pixel from
@@ -245,14 +343,32 @@ is not a size this stage controls. It disarms after four seconds — a
 confirmation left armed is its own trap, because a host who walked away and
 came back would press "Sure?" believing it to be the first press.
 
+**A bug the screenshots found, which no audit could have.** The navigator's
+scrim was in the right place, the right size and the right z-index, and
+completely invisible. `bg-canvas/80` computes to `rgba(0, 0, 0, 0)`: every
+colour in this system is an `oklch()` token, and Tailwind's slash-alpha can
+only inject an alpha channel into a colour it can decompose. Grepping for the
+pattern found **four more** — the sticky headers on the deck list, templates,
+transfer and history had all been relying on `backdrop-blur` alone, with page
+content scrolling underneath them blurred but untinted, since they were
+written. All five are now `color-mix(in oklch, …)`, which is the spelling the
+rest of the codebase already used for exactly this reason (`DESIGN.md` P1).
+Worth recording as a class: a colour that silently resolves to transparent is
+invisible in a diff, invisible to a type checker, invisible to the design lint,
+and looks like a z-index problem.
+
 Constraints held: `npx tsc -p tsconfig.app.json --noEmit` and
 `npm run lint:design` clean; the overshoot budget is still exactly three
 moments (`grep -rn "spring.pop\|animate-pop-in" src`); no inline spring
 literals; `prefers-reduced-motion` verified on the new menu (settles at
 `opacity 1`, `transform: none`); the presenter's `resume-session`-before-
 `create-session` path verified intact across a host reload (`2 / 6` → `2 / 6`,
-roster intact); the control bar at 11 controls still fits 1280 × 720 with
-141px to spare.
+roster intact, and again with the navigator shipped); the control bar at 12
+controls fits 1280 × 720 with 102px to spare and wraps rather than clips below
+that; `prefers-reduced-motion` verified on the navigator and the type picker
+(both settle at `opacity 1`, `transform: none`); the jump verified against a
+real phone in the room at **1 broadcast, not 8**, with the room's frame count
+unmoved while the panel is open and no answer-key string anywhere in it.
 
 ---
 
@@ -268,56 +384,80 @@ roster intact); the control bar at 11 controls still fits 1280 × 720 with
 | A global persistent nav / tab bar | There are two audiences and three modes; a tab bar implies peer categories that can be switched between freely, and "the editor" and "a live room with 28 phones in it" are not peers. |
 | Optimising for click count | "The 3-click rule is an arbitrary rule of thumb that is not backed by data," and click counting "does not take into account cognitive factors … [or] figure out where they currently are in the site's structure" — [NN/g](https://www.nngroup.com/articles/3-click-rule/). The counts in §3 are evidence of *missing doors*, not a target. |
 | Mirroring the deck position onto the player's phone | `DESIGN.md` already rejected mirroring question text: the phone is a controller and attention belongs on the shared screen. A progress counter is status rather than content, so it is arguable — and therefore deferred to §6 rather than smuggled in here. |
+| Putting the slide navigator **only** in the speaker window | It is the Keynote-correct home and the wrong *only* home: it needs a popup that can be blocked and a second display. A navigation surface that exists only when a popup succeeded is not a navigation surface. It is in both. |
+| Converting `/templates` to a sheet | On reflection this citation was applied too broadly when it was written. A sheet is for "a scoped task closely related to the current context"; the template gallery is other people's decks, with its own loading state, empty state and content. That is a **destination**, not a task — Apple's own App Store puts browse behind a tab, not a sheet. `/transfer` is the one that is genuinely sheet-shaped, and it is still queued (§6). The measurable harm both pages caused was losing the deck list's scroll position, and that is fixed for every page rather than for two. |
+| Stepping to a jumped slide, or confirming a jump | The press is reversible — `Back` returns, and a jump is one broadcast either way. A confirmation on a reversible navigation is the trap F2 warns about pointed the other way. |
 | Undo instead of confirm for deck/slide deletion | The right answer, and NN/g prefer it. It needs a server-side tombstone, and `server/` is out of scope for this pass. Recorded in §6 rather than half-built. |
 
 ---
 
 ## 6. What is still wrong
 
-Ten findings this pass did not fix, in the order they cost a person something.
+Six of the ten findings in the first pass are now fixed (slide jump, the
+seventeen-type wall, the player's position and room code, the run that just
+happened, scroll on every return, and — partly — the page-swap complaint).
+What is left, plus what the second pass added, in the order it costs a person
+something.
 
-1. **Seventeen slide types, flat, on first run.** The empty editor offers every
-   type at equal weight and recommends none. [Hick's
-   Law](https://lawsofux.com/hicks-law/) directly; the fix is a default on the
-   empty state ("Ask a multiple-choice question") with the rest behind a
-   picker.
-2. **The presenter can only step ±1.** A host who needs slide 9 of 20 presses
-   `Next` eight times with the room watching every one. There is no jump, no
-   grid, no scrubber — and the data for it (`slideTitles`) is already on the
-   session ack.
-3. **`confirm()` still guards both deletions.** A native modal with no undo,
-   for an irreversible act. F5 is only half-satisfied: the deck delete moved a
-   layer in, but it is still confirm-then-destroy rather than destroy-then-undo.
-4. **The control bar is eleven controls at one level.** It fits, but it is 89%
-   of the width at 1280 and it mixes transport, room tools, display settings
-   and session lifecycle in one row. The grouping dividers are doing work the
-   structure should do.
+1. **`confirm()` still guards both deletions.** A native modal with no undo,
+   for an irreversible act. F5 is half-satisfied: `Delete deck` moved a layer
+   into the `•••` menu, but it is still confirm-then-destroy rather than
+   destroy-then-undo, which is what NN/g actually recommend and what the
+   product should do. It needs a server-side tombstone, and `server/` is out of
+   scope for this pass.
+2. **The control bar is now twelve controls at one level** — one worse than
+   last pass, because the jump had to go somewhere. It fits every width we
+   target and wraps rather than clips below them, but it mixes transport, room
+   tools, display settings and session lifecycle in a single row with dividers
+   doing work the structure should do. The honest fix is two clusters, not a
+   thirteenth button.
+3. **The stage navigator shows upcoming questions to the room.** Argued in §3
+   as the smaller of two leaks, and it is — but "smaller" is not "none". A
+   trivia host running a paid quiz night has a real objection. The unbuilt
+   better answer is a numbers-and-type-only mode for the stage panel, with full
+   titles reserved for the speaker window, chosen once in deck settings rather
+   than guessed at per press.
+4. **`slideTitles` is issued once and never re-pushed.** A slide added or
+   deleted mid-session invalidates the list; the client notices (the
+   authoritative `totalSlides` stops matching) and degrades to numbers,
+   re-learning a title each time the host lands on a slide. That is honest but
+   it is a client working around a protocol gap — the real fix is the server
+   re-issuing titles on `slide:changed`, which is not ours to write.
 5. **The editor restores selection but not scroll.** Come back to a long slide
-   form and you are at the top of it. F3 is satisfied for the rail and not for
-   the pane.
-6. **`/templates` and `/transfer` are full-page swaps** for what are
-   self-contained tasks — exactly the case Apple's HIG hands to a sheet. Both
-   also discard the dashboard's scroll position on the way back, which is an
-   F3 violation on a route that did not need to be a route.
-7. **The player never sees their position in the deck.** "3 of 6" is status,
-   not mirrored content, and a remote player with no shared screen has no idea
-   whether the quiz is nearly over. Deferred because it adds chrome to a
-   deliberately bare surface and the argument deserves a decision, not a
-   default.
-8. **The player's lobby does not echo the code they joined.** Mistype a digit
-   into a real neighbouring room and there is nothing on the phone to check
-   against.
-9. **The dashboard does not surface the run that just happened.** "Present
-   again" and "Download results" now exist on the final screen, but the moment
-   a host leaves it, the most recent session is three presses and a list scan
-   away again.
-10. **The deck title is still an unlabelled drill-in.** It is now redundant
-    rather than load-bearing — `Edit` sits beside it — so this is a
-    consistency wrinkle rather than a trap. It stays listed because the
-    original defect in this product was exactly this affordance being the
-    *only* way in, and a system that forgets its own near-misses re-earns them.
-
----
+   form and you are at the top of it. F3 is satisfied for the rail and for every
+   list in the product, and not for that one pane.
+6. **`/transfer` should be a sheet.** Import and export is a genuinely
+   self-contained task — file in, file out — and it is a full page swap with its
+   own header. Now that scroll survives the round trip the remaining cost is
+   structural rather than measurable, which is exactly why it is listed here and
+   not done on the way past.
+7. **The `•••` menu has no arrow-key navigation between items.** It opens,
+   closes on Escape and on an outside click, and returns focus to its trigger,
+   but moving between three items is Tab, not Down. The slide navigator does
+   implement arrow movement; the menu should match it. Same gap in the type
+   picker, where only "filter, then Enter for the first match" is wired.
+8. **`LastRunBar` only knows about runs that ended in this tab.** Close the
+   browser and the pointer to your last session is gone — the results are still
+   in `Session history`, three presses away, which is where everyone was before.
+   A durable answer needs a "recent sessions" endpoint that does not exist.
+9. **The deck title is still an unlabelled drill-in.** Now redundant rather
+   than load-bearing — `Edit` sits beside it — so a consistency wrinkle rather
+   than a trap. It stays listed because the original defect in this product was
+   exactly this affordance being the *only* way in, and a system that forgets
+   its own near-misses re-earns them.
+10. **Ducking out of a live room lands you on the slide you last *edited*, not
+    the one on the projector.** Two principles disagree here and the tie was
+    broken toward F3: the host explicitly selected that slide, and overriding
+    their selection with the live index is the system second-guessing them. The
+    answer that satisfies both is to mark which slide is on screen in the rail
+    without moving the selection — F4 without overruling F3 — and the editor
+    cannot currently know the live index, because the crumb carries only a deck
+    id and a join code and there is no socket on that page. Listed as an open
+    question rather than a defect.
+11. **The type picker has no "recently used".** The filter pays back most of
+    what progressive disclosure costs an expert, but an author building a
+    twelve-question quiz types the same three letters twelve times. Remembering
+    the last type used in this deck would make the common case one press again.
 
 ## 7. Sources
 
