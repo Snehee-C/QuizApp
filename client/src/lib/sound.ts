@@ -2,12 +2,14 @@
 //
 // SOUND IS NEVER THE ONLY CHANNEL. Every cue here duplicates something the
 // room can already see: "join" a bubble landing in the lobby, "tick" the last
-// three pulses of the timer ring, "reveal" the 900ms tile choreography,
+// three pulses of the timer ring, "reveal" the tile choreography closing,
 // "correct"/"wrong" the ✓/✕ stamp and the scale change, "podium" the winner
-// flood and confetti. Muting the app must never cost a player information —
-// most rooms run muted, and per the accessibility contract that is a
-// supported configuration, not a degraded one. Do not add a cue that carries
-// meaning on its own.
+// flood and confetti, "riser" the arming line filling (standings) or the
+// distribution bars spreading (reveal), "land" the rows settling into their
+// new ranks with their +Δ chips, or the correct tile lifting. Muting the app
+// must never cost a player information — most rooms run muted, and per the
+// accessibility contract that is a supported configuration, not a degraded
+// one. Do not add a cue that carries meaning on its own.
 //
 // Everything is synthesised from oscillators. The category's most dated
 // signal is stock royalty-free loop music, and an asset-free kit also means
@@ -16,9 +18,13 @@
 //
 // House rules for the kit itself:
 //   - short attack, hard stop: nothing rings past ~600ms except "podium"
+//     and "riser", which are the two cues whose JOB is duration (see below)
 //   - sine and triangle only; a square/saw buzzer is the Kahoot costume
 //   - being wrong is never punished (P4) — "wrong" is soft, low and warm,
 //     not a buzzer
+//   - one harmonic plan across the kit, so the pair that frames a moment
+//     actually resolves: "riser" climbs C→G (the dominant) and "land"
+//     answers it with C. Suspense is a chord that has not come home yet.
 
 export type SoundName =
   | "join"
@@ -26,7 +32,9 @@ export type SoundName =
   | "reveal"
   | "correct"
   | "wrong"
-  | "podium";
+  | "podium"
+  | "riser"
+  | "land";
 
 export type SoundRole = "presenter" | "participant";
 
@@ -212,6 +220,15 @@ interface Note {
   type?: OscillatorType;
   /** Glide to this frequency across the note — a cheap sense of direction. */
   to?: number;
+  /**
+   * Invert the envelope: ramp UP to `peak` across the whole note instead of
+   * decaying from it. Every other cue in the kit is percussive — struck, then
+   * gone — which is exactly wrong for suspense, because a sound that is
+   * already dying cannot promise anything. A swell plus a `to` glide is the
+   * entire riser: it gets louder and higher and then stops, and the stopping
+   * is what the resolve lands into.
+   */
+  swell?: boolean;
 }
 
 // Attack is deliberately not zero: a 4ms ramp from silence removes the click
@@ -219,6 +236,8 @@ interface Note {
 // still read as percussive.
 const ATTACK = 0.004;
 const MIN_GAIN = 0.0001;
+// Where a swelling note STARTS, as a fraction of its peak. See voice().
+const SWELL_FLOOR = 0.06;
 
 function voice(context: AudioContext, out: GainNode, n: Note, t0: number) {
   const start = t0 + n.at;
@@ -235,10 +254,29 @@ function voice(context: AudioContext, out: GainNode, n: Note, t0: number) {
 
   const g = context.createGain();
   g.gain.setValueAtTime(MIN_GAIN, start);
-  g.gain.linearRampToValueAtTime(n.peak, start + Math.min(ATTACK, n.dur / 2));
-  // Exponential decay reads as a natural release; it cannot reach zero, so a
-  // setValueAtTime floor plus osc.stop() does the hard cut the kit promises.
-  g.gain.exponentialRampToValueAtTime(MIN_GAIN, end);
+  if (n.swell) {
+    // Crescendo across the note, then a short release so the cut is not a
+    // click. Exponential on the way up too, for the same reason the pitch
+    // glide is: loudness is perceived logarithmically, and a linear swell
+    // sounds like it stops growing halfway.
+    //
+    // It climbs from SWELL_FLOOR, not from silence. Ramping exponentially all
+    // the way up from the 0.0001 floor spends almost the whole note inaudible
+    // — rendered offline, a 1.15s riser was still at 1.5% of its peak at the
+    // halfway mark, so the build only existed in its last third and the room
+    // heard a lurch rather than a build. From 6% it is a ~24dB rise that is
+    // present from the first beat and grows the whole way.
+    const tail = Math.min(0.06, n.dur * 0.12);
+    const floor = Math.max(MIN_GAIN, n.peak * SWELL_FLOOR);
+    g.gain.linearRampToValueAtTime(floor, start + Math.min(ATTACK, n.dur / 2));
+    g.gain.exponentialRampToValueAtTime(n.peak, end - tail);
+    g.gain.exponentialRampToValueAtTime(MIN_GAIN, end);
+  } else {
+    g.gain.linearRampToValueAtTime(n.peak, start + Math.min(ATTACK, n.dur / 2));
+    // Exponential decay reads as a natural release; it cannot reach zero, so a
+    // setValueAtTime floor plus osc.stop() does the hard cut the kit promises.
+    g.gain.exponentialRampToValueAtTime(MIN_GAIN, end);
+  }
   g.gain.setValueAtTime(0, end);
 
   osc.connect(g);
@@ -272,6 +310,32 @@ const E6 = 1318.51;
 // Three rising steps, one per remaining second. Pitch rising with urgency is
 // the same information the ring's accent→rose shift carries visually.
 const TICK_STEPS = [G5, C6, E6];
+
+const C3 = 130.81;
+
+/**
+ * The suspense bed. Three octaves of C climbing a fifth to G across whatever
+ * beat it has been given, all three swelling.
+ *
+ * Why it is built rather than written out: the two moments that need it are
+ * different lengths (the standings arm + run is ~2.05s, the reveal's close +
+ * spread is ~860ms) and a riser that ends before its beat does is worse than
+ * no riser — it tells the room the moment is over while the screen is still
+ * moving. One cue that stretches beats two cues that do not fit.
+ *
+ * The shimmer voice enters a third of the way in rather than at the top. A
+ * riser that starts with everything already sounding has nowhere left to go;
+ * adding a voice partway is how the build keeps building after the glide has
+ * used up most of its range.
+ */
+function riserNotes(dur: number): Note[] {
+  const d = Math.max(0.35, Math.min(2.6, dur));
+  return [
+    { f: C3, at: 0, dur: d, peak: 0.055, swell: true, to: G3 },
+    { f: C4, at: 0, dur: d, peak: 0.08, swell: true, to: G4 },
+    { f: C5, at: d * 0.34, dur: d * 0.66, peak: 0.045, swell: true, to: G5, type: "triangle" },
+  ];
+}
 
 const KIT: Record<SoundName, Note[]> = {
   // Low and short so a lobby filling at four joins a second is a texture,
@@ -320,6 +384,23 @@ const KIT: Record<SoundName, Note[]> = {
     { f: C6, at: 0.34, dur: 0.76, peak: 0.14, type: "triangle" },
     { f: G4, at: 0.34, dur: 0.76, peak: 0.06 },
   ],
+
+  // Declared for completeness; the live notes come from riserNotes(), which
+  // stretches the cue to whatever beat it is sitting under.
+  riser: riserNotes(1.15),
+
+  // The resolve. The riser leaves the room on G — the dominant, which is the
+  // sound of an unanswered question — and this is the C that answers it.
+  // Struck as one chord rather than rolled, because it marks an INSTANT (the
+  // rows landing, the correct tile lifting) and an arpeggio would smear it
+  // across 300ms. Deliberately not "podium": that one is a session ending,
+  // this one happens five or six times a round and must not wear out.
+  land: [
+    { f: C4, at: 0, dur: 0.44, peak: 0.08 },
+    { f: C5, at: 0, dur: 0.4, peak: 0.12, type: "triangle" },
+    { f: E5, at: 0.01, dur: 0.4, peak: 0.09, type: "triangle" },
+    { f: G5, at: 0.02, dur: 0.38, peak: 0.07, type: "triangle" },
+  ],
 };
 
 /* ── playback ───────────────────────────────────────────────────────── */
@@ -351,6 +432,11 @@ export interface PlayOptions {
    * second and a half of silence.
    */
   step?: number;
+  /**
+   * "riser" only: seconds, clamped to 0.35–2.6. Pass the length of the beat
+   * the riser is sitting under, so the build and the picture end together.
+   */
+  duration?: number;
 }
 
 /**
@@ -366,7 +452,12 @@ export function playSound(name: SoundName, options?: PlayOptions): void {
       void ctx.resume();
       return;
     }
-    const notes = name === "tick" ? tickNotes(options?.step) : KIT[name];
+    const notes =
+      name === "tick"
+        ? tickNotes(options?.step)
+        : name === "riser"
+          ? riserNotes(options?.duration ?? 1.15)
+          : KIT[name];
     // A hair in the future: scheduling at exactly currentTime can land in a
     // block the audio thread has already rendered, which clips the attack.
     const t0 = ctx.currentTime + 0.001;

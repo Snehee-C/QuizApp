@@ -1,8 +1,9 @@
-import { useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { slotFor } from "../lib/answers";
 import { Shape } from "./ui/Shape";
-import { STAGGER_LG, spring } from "../lib/motion";
+import { REVEAL, STAGGER_LG, ease, prefersReducedMotion, spring } from "../lib/motion";
+import { playSound } from "../lib/sound";
 import { cn } from "../lib/cn";
 
 interface StageAnswersProps {
@@ -25,6 +26,50 @@ interface StageAnswersProps {
 //
 // Counts stay hidden until the reveal: showing a live tally while answering is
 // open creates a bandwagon and tells latecomers what to pick.
+//
+// ── THE BEAT STRUCTURE, AND WHY IT IS THE OTHER WAY ROUND NOW ───────────
+//
+// Measured on a live room before this change: `data-state` flipped to
+// "correct" at t=70ms, the halo was on at t=70ms, the ✓ was fully landed by
+// t=487ms — and the distribution bars did not start moving until t=504ms and
+// did not finish until t=1120ms. The answer was given in frame one and the
+// remaining second was spent drawing a chart about a question the room had
+// already stopped caring about. The choreography was real; it just ran in the
+// order that destroys it.
+//
+// §5 lists the morph last, which is correct as an argument about morphing
+// versus cross-fading and wrong as an argument about theatre. There are two
+// secrets at a reveal — what everyone picked, and which one was right — and
+// the first is much the cheaper. Spending the opening beat on it buys the
+// expensive one something it cannot otherwise have: a silence to land in.
+//
+//   close   300ms  the scrim drops over all four tiles at once. The question
+//                  is shut. Nothing is marked.
+//   spread  560ms  each tile morphs in place into its own share, 60ms apart,
+//                  counts fading in behind them. "Twelve of you said Saturn."
+//   hold    300ms  NOTHING, measured from the LAST bar landing. This beat
+//                  is the product.
+//   answer         the correct tile lifts, haloes, and stamps.
+//
+// The riser runs under the first three beats and stops dead at `answer`, where
+// "land" resolves it. The arming information a muted room needs is the scrim
+// and the bars themselves — there is always something visibly in motion right
+// up to the hold, and the hold is only 300ms, which is short enough to read as
+// a held breath rather than as a stall.
+//
+// REDUCED MOTION keeps the beats and drops the movement. Nothing here travels
+// across the screen — the scrim and the counts are opacity, the bars are a
+// width on an element that stays where it is — so the thing reduced motion
+// exists to prevent is not present, and suppressing the timing as well would
+// delete the moment rather than calm it. What does go: the overshoot on the
+// lift and on the ✓ (spring.effect, ζ 1.0, in place of spring.pop) and the
+// 1.03 scale itself.
+//
+// A reveal this instance did not WATCH arrive — a projector reloaded onto an
+// already-revealed slide, a host returning to a closed question — runs none of
+// it. Delays collapse to zero and no cue fires, for the same reason Present
+// restores that state silently: the room has already had this moment and a
+// second one would be a lie about what just happened.
 //
 // Note the stage does NOT dim the wrong options the way the phone does. On a
 // phone the dimming is personal feedback; on a projector the room still wants
@@ -66,6 +111,47 @@ export function StageAnswers({
   const correct = new Set(correctIndices ?? []);
   const gridRef = useRef<HTMLDivElement>(null);
   const labelRefs = useRef<(HTMLSpanElement | null)[]>([]);
+
+  const reduced = useRef<boolean | null>(null);
+  if (reduced.current === null) reduced.current = prefersReducedMotion();
+
+  // Did this instance mount BEFORE the reveal? Only then does it own the
+  // choreography; a grid that mounted already-revealed is a restore.
+  const liveRef = useRef<boolean | null>(null);
+  if (liveRef.current === null) liveRef.current = !revealed;
+  const live = liveRef.current;
+
+  const [phase, setPhase] = useState<Phase>(live ? "idle" : "answer");
+
+  // Scales with the option count: the tiles spread 60ms apart, so the beat the
+  // answer lands on has to wait for the LAST of them (see motion.ts).
+  const answerAt = REVEAL.answerAt(options.length);
+
+  useEffect(() => {
+    if (!revealed || !live) return;
+    // One riser spanning close + spread + hold, cut off by "land" on the beat
+    // the answer lands. The "reveal" chime Present fires at t=0 is the other
+    // half of that sentence: C (the question shuts) → build to G → C.
+    playSound("riser", { duration: answerAt / 1000 });
+    setPhase("closed");
+    const toSpread = window.setTimeout(() => setPhase("spread"), REVEAL.close);
+    const toAnswer = window.setTimeout(() => {
+      setPhase("answer");
+      playSound("land");
+    }, answerAt);
+    return () => {
+      window.clearTimeout(toSpread);
+      window.clearTimeout(toAnswer);
+    };
+  }, [revealed, live, answerAt]);
+
+  // Seconds, collapsed to zero on a restore.
+  const beat = (s: number) => (live ? s : 0);
+  // The label's ink flips when the bar leaves from under it, not when the
+  // reveal fires — before this the two were 420ms apart and the measured
+  // pair in the contrast note below described only the later half of it.
+  const bare = phase === "spread" || phase === "answer";
+  const answerShown = phase === "answer";
 
   // Fit every option label to the same size — the largest at which NONE of them
   // exceeds MAX_LINES. One shared size rather than a per-tile one: four options
@@ -123,7 +209,11 @@ export function StageAnswers({
     // column and a check to every row, which narrows the label WITHOUT changing
     // the grid's width — so the ResizeObserver never hears about it, and a
     // fitted option silently re-wraps past the line cap and overflows the stage.
-  }, [fitKey, options.length, revealed]);
+    //
+    // `phase` for the same reason, one beat later: the ✓ is no longer part of
+    // the same frame as the count column, so the refit the count triggers
+    // happens 860ms before the check arrives and takes up its own width.
+  }, [fitKey, options.length, revealed, phase]);
 
   return (
     <div
@@ -148,13 +238,18 @@ export function StageAnswers({
             animate={{
               opacity: 1,
               y: 0,
-              scale: revealed && isCorrect ? 1.03 : 1,
+              scale: answerShown && isCorrect && !reduced.current ? 1.03 : 1,
             }}
             transition={{
+              opacity: { duration: 0.28, delay: i * 0.05 },
+              y: { ...spring.default, delay: i * 0.05 },
               // The correct-answer stamp is one of the three budgeted
-              // overshoot moments (DESIGN.md §4).
-              ...(revealed && isCorrect ? spring.pop : spring.default),
-              delay: i * 0.05,
+              // overshoot moments (DESIGN.md §4). It gets its own transition
+              // rather than sharing the entrance's: the entrance carried a
+              // `delay: i * 0.05` that was silently being applied to the lift
+              // as well, so the answer landed up to 150ms late depending on
+              // which slot happened to be correct.
+              scale: reduced.current ? spring.effect : spring.pop,
             }}
             // `answer-tile` is AnswerTile's hook, worn deliberately rather than
             // cloned: this is a different component — a track with a bar
@@ -169,9 +264,15 @@ export function StageAnswers({
             // dim. Reusing the word would have imported the behaviour.
             className={cn(
               "answer-tile answer-tile-stage relative overflow-hidden rounded-xl",
-              revealed && isCorrect && "shadow-glow z-10"
+              answerShown && isCorrect && "shadow-glow z-10"
             )}
-            data-state={revealed ? (isCorrect ? "correct" : "revealed") : "idle"}
+            // `correct` is withheld until the answer beat — it is the state
+            // forced-colours reads to draw the only marking a High Contrast
+            // room gets, so flipping it early would hand the answer to those
+            // users 1160ms before everyone else.
+            data-state={
+              phase === "idle" ? "idle" : answerShown && isCorrect ? "correct" : "revealed"
+            }
             style={
               {
                 background: "var(--surface-1)",
@@ -188,11 +289,11 @@ export function StageAnswers({
               className="answer-bar absolute inset-y-0 left-0"
               style={{ background: slot.fill }}
               initial={{ width: "100%" }}
-              animate={{ width: revealed ? `${Math.max(share * 100, 6)}%` : "100%" }}
+              animate={{ width: bare ? `${Math.max(share * 100, 6)}%` : "100%" }}
               transition={{
-                duration: 0.52,
-                ease: [0.16, 1, 0.3, 1],
-                delay: revealed ? 0.42 + i * STAGGER_LG : 0,
+                duration: beat(REVEAL.spread / 1000),
+                ease: ease.expoOut,
+                delay: beat(i * STAGGER_LG),
               }}
             />
 
@@ -202,7 +303,9 @@ export function StageAnswers({
                 className="answer-scrim absolute inset-0"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                transition={{ duration: 0.3, delay: 0.42 }}
+                // The close beat, and all four together: the room is being
+                // told the question is shut, which is one event, not four.
+                transition={{ duration: beat(REVEAL.close / 1000) }}
                 style={{
                   background: "color-mix(in oklch, var(--canvas), transparent 30%)",
                 }}
@@ -214,15 +317,15 @@ export function StageAnswers({
                 its own block, which is the lopsidedness one layer down. */}
             <div
               className="relative h-full flex items-center gap-5 px-7 py-6"
-              style={{ color: revealed ? "var(--ink)" : slot.ink }}
+              style={{ color: bare ? "var(--ink)" : slot.ink }}
             >
               <span
                 className="answer-chip shrink-0 grid place-items-center rounded-md w-[1.7em] h-[1.7em] text-stage-answer"
                 style={{
-                  background: revealed
+                  background: bare
                     ? slot.fill
                     : "color-mix(in oklch, currentColor, transparent 86%)",
-                  color: revealed ? slot.ink : "currentColor",
+                  color: bare ? slot.ink : "currentColor",
                 }}
               >
                 <Shape shape={slot.shape} size="0.68em" />
@@ -283,20 +386,28 @@ export function StageAnswers({
 
               {revealed && (
                 <motion.span
+                  data-tile-count
                   initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  transition={{ delay: 0.6 + i * STAGGER_LG }}
+                  animate={{ opacity: bare ? 1 : 0 }}
+                  transition={{ duration: beat(0.26), delay: beat(0.12 + i * STAGGER_LG) }}
                   className="nums shrink-0 text-stage-answer font-bold tabular-nums min-w-[2ch] text-right"
                 >
                   {n}
                 </motion.span>
               )}
 
-              {revealed && isCorrect && (
+              {answerShown && isCorrect && (
                 <motion.span
-                  initial={{ scale: 0.6, opacity: 0 }}
+                  initial={{ scale: reduced.current ? 1 : 0.6, opacity: 0 }}
                   animate={{ scale: 1, opacity: 1 }}
-                  transition={{ ...spring.pop, delay: 0.26 }}
+                  // Budgeted overshoot moment 1 of 3 (DESIGN.md §4). The ✓
+                  // trails the lift rather than sharing its frame — a stamp
+                  // that lands with the thing it is stamping reads as one
+                  // blur, not as two events.
+                  transition={{
+                    ...(reduced.current ? spring.effect : spring.pop),
+                    delay: beat(REVEAL.stamp / 1000),
+                  }}
                   className="answer-stamp answer-stamp-correct shrink-0 grid place-items-center rounded-pill bg-accent text-accent-ink w-[1.3em] h-[1.3em] text-stage-answer font-bold"
                   aria-label="correct"
                 >
@@ -310,6 +421,14 @@ export function StageAnswers({
     </div>
   );
 }
+
+/**
+ * idle   — answering is open, nothing is marked
+ * closed — the scrim is arriving; the question is shut
+ * spread — tiles are morphing into their own shares
+ * answer — the correct tile has lifted
+ */
+type Phase = "idle" | "closed" | "spread" | "answer";
 
 // Most lines an option may occupy before the whole set steps down a size. Three
 // is what keeps a wrapped option from out-growing the row it shares: at four
