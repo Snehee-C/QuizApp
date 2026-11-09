@@ -87,6 +87,14 @@ interface LiveSession {
   // slide and drops out of a moment the whole room is sharing. Holding the
   // exact frame we broadcast lets the join ack put that phone back in it.
   leaderboardView: { entries: LeaderboardEntryRow[] } | null;
+  // The SAME moment at stage scope. Two fields rather than two keys on one
+  // object, deliberately: `leaderboardView` is handed to a participant verbatim
+  // on the join ack, so the object a phone receives must be incapable of
+  // carrying rows a phone may not have. A field it does not know about cannot
+  // be forgotten in a projection. Set and cleared in lockstep with it, so
+  // `leaderboardView === null` remains the one answer to "is the board up" —
+  // which is the signal the phones' rank embargo is released by.
+  stageLeaderboardView: LeaderboardEntryRow[] | null;
   // Serialises navigation. `goto` awaits a DB write halfway through, so two
   // overlapping calls interleave there and the later emit wins carrying a
   // stale slide with a fresh index — the room and the stage then disagree
@@ -455,11 +463,28 @@ function announcePresenters(io: Server, s: LiveSession) {
   });
 }
 
+// How many rows a PARTICIPANT may be handed. Ten is what fits on a phone, but
+// the binding reason it is not raised is that every row carries a
+// `participantId` — and that id is the whole of what `participant:join` needs
+// to assume somebody else's identity and overwrite their answers. A ten-row
+// board already spends ten of them on the room; a full one would hand every
+// phone present the keys to every other phone present.
+const PUBLIC_LEADERBOARD_LIMIT = 10;
+
+// How many rows the STAGE may be handed. The presenter is the one party
+// entitled to see the whole room — it already receives the answer key, the
+// live tally and the roster — and the bar race cannot animate a climb that
+// starts off the board: a player arriving from 11th has no remembered row, so
+// the one row on screen that genuinely moved is the one row that does not
+// move. The stage still DRAWS five; this is a wire bound, not an editorial
+// one, which is why it is generous and why raising it changes no rendering.
+const STAGE_LEADERBOARD_LIMIT = Number(process.env.STAGE_LEADERBOARD_LIMIT ?? 200);
+
 // Score is the sum of `points` across all of a participant's responses in this
 // session. Because responses are upserted (one row per participant+slide),
 // this naturally handles a participant changing their answer — no risk of
 // double-counting points from a resubmission.
-async function computeLeaderboard(s: LiveSession, limit = 10) {
+async function computeLeaderboard(s: LiveSession, limit = PUBLIC_LEADERBOARD_LIMIT) {
   const rows = await prisma.response.groupBy({
     by: ["participantId"],
     where: { sessionId: s.sessionId },
@@ -479,17 +504,87 @@ async function computeLeaderboard(s: LiveSession, limit = 10) {
       avatar: who(r.participantId)?.avatar ?? 0,
     }))
     .sort((a, b) => b.score - a.score);
-  return { entries: entries.slice(0, limit), fullEntries: entries };
+  return {
+    // What a PARTICIPANT may see. Unchanged: ten rows.
+    entries: entries.slice(0, limit),
+    // What the STAGE may see. See STAGE_LEADERBOARD_LIMIT.
+    stageEntries: entries.slice(0, STAGE_LEADERBOARD_LIMIT),
+    // Everyone, in order. For rank/score lookups only — this never goes on the
+    // wire, because a board is scoped by who receives it and this one is not.
+    fullEntries: entries,
+  };
 }
 
 // Background data refresh — only the presenter uses this (to know whether
-// any scores exist yet, for showing the leaderboard button at all). It does
-// NOT make the leaderboard visible to participants; that's a separate,
-// explicit show/hide broadcast below, so everyone sees it at the same time.
-// Takes already-computed entries so callers that just ran computeLeaderboard
-// (e.g. to grade a submission) don't pay for a second identical query.
-function sendLeaderboardToPresenter(io: Server, s: LiveSession, entries: LeaderboardEntryRow[]) {
-  emitToPresenters(io, s, "leaderboard:updated", { entries });
+// any scores exist yet, for showing the leaderboard button at all, and to hold
+// the board the bar race will run from). It does NOT make the leaderboard
+// visible to participants; that's a separate, explicit show/hide broadcast
+// below, so everyone sees it at the same time. Takes already-computed entries
+// so callers that just ran computeLeaderboard (e.g. to grade a submission)
+// don't pay for a second identical query.
+//
+// COALESCED, because this fires on every single submission. One board per
+// answer was affordable while a board was ten rows; at stage scope a 200-player
+// room would push 200 boards of 200 rows — tens of thousands of rows, several
+// megabytes — at a projector that is rendering none of them, because the
+// standings are not on screen while people are still answering. So the first
+// push in a burst goes immediately (the host must see the Scores button light
+// up on the first answer) and the rest collapse into one trailing frame.
+//
+// Every moment that actually puts a board in front of a room — a reveal, a
+// show, a navigation, a resumed stage — passes `immediate` and is therefore
+// exact. The only thing a window can ever delay is a mid-answering refresh
+// that the next push supersedes anyway.
+const LEADERBOARD_PUSH_MS = Number(process.env.LEADERBOARD_PUSH_MS ?? 500);
+const leaderboardPushes = new Map<
+  string,
+  { lastAt: number; timer: ReturnType<typeof setTimeout> | null; pending: LeaderboardEntryRow[] | null }
+>();
+
+function sendLeaderboardToPresenter(
+  io: Server,
+  s: LiveSession,
+  entries: LeaderboardEntryRow[],
+  immediate = false
+) {
+  // Keyed by sessionId rather than join code: `live` is a cache, and the same
+  // room rebuilt after a restart is the same session.
+  const key = s.sessionId;
+  let st = leaderboardPushes.get(key);
+  if (!st) {
+    st = { lastAt: 0, timer: null, pending: null };
+    leaderboardPushes.set(key, st);
+  }
+  const now = Date.now();
+  if (immediate || now - st.lastAt >= LEADERBOARD_PUSH_MS) {
+    if (st.timer) clearTimeout(st.timer);
+    st.timer = null;
+    st.pending = null;
+    st.lastAt = now;
+    emitToPresenters(io, s, "leaderboard:updated", { entries });
+    return;
+  }
+  // Inside the window: keep the newest board and send that one, once.
+  st.pending = entries;
+  if (!st.timer) {
+    st.timer = setTimeout(() => {
+      const cur = leaderboardPushes.get(key);
+      if (!cur) return;
+      cur.timer = null;
+      const queued = cur.pending;
+      cur.pending = null;
+      if (!queued) return;
+      cur.lastAt = Date.now();
+      emitToPresenters(io, s, "leaderboard:updated", { entries: queued });
+    }, LEADERBOARD_PUSH_MS - (now - st.lastAt));
+  }
+}
+
+/** Drop a pending push — the room is gone, or something exact just replaced it. */
+function cancelLeaderboardPush(s: LiveSession) {
+  const st = leaderboardPushes.get(s.sessionId);
+  if (st?.timer) clearTimeout(st.timer);
+  leaderboardPushes.delete(s.sessionId);
 }
 
 interface LeaderboardEntryRow {
@@ -529,8 +624,11 @@ async function revealSlide(io: Server, joinCode: string, slide: LiveSession["sli
   s.revealPayloads.set(slide.id, payload);
   io.to(joinCode).emit("slide:reveal", payload);
 
-  const { entries } = await computeLeaderboard(s);
-  sendLeaderboardToPresenter(io, s, entries);
+  // A reveal is the beat immediately before the host calls up the standings,
+  // so this is the board the bar race will run from: pushed immediately, at
+  // stage scope, so the climb has somewhere to climb from.
+  const { stageEntries } = await computeLeaderboard(s);
+  sendLeaderboardToPresenter(io, s, stageEntries, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +674,7 @@ function emptyLiveShell(): Pick<
   | "presenterSockets"
   | "audienceArrivals"
   | "leaderboardView"
+  | "stageLeaderboardView"
   | "navChain"
   | "lastActivityAt"
   | "endedAtMs"
@@ -588,6 +687,7 @@ function emptyLiveShell(): Pick<
     presenterSockets: new Set(),
     audienceArrivals: new Map(),
     leaderboardView: null,
+    stageLeaderboardView: null,
     navChain: Promise.resolve(),
     lastActivityAt: Date.now(),
     endedAtMs: null,
@@ -855,6 +955,7 @@ function reapLive() {
       clearTimeout(s.revealTimer);
       s.revealTimer = null;
     }
+    cancelLeaderboardPush(s);
     live.delete(code);
   }
 }
@@ -1179,7 +1280,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // while every phone in the room still showed the board. Identical field
       // name and shape to the `participant:join` ack — one spelling of "the
       // standings are on screen", as with the roster above.
-      leaderboardView: found.leaderboardView,
+      // Stage-scoped, same field name and same `{ entries }` shape the phones
+      // get — one spelling of "the standings are on screen", with the rows
+      // each side is entitled to. `null` still means the board is down.
+      leaderboardView: found.leaderboardView
+        ? { entries: found.stageLeaderboardView ?? found.leaderboardView.entries }
+        : null,
       // Not in the wire contract, but a resumed stage cannot render without
       // them and they are presenter-only in create-session too.
       sessionId: found.sessionId,
@@ -1198,8 +1304,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     io.to(socket.id).emit("participant:count", participantsPayload(found));
     const resumedSlide = currentSlideOf(found);
     if (resumedSlide) await emitResults(io, joinCode, resumedSlide.id);
-    const { entries } = await computeLeaderboard(found);
-    sendLeaderboardToPresenter(io, found, entries);
+    const { stageEntries } = await computeLeaderboard(found);
+    sendLeaderboardToPresenter(io, found, stageEntries, true);
   });
 
   // The session row is gone (its deck was deleted mid-run). Drop the live
@@ -1280,6 +1386,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // host putting the deck back on screen, so a phone that re-joins after this
     // must be seated at the slide, not at a scoreboard nobody is looking at.
     s.leaderboardView = null;
+    s.stageLeaderboardView = null;
 
     s.currentIndex = clamped;
     s.status = clamped < 0 ? "LOBBY" : "ACTIVE";
@@ -1352,8 +1459,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
 
     // push existing results for the new slide (in case of late reveal)
     if (slide) await emitResults(io, joinCode, slide.id);
-    const { entries } = await computeLeaderboard(s);
-    sendLeaderboardToPresenter(io, s, entries);
+    const { stageEntries } = await computeLeaderboard(s);
+    sendLeaderboardToPresenter(io, s, stageEntries, true);
 
     // This callback only ever goes back to the presenter, so it carries answers.
     cb?.({ ok: true, index: s.currentIndex, currentSlide: currentSlideOf(s, true) });
@@ -1431,8 +1538,9 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   socket.on("presenter:get-leaderboard", async (args, cb) => {
     const s = await requirePresenter(args, cb);
     if (!s) return;
-    const { entries } = await computeLeaderboard(s);
-    cb?.({ ok: true, entries });
+    // Presenter-verified caller, so this is the stage's board.
+    const { stageEntries } = await computeLeaderboard(s);
+    cb?.({ ok: true, entries: stageEntries });
   });
 
   // ---- Presenter: reveal / hide the leaderboard for EVERYONE (presenter +
@@ -1441,21 +1549,29 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   socket.on("presenter:show-leaderboard", async (args, cb) => {
     const s = await requirePresenter(args, cb);
     if (!s) return;
-    const { entries } = await computeLeaderboard(s);
+    const { entries, stageEntries } = await computeLeaderboard(s);
     // Remember the exact frame the room is now looking at. A phone that
     // reloads during standings must come back into the same shared moment,
     // and it can only do that if the broadcast left something behind — we
     // keep the frame itself rather than recomputing at join time so the
     // reloader sees the board everyone else is reading, not a newer one.
     s.leaderboardView = { entries };
+    s.stageLeaderboardView = stageEntries;
+    // Before the broadcast, not after: the stage flipped to the standings the
+    // instant the host pressed the key, without waiting for this round trip,
+    // so the board it mounts with must already be the one the race resolves
+    // to. An exact push here also cancels any coalesced frame still in flight,
+    // which would otherwise land mid-race carrying an older board.
+    sendLeaderboardToPresenter(io, s, stageEntries, true);
     io.to(args.joinCode).emit("leaderboard:show", { entries });
-    cb?.({ ok: true, entries });
+    cb?.({ ok: true, entries: stageEntries });
   });
 
   socket.on("presenter:hide-leaderboard", async (args, cb) => {
     const s = await requirePresenter(args, cb);
     if (!s) return;
     s.leaderboardView = null;
+    s.stageLeaderboardView = null;
     io.to(args.joinCode).emit("leaderboard:hide", {});
     cb?.({ ok: true });
   });
@@ -1469,8 +1585,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // nor re-broadcast `session:ended` to a room already on the podium. Ack with
     // the standings so the caller still gets a useful answer.
     if (s.status === "ENDED") {
-      const { entries } = await computeLeaderboard(s);
-      return cb?.({ ok: true, entries });
+      const { stageEntries } = await computeLeaderboard(s);
+      return cb?.({ ok: true, entries: stageEntries });
     }
     if (s.revealTimer) {
       clearTimeout(s.revealTimer);
@@ -1488,9 +1604,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       where: { id: s.sessionId },
       data: { status: "ENDED", endedAt: new Date() },
     });
-    const { entries } = await computeLeaderboard(s);
+    cancelLeaderboardPush(s);
+    const { entries, stageEntries } = await computeLeaderboard(s);
+    // The broadcast is the room's — participant-scoped. The ack is the
+    // presenter's, and the podium it draws is the whole room's final board.
     io.to(joinCode).emit("session:ended", { entries });
-    cb?.({ ok: true, entries });
+    cb?.({ ok: true, entries: stageEntries });
   });
 
   // ---- Participant: join by code ----
@@ -1591,6 +1710,18 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     const revealed = !!current && s.revealedSlides.has(current.id);
     let answered = false;
     let myAnswer: any = null;
+    // What their answer SCORED. `feedback` is component state on the phone, so
+    // a reload after a reveal came back without "Correct", without "+973" and
+    // without a rank — the player told strictly less than they had a moment
+    // earlier, for no reason other than that the only copy of it lived in the
+    // tab that went away. The graded row has been here the whole time.
+    let myResult: {
+      isQuiz: true;
+      correct: boolean;
+      points: number;
+      totalScore: number;
+      rank: number;
+    } | null = null;
     if (current) {
       const mine = await prisma.response.findUnique({
         where: {
@@ -1600,11 +1731,29 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
             participantId,
           },
         },
-        select: { value: true },
+        select: { value: true, correct: true, points: true },
       });
       if (mine) {
         answered = true;
         myAnswer = safeParse(mine.value);
+        // The same test `participant:submit` uses to decide `isQuiz`, so the
+        // two acks cannot disagree about which slides carry a result at all.
+        if (idx >= 0 && isTimed(s.slides[idx].type, s.slides[idx].config)) {
+          const { fullEntries } = await computeLeaderboard(s);
+          myResult = {
+            isQuiz: true,
+            correct: mine.correct,
+            points: mine.points,
+            totalScore: fullEntries.find((e) => e.participantId === participantId)?.score ?? 0,
+            // A rank is a claim about the ROOM, and the phones embargo it until
+            // `leaderboardView` says the room has seen the standings — showing
+            // it earlier spends the stage's bar race on a result every phone is
+            // already holding. Sending it here is what keeps that decision the
+            // client's: the server restores the whole result, the client
+            // chooses the moment. Scored over everyone, like the submit ack's.
+            rank: fullEntries.findIndex((e) => e.participantId === participantId) + 1,
+          };
+        }
       }
     }
 
@@ -1628,6 +1777,13 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       reveal: revealed ? s.revealPayloads.get(current!.id) ?? null : null,
       answered,
       myAnswer,
+      // The graded result of `myAnswer`, in exactly the spelling
+      // `participant:submit` acks with — `{ isQuiz, correct, points,
+      // totalScore, rank }` — so a reconnecting phone restores its feedback
+      // through the same path a fresh submission takes, rather than needing a
+      // second shape for the same fact. `null` when this phone has not
+      // answered the slide in front of it, or when that slide is not scored.
+      myResult,
       // `leaderboard:show` is a one-shot broadcast, so a phone that reloads
       // while the projector is on the standings came back rendering the slide
       // — out of a moment the rest of the room is still sharing. Same
@@ -1857,10 +2013,13 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     if (isTimed(slide.type, slide.config)) {
       // Single leaderboard query, reused for both this participant's ack and
       // the presenter's live view — was previously computed twice per submit.
-      const { entries, fullEntries } = await computeLeaderboard(s);
+      const { stageEntries, fullEntries } = await computeLeaderboard(s);
       const rank = fullEntries.findIndex((e) => e.participantId === participantId) + 1;
       const totalScore = fullEntries.find((e) => e.participantId === participantId)?.score ?? 0;
-      sendLeaderboardToPresenter(io, s, entries);
+      // The one push that is NOT exact-on-arrival: nothing is on screen yet,
+      // and in a full room this fires once per answer. Coalesced (see
+      // sendLeaderboardToPresenter); the reveal that follows is immediate.
+      sendLeaderboardToPresenter(io, s, stageEntries);
       cb?.({ ok: true, isQuiz: true, correct: graded.correct, points: graded.points, totalScore, rank });
 
       // If everyone present has now answered this slide, reveal early rather

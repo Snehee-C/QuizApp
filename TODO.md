@@ -43,11 +43,25 @@ result — so a phone that reloads after a reveal comes back without `Correct`,
 without `+points`, and without its rank. The player is told less than they had.
 Fix: put the player's own score and rank on the join ack. Server change.
 
+Status: **done** — `participant:join` now acks `myResult`, which is the
+`participant:submit` ack's own shape (`{ isQuiz, correct, points, totalScore,
+rank }`) or `null`. The rank embargo is untouched: `leaderboardView` is still
+the release signal, so the server restores the whole result and the client
+still chooses when the room's half of it is shown.
+
 ### A climb from 11th cannot animate
 `computeLeaderboard` sends a top ten, so rows 11+ were never on any board the
 stage remembers. The bar race now runs over the whole board it receives and
 slices only the render, so this is purely a wire limit — a larger board (or a
 dedicated "previous standings" frame) gets it for free.
+
+Status: **done** — a larger board, scoped. Presenter-facing frames carry up to
+`STAGE_LEADERBOARD_LIMIT` (200) rows; every participant-facing board stays at
+ten, because each row carries a `participantId` and that is the whole of what
+`participant:join` needs to impersonate someone. `leaderboard:updated` is also
+coalesced (500ms, leading edge, every on-screen moment flushing exactly) — it
+fires once per submission, and one 200-row board per answer at a projector
+rendering none of them is not a thing to ship.
 
 ### The importer does not validate slide config — it accepts decks that cannot work
 Found while building the skill, and verified directly. `POST /transfer/import`
