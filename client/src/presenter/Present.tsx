@@ -27,6 +27,12 @@ import { Button } from "../components/ui/Button";
 import { initSound, isMuted, playSound, subscribeMuted, toggleMuted, unlockAudio } from "../lib/sound";
 import { MoreMenu } from "../components/MoreMenu";
 import { clearPresenting, markPresenting, markRunFinished } from "../lib/liveSession";
+import {
+  getRevealUpcoming,
+  getShownSlides,
+  saveShownSlides,
+  setRevealUpcoming,
+} from "../lib/presenterPrefs";
 import { SlideNavigator } from "../components/SlideNavigator";
 import { burstAt, burstFrom } from "../lib/confetti";
 
@@ -72,6 +78,13 @@ export default function Present() {
   const [speakerOpen, setSpeakerOpen] = useState(false);
   const [qaOpen, setQaOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
+  // Which slides this room has actually been shown — the only thing that makes
+  // a question a spoiler or not (SlideNavigator.tsx). Accumulated from
+  // `slide:changed`, which is the one event that means "the room is now
+  // looking at this", and restored on a reload so a refresh does not re-classify
+  // twenty minutes of already-asked questions as secrets.
+  const [shownIdx, setShownIdx] = useState<Set<number>>(() => new Set());
+  const [revealUpcoming, setRevealState] = useState(getRevealUpcoming);
 
   const joinCodeRef = useRef<string | null>(null);
   const currentSlideIdRef = useRef<string | null>(null);
@@ -127,6 +140,14 @@ export default function Present() {
       // Adopting a session is the one moment every one of those paths has
       // already passed through (lib/liveSession.ts).
       if (id && res.joinCode) markPresenting(id, res.joinCode, res.currentSlide?.id ?? null);
+      // A resume re-enters a room that has a history. Restore what it has been
+      // shown, and fold in the slide it is on right now, which is true whether
+      // this is a resume or a fresh session that just opened.
+      const shown = getShownSlides(res.joinCode);
+      const at = res.index ?? res.currentIndex ?? -1;
+      if (at >= 0) shown.add(at);
+      saveShownSlides(res.joinCode, shown);
+      setShownIdx(shown);
       if (res.sessionId) setSessionId(res.sessionId);
       setStatus(res.status);
       setIndex(res.index ?? res.currentIndex ?? -1);
@@ -265,8 +286,19 @@ export default function Present() {
       // showing none, because the host jumps on it in front of a room.
       setSlideTitles((prev) => {
         const n = payload.totalSlides ?? prev.length;
-        const base = prev.length === n ? prev.slice() : Array.from({ length: n }, () => null);
+        const stale = prev.length !== n;
+        const base = stale ? Array.from({ length: n }, () => null) : prev.slice();
         if (payload.currentSlide) base[payload.index] = payload.currentSlide.question;
+        // The same staleness signal governs what the room has been SHOWN. If
+        // the deck's length moved, every index below means something else now,
+        // and a stale "seen" would uncover a question nobody has been asked.
+        // The slide on screen is the one thing still certainly true.
+        setShownIdx((prevSeen) => {
+          const next = stale ? new Set<number>() : new Set(prevSeen);
+          next.add(payload.index);
+          saveShownSlides(joinCodeRef.current, next);
+          return next;
+        });
         return base;
       });
       // Keep the trail pointing at what the ROOM is looking at, not merely at
@@ -494,9 +526,17 @@ export default function Present() {
   // Memoised because it is a dependency of the speaker-window effect, and a
   // fresh array identity every render would re-write that window on every
   // answer that streams in.
+  // `seen` rides along rather than being resolved here, because the two
+  // consumers disagree about it on purpose: the stage navigator honours it,
+  // and the speaker window ignores it. The titles themselves are never
+  // stripped — masking is a rendering decision made by the surface that is
+  // actually being projected, not a fact about the data.
   const navSlides = useMemo(
-    () => Array.from({ length: totalSlides }, (_, i) => ({ index: i, title: slideTitles[i] ?? null })),
-    [totalSlides, slideTitles]
+    () =>
+      Array.from({ length: totalSlides }, (_, i) => {
+        return { index: i, title: slideTitles[i] ?? null, seen: shownIdx.has(i) };
+      }),
+    [totalSlides, slideTitles, shownIdx]
   );
 
   // Where phones should point. Null until resolved; falls back to this page's
@@ -688,6 +728,12 @@ export default function Present() {
         navOpen={navOpen}
         onToggleNav={() => setNavOpen((v) => !v)}
         onJump={jumpTo}
+        revealUpcoming={revealUpcoming}
+        onToggleReveal={() => {
+          const next = !revealUpcoming;
+          setRevealState(next);
+          setRevealUpcoming(next);
+        }}
         onToggleStage={toggleStage}
         onFullscreen={toggleFullscreen}
         onStart={start}
@@ -933,8 +979,9 @@ function useSettingsActions(props: {
       detail: muted ? "Off" : "On",
       checked: !muted,
       onSelect: () => {
-        // Prime the audio context from this gesture, or the next cue is
-        // swallowed waiting for one (ui/SoundToggle.tsx).
+        // Prime the audio context from this gesture. Browsers only allow one
+        // to start inside a user interaction, so unmuting and then waiting for
+        // some later click swallows the next cue.
         unlockAudio();
         toggleMuted();
       },
@@ -949,11 +996,13 @@ function ControlBar(props: {
   status: string;
   stage: Stage;
   onEditDeck: () => void;
-  slides: { index: number; title: string | null }[];
+  slides: { index: number; title: string | null; seen: boolean }[];
   currentIndex: number;
   navOpen: boolean;
   onToggleNav: () => void;
   onJump: (index: number) => void;
+  revealUpcoming: boolean;
+  onToggleReveal: () => void;
   onToggleStage: () => void;
   onFullscreen: () => void;
   onStart: () => void;
@@ -1005,6 +1054,8 @@ function ControlBar(props: {
           <SlideNavigator
             slides={props.slides}
             currentIndex={props.currentIndex}
+            revealUpcoming={props.revealUpcoming}
+            onToggleReveal={props.onToggleReveal}
             onJump={props.onJump}
             onClose={props.onToggleNav}
           />

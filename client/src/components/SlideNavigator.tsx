@@ -31,17 +31,31 @@ import { duration as dur, ease, prefersReducedMotion } from "../lib/motion";
  * panel anywhere else would mean either lying to the audit or setting a slide
  * list at 24px.
  *
- * Second: yes, the room can read the upcoming questions while this is open.
- * That is a real cost and it is the smaller one. The alternative it replaces
- * showed those same questions to the room as full-screen slides, one after
- * another, with the clock running on each. A two-second glance at a truncated
- * list is strictly less leakage than actually presenting the slides. It is
- * host-initiated, it dismisses on Escape, on an outside click, and on the jump
- * itself, and the leak-free home for a dual-screen host is the speaker window,
- * which carries the same list.
+ * Second: what the room may read off it. A panel listing twelve questions on
+ * a projector is a spoiler for eleven of them, and "it leaks less than the
+ * eight slides you would otherwise have presented" is true but is not a
+ * defence of leaking.
  *
- * It never renders anything but the question text the stage will show anyway.
- * No config, no options, no correct answers: the answer key does not reach this
+ * The rule that resolves it needs no configuration, because the leak is
+ * precisely bounded: **you cannot spoil a question the room has already been
+ * asked.** So a slide the room has seen shows its title, and a slide it has
+ * not shows its number and nothing else. That is automatically correct for the
+ * commonest jump there is — backwards, to revisit something — and it is
+ * correct for a host who jumped 1→9 and never showed 2 through 8, which a
+ * "highest slide reached" rule would have got wrong.
+ *
+ * Jumping FORWARD still needs a way to see where you are going, and on a
+ * single screen this panel is the only thing that can say. So the host can
+ * reveal them, from a control inside the panel where the need appears, and the
+ * choice persists per host (lib/presenterPrefs.ts). Off by default: safe is a
+ * better default than familiar when the cost of the wrong guess is a quiz
+ * night ruined, and the host who wants look-ahead pays for it once.
+ *
+ * The speaker window carries the full list unconditionally, because it is the
+ * one surface a projector never shows.
+ *
+ * It never renders anything but question text the stage will show anyway. No
+ * config, no options, no correct answers: the answer key does not reach this
  * component and must not be routed into it.
  */
 export interface NavigatorSlide {
@@ -49,21 +63,32 @@ export interface NavigatorSlide {
   index: number;
   /** Null when the titles went stale under a mid-session edit (see Present). */
   title: string | null;
+  /**
+   * Has the room actually been shown this slide? Not "is it before the current
+   * one" — a host who jumped past six slides never showed them, and they are
+   * still spoilers.
+   */
+  seen: boolean;
 }
 
 export function SlideNavigator({
   slides,
   currentIndex,
+  revealUpcoming,
+  onToggleReveal,
   onJump,
   onClose,
 }: {
   slides: NavigatorSlide[];
   currentIndex: number;
+  revealUpcoming: boolean;
+  onToggleReveal: () => void;
   onJump: (index: number) => void;
   onClose: () => void;
 }) {
   const panel = useRef<HTMLDivElement>(null);
   const reduced = prefersReducedMotion();
+  const hidden = slides.filter((s) => !s.seen && s.index !== currentIndex).length;
 
   // Focus the slide you are ON, not the first one. The panel opens as a map of
   // where you are, so the "you are here" pin is the right place to start — and
@@ -155,9 +180,37 @@ export function SlideNavigator({
           "rounded-xl bg-surface-1 shadow-elev-3 p-4"
         )}
       >
+        {/* The control sits above the grid it governs, and names the state it
+            will produce rather than the state you are in — a button says what
+            pressing it does. The count makes the rule legible without a
+            paragraph explaining it: "8 not shown yet" tells the host both why
+            those cards are blank and exactly what revealing them would cost. */}
+        {hidden > 0 || revealUpcoming ? (
+          <div className="flex items-center justify-between gap-4 mb-2.5 px-1">
+            <span className="text-caption2 font-semibold uppercase track-label text-ink-subtle">
+              {revealUpcoming
+                ? "Upcoming questions are on the big screen"
+                : `${hidden} not shown to the room yet`}
+            </span>
+            <button
+              type="button"
+              onClick={onToggleReveal}
+              aria-pressed={revealUpcoming}
+              className={cn(
+                "shrink-0 px-3 h-8 rounded-sm text-footnote font-semibold outline-none",
+                "transition-colors duration-fast focus-visible:shadow-focus",
+                "bg-surface-2 text-ink-muted hover:text-ink hover:bg-surface-3"
+              )}
+            >
+              {revealUpcoming ? "Hide upcoming" : "Show upcoming"}
+            </button>
+          </div>
+        ) : null}
+
         <div className="grid gap-2 grid-cols-[repeat(auto-fill,minmax(13rem,1fr))]">
           {slides.map((s) => {
             const here = s.index === currentIndex;
+            const named = s.seen || here || revealUpcoming;
             return (
               <button
                 key={s.index}
@@ -185,8 +238,13 @@ export function SlideNavigator({
                 <span className={cn("nums text-caption2 font-semibold uppercase track-label block", here ? "text-accent-ink" : "text-ink-subtle")}>
                   Slide {s.index + 1}
                 </span>
-                <span className="text-subhead font-medium line-clamp-2 block mt-0.5">
-                  {s.title || "Untitled"}
+                <span
+                  className={cn(
+                    "text-subhead font-medium line-clamp-2 block mt-0.5",
+                    !named && !here && "text-ink-subtle italic"
+                  )}
+                >
+                  {named ? s.title || "Untitled" : "Not shown yet"}
                 </span>
               </button>
             );
