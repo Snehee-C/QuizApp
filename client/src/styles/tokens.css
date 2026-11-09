@@ -1,0 +1,230 @@
+/* FLOODLIGHT design tokens — see DESIGN.md.
+ *
+ * Colour is authored in OKLCH: perceptually uniform, so equal L means equal
+ * visual weight across hues, and a theme swap is arithmetic (lift L, drop C)
+ * rather than a second hand-tuned palette.
+ *
+ * Two themes live here:
+ *   :root            — Stage Dark. The player's phone always uses this.
+ *   [data-stage=light] — Stage Light, for a projector in a lit room (P5).
+ */
+
+:root {
+  /* ── canvas & surfaces — all depth comes from this 4-step ladder ──── */
+  --canvas: oklch(0.15 0.012 272);
+  --surface-1: oklch(0.2 0.014 272);
+  --surface-2: oklch(0.25 0.016 272);
+  --surface-3: oklch(0.3 0.018 272);
+  --hairline: oklch(0.33 0.016 272);
+  --hairline-str: oklch(0.42 0.018 272);
+
+  --ink: oklch(0.97 0.004 272);
+  --ink-muted: oklch(0.78 0.012 272);
+  --ink-subtle: oklch(0.62 0.014 272);
+
+  /* ── accent: "voltage". Timer ring, correct answer, streak, one CTA. ─ */
+  --accent: oklch(0.87 0.2 132);
+  --accent-dim: oklch(0.72 0.17 132);
+  --accent-ink: oklch(0.2 0.05 132);
+  --accent-a45: oklch(0.87 0.2 132 / 0.45);
+  --accent-a18: oklch(0.87 0.2 132 / 0.18);
+
+  /* ── answer slots. Solved, not hand-picked: monotonic lightness ladder
+   *    0.42/0.50/0.68/0.80 (survives greyscale and every form of CVD), max
+   *    in-gamut chroma at each step, and every fill clears >=6.4:1 against
+   *    its own ink. Two dark slots take white text, two light slots take
+   *    near-black -- there is a dead zone around L 0.50-0.68 where neither
+   *    ink reaches AAA-large, so the ladder deliberately straddles it.
+   *    `-deep` is the fill at L-0.14 in the SAME hue -- a deeper tone of the
+   *    slot, for its pressed state and the edge of its results bar. Never
+   *    black: a black tone reads as a drop shadow, and shadows in this system
+   *    come from one light only (DESIGN.md P3). */
+  --ans-a: oklch(0.42 0.266 265);
+  --ans-a-deep: oklch(0.28 0.179 265);
+  --ans-a-ink: oklch(0.99 0 0);
+  --ans-b: oklch(0.5 0.184 12);
+  --ans-b-deep: oklch(0.36 0.134 12);
+  --ans-b-ink: oklch(0.99 0 0);
+  --ans-c: oklch(0.68 0.108 192);
+  --ans-c-deep: oklch(0.54 0.086 192);
+  --ans-c-ink: oklch(0.17 0.02 272);
+  --ans-d: oklch(0.8 0.129 60);
+  --ans-d-deep: oklch(0.66 0.129 60);
+  --ans-d-ink: oklch(0.17 0.02 272);
+  /* Slots 5-6, for decks with more than four options. F sits at hue 230, not
+   * green, so it never reads as the lime "correct" accent.
+   *
+   * SOLVED to EXTEND the ladder's ends, not to sit beside its rungs. These two
+   * were originally appended at L 0.46 and 0.74, which interleaved them into
+   * the middle of the A-D ladder: measured in true greyscale that left
+   * adjacent pairs at 1.16:1 (F/D, dark) and 1.07:1 (C/F, light) -- i.e. the
+   * colour channel was effectively DEAD between them for an achromatopsic
+   * viewer, in greyscale, or on a failing bulb. The four-channel redundancy
+   * still separated the board by shape, letter and position, but a ladder that
+   * claims to survive greyscale has to actually do it at six options, not only
+   * at four.
+   *
+   * E now sits BELOW A and F ABOVE D, giving E < A < B < C < D < F with a
+   * worst adjacent pair of 1.42:1 -- which is the A-D ladder's own worst
+   * (C/D at 1.43:1), so six options are now as separable as four. F trades
+   * chroma for that lightness (0.136 -> 0.060 is simply what hue 230 has left
+   * at L 0.90); hue still separates it from D, and the greyscale channel it
+   * buys is the one that was missing. */
+  --ans-e: oklch(0.26 0.136 320);
+  --ans-e-deep: oklch(0.18 0.095 320);
+  --ans-e-ink: oklch(0.99 0 0);
+  --ans-f: oklch(0.9 0.06 230);
+  --ans-f-deep: oklch(0.76 0.06 230);
+  --ans-f-ink: oklch(0.17 0.02 272);
+
+  /* ── semantics — never red/green (P4) ────────────────────────────── */
+  --correct: var(--accent);
+  --correct-ink: var(--accent-ink);
+  --incorrect: oklch(0.45 0.01 272);
+  --warn: oklch(0.8 0.145 70);
+  --streak: oklch(0.84 0.125 45);
+  --danger: oklch(0.65 0.2 18);
+
+  /* ── type ─────────────────────────────────────────────────────────── */
+  /* ONE family. `--font-display` is an alias, not a second typeface: a call
+   * site saying `font-display` is stating intent, not loading another face.
+   * Mono is reserved for the join code (see `.code`), where distinguishing
+   * 0 from O is a transcription requirement. */
+  --font-ui: "Geist Variable", "Geist", system-ui, -apple-system, sans-serif;
+  --font-display: var(--font-ui);
+  --font-mono: "Geist Mono Variable", "Geist Mono", ui-monospace, monospace;
+
+  /* Tracking is baked into each type step (DESIGN.md §4), so only the two
+   * cases a step cannot express live here: uppercase labels, the one place
+   * tracking goes positive, and the join code. */
+  --track-label: 0.06em;
+  --track-code: 0.08em;
+
+  /* ── space (4px base) ─────────────────────────────────────────────── */
+  --s-0: 2px;
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-7: 32px;
+  --s-8: 40px;
+  --s-9: 48px;
+  --s-10: 64px;
+  --s-11: 80px;
+  --s-12: 96px;
+  --s-13: 128px;
+  /* projectors crop, and heads block the bottom ~8% */
+  --stage-safe: 4.5vw;
+  --stage-gap: 1.6vw;
+
+  /* ── radius — scales WITH element size, never constant ────────────── */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-xl: 28px;
+  --r-2xl: 40px;
+  --r-pill: 9999px;
+
+  /* ── elevation — ONE light: above, slightly in front, never angled.
+   *    A hairline SEPARATES; a shadow ELEVATES; the two are not
+   *    interchangeable. Blur always grows faster than offset and opacity
+   *    falls as blur grows, which is how one soft light further away
+   *    behaves. No hard offset shadows (DESIGN.md P3). */
+  /* Separation, not elevation — it makes no depth claim (P3). */
+  --line: 0 0 0 1px var(--hairline);
+  --elev-1: 0 0 0 1px var(--hairline), 0 1px 2px oklch(0 0 0 / 0.32);
+  --elev-2: 0 0 0 1px var(--hairline), 0 4px 12px oklch(0 0 0 / 0.38),
+    inset 0 1px 0 oklch(1 0 0 / 0.06);
+  --elev-3: 0 0 0 1px var(--hairline-str), 0 16px 40px oklch(0 0 0 / 0.46),
+    inset 0 1px 0 oklch(1 0 0 / 0.08);
+  --glow: 0 0 0 2px var(--accent-a45), 0 0 36px var(--accent-a18);
+  --focus: 0 0 0 3px var(--accent-a45);
+
+  /* ── motion ───────────────────────────────────────────────────────── */
+  --dur-instant: 80ms;
+  --dur-fast: 140ms;
+  --dur-base: 220ms;
+  --dur-slow: 320ms;
+  --dur-stage: 520ms;
+  --dur-reveal: 900ms;
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-entrance: cubic-bezier(0, 0, 0.2, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --ease-expo-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-back-out: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --stagger: 35ms;
+  --stagger-lg: 60ms;
+
+}
+
+/* ── Stage Light: a projector cannot render black in a lit room (§5) ───
+ *
+ * CAUTION, and the reason this block is not the whole story: lib/themes.ts
+ * applies the active deck theme as INLINE custom properties on <html>, which
+ * outrank everything here. So this block is the pre-theme fallback, and
+ * themes.ts holds the values that actually reach a projector. Both are audited
+ * by `npm run audit:themes` -- genuinely both, as of the N5 fix: the script
+ * reads this file as well as themes.ts, and fails (exit 1) on either half. If
+ * you change an accent, change it in both places or the audit will say so. */
+[data-stage="light"] {
+  --canvas: oklch(0.99 0.004 95);
+  --surface-1: oklch(0.97 0.006 95);
+  --surface-2: oklch(0.94 0.008 95);
+  --surface-3: oklch(0.91 0.009 95);
+  --hairline: oklch(0.89 0.008 95);
+  --hairline-str: oklch(0.8 0.01 95);
+
+  --ink: oklch(0.22 0.012 272);
+  --ink-muted: oklch(0.42 0.012 272);
+  --ink-subtle: oklch(0.56 0.012 272);
+
+  /* Lime is illegible on paper, so the light stage gets a deep moss accent.
+   * SOLVED, not picked: the reveal badge and the correct-answer check are stage
+   * CONTENT, read from the back of a lit room, so they owe the §5 target of
+   * 7:1 against their own ink -- not the 4.5:1 that desk-distance chrome owes.
+   * At L 0.52 they measured 5.15:1 and the audit caught it. L 0.445 is the
+   * lightest step that clears 7:1, carrying the greatest in-gamut chroma at
+   * that lightness so the accent stays saturated rather than going muddy to
+   * buy the contrast. It lands at 7.10:1 against the ink AND 7.10:1 against
+   * the paper canvas, which matters because the accent is used both as a fill
+   * behind ink and as text on the canvas. */
+  --accent: oklch(0.445 0.126 132);
+  --accent-dim: oklch(0.4 0.114 132);
+  --accent-ink: oklch(0.99 0.004 95);
+  --accent-a45: oklch(0.445 0.126 132 / 0.45);
+  --accent-a18: oklch(0.445 0.126 132 / 0.18);
+
+  /* On paper the two LIGHT slots lose their edge against the canvas, so they
+   * step down one notch; the two dark slots are already strong and stay put. */
+  --ans-c: oklch(0.66 0.11 192);
+  --ans-c-deep: oklch(0.52 0.09 192);
+  --ans-d: oklch(0.74 0.14 60);
+  --ans-d-deep: oklch(0.6 0.135 60);
+  /* F keeps its light-stage step-down in spirit -- on paper a very light fill
+   * loses its edge against the canvas -- but it must stay ABOVE D (0.74 here)
+   * or the greyscale ladder collapses again on exactly the axis where it was
+   * worst (C/F measured 1.07:1 before this fix). */
+  --ans-f: oklch(0.86 0.072 230);
+  --ans-f-deep: oklch(0.72 0.072 230);
+
+  --incorrect: oklch(0.72 0.008 272);
+  --danger: oklch(0.5 0.19 22);
+
+  --elev-1: 0 0 0 1px var(--hairline), 0 1px 2px oklch(0 0 0 / 0.05);
+  --elev-2: 0 0 0 1px var(--hairline), 0 2px 8px oklch(0 0 0 / 0.06),
+    0 12px 28px oklch(0 0 0 / 0.05);
+  --elev-3: 0 0 0 1px var(--hairline-str), 0 8px 20px oklch(0 0 0 / 0.08),
+    0 24px 56px oklch(0 0 0 / 0.07);
+
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --hairline: var(--hairline-str);
+  }
+}

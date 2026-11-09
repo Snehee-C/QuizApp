@@ -1,14 +1,432 @@
+/* Self-hosted variable fonts — bundled, not CDN, so the app still looks right
+ * when it runs offline on a venue LAN (see PLAN.md §11).
+ *
+ * ONE family (DESIGN.md P1). Geist carries the whole product; Geist Mono is
+ * loaded for the join code alone, where glyph disambiguation is a transcription
+ * requirement rather than a stylistic choice. */
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+@import "./styles/tokens.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-html, body, #root {
-  height: 100%;
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-ui);
+    font-optical-sizing: auto;
+    background: var(--canvas);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* stop iOS auto-inflating text in the rotated/zoomed player view */
+    text-size-adjust: 100%;
+  }
+
+  /* Continuous corners (DESIGN.md §5). A superellipse is the shape a radius is
+   * trying to be: curvature ramps in rather than meeting the straight edge at a
+   * hard tangent, which is what makes a plain border-radius read as "pill stuck
+   * to a box" at larger sizes. Progressive enhancement — where `corner-shape`
+   * is unsupported the same elements keep their circular radius and nothing
+   * else about the layout changes. */
+  @supports (corner-shape: superellipse(4)) {
+    [class*="rounded-"]:not(.rounded-pill) {
+      corner-shape: superellipse(4);
+    }
+  }
+
+  /* Focus is never removed — only restyled (DESIGN.md §6). */
+  :focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+    outline-offset: 2px;
+    border-radius: var(--r-xs);
+  }
+
+  /* Every score, timer, percentage and join code. Non-tabular numerals that
+   * jitter mid-count-up are this category's most common polish failure. Geist
+   * carries tabular figures, so this no longer means a second typeface — only
+   * the join code reaches for mono, via `.code`. */
+  .nums {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+
+  ::selection {
+    background: var(--accent-a45);
+    color: var(--ink);
+  }
 }
 
-body {
-  margin: 0;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  background: #f5f5f7;
-  color: #1a1a1a;
+@layer components {
+  /* Hover is a brightness change, not a colour change (Linear's trick). It also
+   * means a variant needs one colour defined, not two. */
+  .brighten {
+    transition: filter var(--dur-instant) var(--ease-standard);
+  }
+  .brighten:hover:not(:disabled) {
+    filter: brightness(1.12);
+  }
+
+  /* The single press behaviour, product-wide (DESIGN.md P1/P3). The element
+   * responds where it is — it does not travel down a drawn shadow. */
+  .press {
+    transition: transform var(--dur-instant) var(--ease-standard);
+  }
+  .press:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+}
+
+@layer utilities {
+  /* Tracking is baked into each type step (DESIGN.md §4). These remain for the
+   * two cases a step cannot cover: uppercase labels, which are the one place
+   * tracking goes positive, and the join code. */
+  .track-label {
+    letter-spacing: var(--track-label);
+  }
+
+  /* A join code is transcribed by hand off a projector, so it is the one place
+   * that reaches for mono (0 vs O, 1 vs l) and the one place tracking opens up.
+   * It lives in the utilities layer deliberately: it has to outrank the
+   * letter-spacing baked into whichever type step it sits on. */
+  .code {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+    letter-spacing: var(--track-code);
+  }
+
+  /* Headline wrapping. `balance` evens the lines of a short heading so the last
+   * one is never a single orphaned word; `pretty` does the cheaper job for body
+   * copy. Both degrade to normal wrapping. */
+  .balance {
+    text-wrap: balance;
+  }
+  .pretty {
+    text-wrap: pretty;
+  }
+}
+
+/* Reduced motion: kill celebration, overshoot and parallax; keep short opacity
+ * crossfades so state changes are still legible (DESIGN.md §6). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 120ms !important;
+    scroll-behavior: auto !important;
+  }
+  .press:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* ── Forced colours (Windows High Contrast, and the equivalent on other OSes).
+ *
+ * This mode is NOT "our palette, turned up". The user has replaced the palette
+ * with their own and the UA enforces it, so the job is not to keep our colours
+ * — it is to make sure the information our colours were carrying survives.
+ * Three mechanics shape every rule below; the third is the one that is not
+ * obvious and that decides the whole approach.
+ *
+ * 1. The UA discards `box-shadow` outright. Every separator and every state
+ *    ring in this system is a box-shadow by construction (P3: `--line`,
+ *    `--elev-*`, `--focus`, `--glow`, and the chosen-tile keyline), so they all
+ *    vanish at once. Measured before this block: 6 answer tiles, 6 fills of
+ *    rgb(255,255,255), 0 tiles with any boundary, keyline absent on all 4
+ *    selected tiles, focus ring gone. `outline` is NOT discarded, so every ring
+ *    is restated as one. A negative `outline-offset` draws it inside the border
+ *    box, which reproduces an inset shadow's geometry and, like it, stays out
+ *    of layout — load-bearing, because the stage grid equalises tile heights
+ *    and a border here would change every box.
+ *
+ * 2. Author colours are forced to the palette UNLESS they are system-colour
+ *    keywords, which pass through. `!important` is on those declarations
+ *    because a tile's fill and ink arrive as INLINE style from the slot ladder,
+ *    and inline outranks any selector we can write.
+ *
+ * 3. Chromium paints a solid Canvas BACKPLATE behind every run of text in this
+ *    mode (it is there to keep text legible over background images). It cannot
+ *    be opted out of short of `forced-color-adjust: none`. So any ink we choose
+ *    that is not legible against Canvas is not merely risky, it is INVISIBLE:
+ *    `background: Highlight; color: HighlightText` — the pattern every
+ *    forced-colors guide shows — renders as white text on a white backplate,
+ *    and an inverted `background: CanvasText; color: Canvas` does the same.
+ *    Both were built, measured and reverted; the screenshots show the labels
+ *    as blank white blocks. Hence the rule this block obeys: TEXT AND FILL ARE
+ *    NEVER RECOLOURED. State is carried entirely by ring weight, ring colour,
+ *    opacity, transform and glyph — all of which the backplate cannot touch.
+ *
+ * Channel accounting (§5 wants four: hue + shape + letter + fixed position).
+ * Position and shape are geometry and survive untouched. The letter is lifted
+ * out of its 55% wash below so it survives at full contrast. Hue is the one
+ * channel this mode legitimately takes away, and it is handed back only inside
+ * the shape chip — see the `forced-color-adjust` note there. */
+@media (forced-colors: active) {
+  /* The boundary the discarded fill used to provide, and the carrier for every
+   * tile state. Width in `em` so it rides the type ladder the way the keyline
+   * does: 1px against `text-title3` on the phone, ~2.7px against
+   * `text-stage-answer`, which is what keeps it readable from six metres.
+   *
+   * Colour and width go through custom properties rather than being
+   * re-declared per state, so that no `[data-state]` selector can out-specify
+   * the focus ring at the bottom of this block — one that did would leave a
+   * focused tile wearing a ring recoloured into its own fill. Focus is never
+   * removed (§6), and that includes never being quietly erased. */
+  .answer-tile {
+    --tile-ring: CanvasText;
+    --tile-ring-w: 0.05em;
+    outline: var(--tile-ring-w) solid var(--tile-ring);
+    outline-offset: calc(-1 * var(--tile-ring-w));
+  }
+
+  /* Hue, returned in a 44px swatch and nowhere else. `forced-color-adjust` is
+   * the escape hatch this mode exists to make unnecessary, so it is scoped to
+   * the single element whose CONTENT is colour — the same carve-out a colour
+   * picker's swatches get — and never to a tile fill, a surface, or any text.
+   * The pair is restated from `--slot-fill` / `--slot-ink` rather than left to
+   * `currentColor`, which has already been forced on the ancestor. It is the
+   * ladder's own measured >=6.4:1 pair, so the shape stays legible inside the
+   * swatch on exactly the terms §5 claims for it, and the swatch gets a
+   * CanvasText ring so it still has an edge against the forced tile fill. */
+  .answer-chip,
+  .echo-chip {
+    forced-color-adjust: none;
+    background: var(--slot-fill) !important;
+    color: var(--slot-ink) !important;
+    outline: 1px solid CanvasText;
+  }
+
+  /* The letter is a channel, not decoration, so it may not be an alpha wash in
+   * the one mode whose entire purpose is guaranteed contrast: 55% of CanvasText
+   * over Canvas measures ~4.8:1 against the 21:1 the palette is offering.
+   * Selection is carried by the ring below, so nothing is lost by taking every
+   * tile's letter to full strength. */
+  .answer-letter {
+    opacity: 1 !important;
+  }
+
+  /* chosen — pre-reveal, so it must imply nothing about correctness. The normal
+   * -mode sentence is "the tile's own ink fills in"; here it becomes "the
+   * tile's own ring fills in", which is the same sentence in the only alphabet
+   * left. Highlight is the palette's word for "this one is selected" and says
+   * that and nothing more. The keyline keeps its element and its 0.14em width
+   * and only changes mechanism, from an inset shadow the UA drops to an inset
+   * outline it keeps; it is offset far enough in to sit INSIDE the tile's own
+   * boundary rather than painting over it, so a chosen tile reads as a hairline
+   * edge with a heavy Highlight band just inside — unmistakably two rings
+   * against an unselected tile's one. */
+  .answer-tile[data-state="chosen"] .answer-chip {
+    background: var(--slot-ink) !important;
+    color: var(--slot-fill) !important;
+  }
+  .answer-keyline {
+    outline: 0.14em solid Highlight;
+    outline-offset: -0.19em;
+  }
+
+  /* correct — the loudest moment in the product, rebuilt without the one move
+   * that would have been loudest, because of mechanic 3 above. What is left is
+   * still five simultaneous differences from a wrong tile: a ring four times
+   * heavier, full opacity against their 0.75, scale 1.04 against their 0.94,
+   * the stamped check against their cross, and a chip that keeps its hue while
+   * theirs give theirs up. None of them is a hue we chose, so "never red/green"
+   * (§5) holds by construction rather than by luck. */
+  .answer-tile[data-state="correct"] {
+    --tile-ring-w: 0.22em;
+  }
+  .answer-stamp-correct,
+  .answer-stamp-wrong {
+    background: Canvas !important;
+    color: CanvasText !important;
+    outline: 1px solid CanvasText;
+  }
+
+  /* wrong — the same vocabulary as everywhere else (desaturate + dim + ✕ +
+   * shrink), with two adjustments this mode forces.
+   *
+   * The dim moves 0.38 -> 0.75. At 0.38 the ink composites to roughly 2.3:1
+   * against the user's own canvas: it stops being a de-emphasis and becomes an
+   * unreadable one, in the single mode that exists to prevent exactly that.
+   * 0.75 still reads as faded and measures ~14:1. The fill does not move,
+   * because the tile and the page behind it are now the same Canvas.
+   *
+   * And the dim is NOT `GrayText`, which is the obvious choice and the trap.
+   * Windows defines that slot per theme: High Contrast White sets it to
+   * #600000 and High Contrast Black to #3FF23F — measured here as
+   * rgb(96,0,0) — so "incorrect" would render dark red in one theme and bright
+   * green in the other, the precise pairing §5 bans, with green landing on the
+   * wrong half of it. Opacity carries no hue in any palette, so the
+   * de-emphasis stays achromatic by construction. The chip does give up its
+   * colour here and only here: losing colour IS this system's "incorrect", so
+   * the swatch exception above is withdrawn rather than contradicted. */
+  .answer-tile[data-state="wrong"] {
+    opacity: 0.75 !important;
+  }
+  .answer-tile[data-state="wrong"] .answer-chip {
+    forced-color-adjust: auto;
+    background: Canvas !important;
+    color: CanvasText !important;
+  }
+
+  /* The answered echo: boundaries only. Its card is separated by a box-shadow
+   * hairline and its rows by one step of the canvas ladder, and this mode
+   * deletes the first and flattens the second, so the frame dissolves into the
+   * page without these. Neutral CanvasText on purpose: a Highlight ring would
+   * make this frame say "selected" and a heavy one would make it say "this was
+   * the answer", about a question the room has not revealed yet — the one thing
+   * it must never do. */
+  .echo-card {
+    outline: 1px solid CanvasText;
+  }
+  .echo-row {
+    outline: 1px solid CanvasText;
+    outline-offset: -1px;
+  }
+
+  /* ---------------------------------------------------------------------
+   * The projector board (`StageAnswers`), which is NOT the component above:
+   * `AnswerTile` is never rendered with `stage`, so everything up to here
+   * fixes the phone and leaves the room looking at the same white rectangles.
+   * Measured at 1920x1080 before these rules: 4 tiles, 4 bar fills all
+   * rgb(255,255,255), 0 tiles with a boundary, channels 4 -> 2 (shape,
+   * letter). Worse than the phone case by construction — the audience cannot
+   * reach the host's display settings.
+   *
+   * It wears `.answer-tile`, `.answer-chip`, `.answer-letter` and
+   * `.answer-stamp-correct` rather than a parallel set, so every rule above
+   * applies unchanged and there is one description of each state. Its
+   * `data-state` adds `revealed` (reveal happened, this tile is not the
+   * answer) — deliberately not `wrong`, which carries a dim the stage refuses
+   * on purpose: the room is still reading every option's share.
+   *
+   * Only what is genuinely different about a projector is restated below. */
+
+  /* Ring width in px, the one exception to the em rule at the top of this
+   * block, and for the reason that rule gives: em has to ride the type ladder,
+   * and here it cannot. The phone's ring element carries `text-stage-answer`
+   * itself; the stage's ring element is the grid cell, which carries no type
+   * at all and resolves em against the inherited 16px — 0.05em would be a
+   * 0.8px hairline thrown six metres. These are what the phone's em resolves
+   * to against the 50px stage step (2.5px / 11px), each rounded up a pixel
+   * because this outline is now the only edge the back of the room has. */
+  .answer-tile-stage {
+    --tile-ring-w: 3px;
+  }
+
+  /* Equal specificity with `.answer-tile[data-state="correct"]` above and
+   * declared after it, so it wins on purpose: that rule's 0.22em against the
+   * stage tile's inherited 16px is 3.5px, which is not a state change, it is
+   * the base ring plus a rounding error. 4x is a state change, and it is the
+   * same 4x ratio the phone gets. */
+  .answer-tile-stage[data-state="correct"] {
+    --tile-ring-w: 12px;
+  }
+
+  /* The swatch and the stamp are ~85px and ~65px here against the phone's
+   * 44px and 28px, so their 1px edges would read as dirt on the lens. Only
+   * the width is restated; the colours, and the `forced-color-adjust` carve-
+   * out that justifies them, stay exactly as argued above. */
+  .answer-tile-stage .answer-chip,
+  .answer-tile-stage .answer-stamp-correct {
+    outline-width: 2px;
+  }
+
+  /* The distribution bar wears the TILE's ring rather than one of its own, and
+   * that is not a shortcut — two measured facts force it into one declaration.
+   *
+   * (a) An opaque absolutely-positioned child paints OVER its parent's
+   *     outline. Chromium draws an element's outline in that element's own
+   *     paint phase, below its descendants — not atomically on top as CSS2.1
+   *     E.2 step 10 allows — so the tile's ring survives only where the bar
+   *     is not. Repro `fc-paintorder.mjs`, four variants, both modes: a 12px
+   *     ring under a 60%-wide opaque child shows as a block around the
+   *     remaining 40% and nothing else; only `z-index:-1` on the child draws
+   *     it whole, and that would bury the bar behind the tile's own fill.
+   *     This is not a forced-colours quirk — it reproduces with `none` — but
+   *     it only MATTERS here, because this is the only mode where the ring is
+   *     the whole boundary. Measured in situ: with the ring on the tile alone,
+   *     the answering-open board (bar at 100%) showed four corner nubs where
+   *     `overflow-hidden` clips the square bar off the tile's rounded corner,
+   *     and no edges at all. The computed-style probe still read
+   *     `tiles_with_boundary 4/4` — an outline that exists and is painted over
+   *     measures identical to one that is visible, which is why this was
+   *     caught in a screenshot and not in a number.
+   *
+   * (b) The bar's right edge is the datum of §5's signature reveal — the
+   *     share is a LENGTH, and with hue gone there is nothing else drawing it.
+   *
+   * One ring at one width satisfies both. Before the reveal it traces the tile
+   * exactly, because the bar IS the tile then. After, the tile's own ring
+   * covers the uncovered right, the bar's covers the left, and the seam
+   * between them falls on the share — the boundary and the datum are the same
+   * stroke, at the same weight, including the 4x weight a correct tile gets.
+   * Both rings are kept, not one: the corners are precisely where
+   * `overflow-hidden` clips this square ring away, and the tile's rounded one
+   * is what shows through there. */
+  .answer-bar {
+    outline: var(--tile-ring-w) solid var(--tile-ring);
+    outline-offset: calc(-1 * var(--tile-ring-w));
+  }
+
+  /* The reveal scrim exists to mute the bar so `--ink` can be read across it.
+   * Forced colours keeps its 0.7 ALPHA while forcing its colour — measured
+   * rgba(255,255,255,0.7) — so it becomes a 70% Canvas sheet over a bar that
+   * is already Canvas: no mute left to perform, and it would wash the bar's
+   * new outline down to 30% of CanvasText. `transparent` is one of the few
+   * author colours this mode preserves rather than forces, which is what makes
+   * removing a layer possible at all. */
+  .answer-scrim {
+    background: transparent !important;
+  }
+
+  /* Focus is never removed, only restyled (§6) — and `--focus` is a box-shadow,
+   * so without this it IS removed. Drawn outside the box with a positive offset
+   * so it lands on the page canvas and stays visible whatever the focused
+   * element's own ring became. */
+  :focus-visible {
+    outline: 3px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  /* `.press` is a transform and survives. `.brighten` is a filter over a forced
+   * fill and now does nothing; left alone deliberately, because hover feedback
+   * is not information and inventing a colour for it would spend the user's
+   * palette on decoration (P2). */
+}
+
+@media (forced-colors: active) {
+  /* The countdown is an SVG stroke, and forced-colors does NOT force `stroke`
+   * the way it forces `color` and `background-color`. So the ring kept
+   * painting in the product's lime (and in --danger at the end) straight over
+   * a palette the user explicitly asked for. It is also the one element on the
+   * stage whose whole job is to be read at a glance from the back of a room,
+   * so leaving it to chance against an unknown background is the worst place
+   * to do it.
+   *
+   * The track takes the user's canvas and the progress stroke takes their
+   * highlight; urgency keeps the only channel that survives here, which is the
+   * geometry — the arc shortening — plus the per-second pulse. Colour cannot
+   * carry urgency in a palette we do not control. */
+  .timer-track {
+    stroke: Canvas !important;
+  }
+  .timer-progress {
+    stroke: Highlight !important;
+  }
 }
