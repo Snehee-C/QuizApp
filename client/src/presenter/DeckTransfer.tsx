@@ -1,12 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { motion } from "motion/react";
-import { api, getToken, type Presentation } from "../lib/api";
+import { getToken, type Presentation } from "../lib/api";
 import { API_BASE } from "../lib/config";
 import { useAuth } from "../auth";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
-import { duration as dur, STAGGER, prefersReducedMotion } from "../lib/motion";
 
 /**
  * Move decks in and out of the account as JSON files.
@@ -23,25 +21,7 @@ interface ImportFailure {
 }
 
 /** Filename the browser saves under when the server sends no usable one. */
-function fallbackFilename(title: string): string {
-  const stem = title
-    .replace(/[^A-Za-z0-9 _-]+/g, " ")
-    .trim()
-    .replace(/\s+/g, "-")
-    .slice(0, 60);
-  return `${stem || "deck"}.json`;
-}
-
 export default function DeckTransfer() {
-  const [items, setItems] = useState<Presentation[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [listError, setListError] = useState<string | null>(null);
-
-  // Per-deck rather than page-wide so one slow download doesn't freeze the
-  // rest of the list.
-  const [downloading, setDownloading] = useState<string | null>(null);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
-
   const [importing, setImporting] = useState(false);
   const [importFile, setImportFile] = useState<string | null>(null);
   const [importError, setImportError] = useState<ImportFailure | null>(null);
@@ -50,47 +30,6 @@ export default function DeckTransfer() {
   const fileInput = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
   const { user, logout } = useAuth();
-
-  useEffect(() => {
-    let live = true;
-    api
-      .listPresentations()
-      .then((data) => live && setItems(data))
-      .catch((e: unknown) => {
-        if (live) setListError(e instanceof Error ? e.message : "Could not load your decks.");
-      })
-      .finally(() => {
-        if (live) setLoading(false);
-      });
-    return () => {
-      live = false;
-    };
-  }, []);
-
-  async function download(deck: Presentation) {
-    setDownloading(deck.id);
-    setDownloadError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/transfer/${deck.id}/export`, {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}) as { error?: string });
-        throw new Error(body.error || `Export failed (${res.status})`);
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filenameFromHeader(res.headers.get("Content-Disposition")) ?? fallbackFilename(deck.title);
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e: unknown) {
-      setDownloadError(e instanceof Error ? e.message : "Could not export that deck.");
-    } finally {
-      setDownloading(null);
-    }
-  }
 
   async function importFromFile(file: File) {
     setImporting(true);
@@ -154,8 +93,6 @@ export default function DeckTransfer() {
     if (file) void importFromFile(file);
   }
 
-  const reduced = prefersReducedMotion();
-
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
       {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
@@ -191,19 +128,17 @@ export default function DeckTransfer() {
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="mb-7">
           <h1 className="font-display text-large-title font-bold leading-none">
-            Import &amp; export
+            Import a deck
           </h1>
           <p className="text-ink-subtle text-subhead mt-2">
-            Save a deck as a <span className="font-mono text-subhead">.json</span> file to back it
-            up or hand it to someone else — and bring one back the same way.
+            Bring in a deck saved as a <span className="font-mono text-subhead">.json</span> file.
+            To send one out, open any deck's ••• menu and choose{" "}
+            <span className="font-semibold text-ink-muted">Export as file</span>.
           </p>
         </div>
 
         {/* ---- Import ---- */}
         <section className="mb-10">
-          <h2 className="text-caption font-semibold uppercase track-label text-ink-subtle mb-2">
-            Import a deck
-          </h2>
           <Card
             level={1}
             onDragOver={(e) => {
@@ -275,78 +210,12 @@ export default function DeckTransfer() {
           )}
         </section>
 
-        {/* ---- Export ---- */}
-        <section>
-          <h2 className="text-caption font-semibold uppercase track-label text-ink-subtle mb-2">
-            Export a deck
-          </h2>
-
-          {loading && <p className="text-ink-subtle">Loading…</p>}
-
-          {!loading && listError && (
-            <Card level={0} className="px-7 py-10 text-center">
-              <p className="font-display text-title2 font-bold mb-2">
-                Couldn’t load your decks
-              </p>
-              <p className="text-ink-subtle text-subhead">{listError}</p>
-            </Card>
-          )}
-
-          {!loading && !listError && items.length === 0 && (
-            <Card level={0} className="px-7 py-12 text-center">
-              <p className="font-display text-title2 font-bold mb-2">Nothing to export</p>
-              <p className="text-ink-subtle text-subhead mb-6">
-                Build a deck first, or import one from a file above.
-              </p>
-              <Link to="/dashboard">
-                <Button variant="primary" size="md">
-                  Go to your decks
-                </Button>
-              </Link>
-            </Card>
-          )}
-
-          {downloadError && (
-            <p className="text-subhead text-ink-muted mb-3" role="status">
-              {downloadError}
-            </p>
-          )}
-
-          <div className="flex flex-col gap-2.5">
-            {items.map((p, i) => {
-              const slides = p._count?.slides ?? 0;
-              return (
-                <motion.div
-                  key={p.id}
-                  initial={{ opacity: 0, y: reduced ? 0 : 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * STAGGER, duration: dur.base }}
-                >
-                  <Card
-                    level={1}
-                    className="flex items-center justify-between gap-4 px-5 py-4 transition-colors duration-fast hover:bg-surface-2"
-                  >
-                    <div className="flex-1 min-w-0">
-                      <p className="font-semibold text-callout truncate">{p.title}</p>
-                      <p className="nums text-footnote text-ink-subtle mt-0.5">
-                        {slides} slide{slides === 1 ? "" : "s"}
-                      </p>
-                    </div>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      className="shrink-0"
-                      disabled={downloading !== null}
-                      onClick={() => download(p)}
-                    >
-                      {downloading === p.id ? "Preparing…" : "Download .json"}
-                    </Button>
-                  </Card>
-                </motion.div>
-              );
-            })}
-          </div>
-        </section>
+        {/* The "Export a deck" list that used to sit here is gone. It was a
+            second copy of the deck list, one navigation away from the first,
+            and existed only so you could press Download beside a row. That
+            verb now lives on the row itself, in the deck's own ••• menu, where
+            the deck already is (lib/deckFile.ts). Deleting the synonym rather
+            than keeping both is DESIGN.md P1. */}
       </main>
     </div>
   );
@@ -359,14 +228,4 @@ class ImportProblem extends Error {
     super(message);
     this.rejectedTypes = rejectedTypes;
   }
-}
-
-/**
- * Prefer the server's own filename so the download matches the deck title it
- * sanitised; fall back only when the header is missing or unreadable.
- */
-function filenameFromHeader(header: string | null): string | null {
-  if (!header) return null;
-  const match = /filename="([^"]+)"/.exec(header);
-  return match ? match[1] : null;
 }

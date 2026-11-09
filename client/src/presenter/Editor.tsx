@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { motion } from "motion/react";
 import {
@@ -15,6 +15,7 @@ import { SLIDE_GROUPS, labelFor, slideType, typesInGroup } from "../slides/regis
 import { ThemePicker } from "../components/ThemePicker";
 import { LiveRoomBar } from "../components/LiveRoomBar";
 import { getPresenting } from "../lib/liveSession";
+import { usePaneScrollMemory } from "../lib/scrollMemory";
 import { SlideTypePicker } from "../components/SlideTypePicker";
 import { AnimatePresence } from "motion/react";
 
@@ -90,6 +91,9 @@ export default function Editor() {
   // Set only once LiveRoomBar has confirmed the room with the server, so the
   // rail's "on screen" marker and the banner can never disagree.
   const [roomLive, setRoomLive] = useState(false);
+  const pane = useRef<HTMLElement>(null);
+  // The last thing in the product that forgot where you were (FLOW.md F3).
+  usePaneScrollMemory(pane, id, selectedId);
   const navigate = useNavigate();
 
   // One place that moves the selection, so remembering it cannot be forgotten
@@ -348,7 +352,7 @@ export default function Editor() {
         </aside>
 
         {/* ── editor ─────────────────────────────────────────────────── */}
-        <main className="flex-1 min-w-0 overflow-y-auto px-8 py-8">
+        <main ref={pane} className="flex-1 min-w-0 overflow-y-auto px-8 py-8">
           {selected ? (
             <SlideForm
               key={selected.id}

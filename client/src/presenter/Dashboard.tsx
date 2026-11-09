@@ -7,6 +7,7 @@ import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
 import { LiveRoomBar } from "../components/LiveRoomBar";
 import { MoreMenu } from "../components/MoreMenu";
+import { exportDeckToFile } from "../lib/deckFile";
 import { getLastRun, getPresenting } from "../lib/liveSession";
 import { LastRunBar } from "../components/LastRunBar";
 import { useScrollMemory } from "../lib/scrollMemory";
@@ -40,6 +41,19 @@ export default function Dashboard() {
     navigate(`/edit/${copy.id}`);
   }
 
+  // Exporting is a per-deck verb, so it lives on the deck. It used to mean
+  // leaving this list, finding the same deck again in a second list on the
+  // Import/export page, and pressing Download beside it (lib/deckFile.ts).
+  const [exportError, setExportError] = useState<string | null>(null);
+  async function exportDeck(p: Presentation) {
+    setExportError(null);
+    try {
+      await exportDeckToFile(p.id, p.title);
+    } catch (e: unknown) {
+      setExportError(e instanceof Error ? e.message : "Could not export that deck.");
+    }
+  }
+
   async function remove(id: string) {
     if (!confirm("Delete this deck? This cannot be undone.")) return;
     await api.deletePresentation(id);
@@ -70,9 +84,11 @@ export default function Dashboard() {
                 Templates
               </Button>
             </Link>
+            {/* Import only. Export moved onto the deck rows, where the deck
+                is — so this link now names one task instead of two. */}
             <Link to="/transfer">
               <Button variant="ghost" size="sm">
-                Import / export
+                Import
               </Button>
             </Link>
             <span className="text-subhead text-ink-subtle hidden sm:block">{user?.name}</span>
@@ -110,6 +126,15 @@ export default function Dashboard() {
             New deck
           </Button>
         </div>
+
+        {/* A row-level failure, reported once above the list rather than
+            inside the row: the menu it came from has already closed, so there
+            is nowhere in the row left to put it. */}
+        {exportError && (
+          <p role="status" className="text-subhead text-ink-muted mb-3">
+            {exportError}
+          </p>
+        )}
 
         {loading && <p className="text-ink-subtle">Loading…</p>}
 
@@ -169,6 +194,7 @@ export default function Dashboard() {
                     actions={[
                       { label: "Session history", onSelect: () => navigate(`/history/${p.id}`) },
                       { label: "Duplicate", onSelect: () => duplicate(p.id) },
+                      { label: "Export as file", onSelect: () => exportDeck(p) },
                       { label: "Delete deck", onSelect: () => remove(p.id), danger: true },
                     ]}
                   />

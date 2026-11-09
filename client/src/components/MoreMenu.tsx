@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "../lib/cn";
 import { duration as dur, ease, prefersReducedMotion } from "../lib/motion";
+import { useArrowFocus } from "../lib/arrowFocus";
 
 export interface MoreAction {
   label: string;
@@ -69,30 +70,40 @@ export function MoreMenu({
   const [open, setOpen] = useState(false);
   const wrap = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
 
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== "Escape") return;
-      setOpen(false);
-      // Focus goes back where it came from. Without this, Escape leaves focus
-      // on a node that has just been removed and the browser drops it to
-      // <body> — so the next Tab restarts at the top of the page, which from a
-      // row twelve decks down is a worse place than where they started.
-      trigger.current?.focus();
-    }
     function onDown(e: PointerEvent) {
       if (!wrap.current?.contains(e.target as Node)) setOpen(false);
     }
-    window.addEventListener("keydown", onKey);
     // Capture: a menu item's own click must still land, but a click on
     // anything else must close this before that thing acts on it.
     window.addEventListener("pointerdown", onDown, true);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("pointerdown", onDown, true);
-    };
+    return () => window.removeEventListener("pointerdown", onDown, true);
+  }, [open]);
+
+  // Escape and the arrows, shared with every other popup in the product
+  // (lib/arrowFocus.ts). ARIA's menu pattern specifies arrow navigation for
+  // `role="menu"`: a menu you can only Tab through is not a menu to anyone not
+  // using a mouse, whatever it looks like.
+  const dismiss = useCallback(() => {
+    setOpen(false);
+    // Focus goes back where it came from. Without this, Escape leaves focus on
+    // a node that has just been removed and the browser drops it to <body> —
+    // so the next Tab restarts at the top of the page, which from a row twelve
+    // decks down is a worse place than where they started.
+    trigger.current?.focus();
+  }, []);
+  useArrowFocus(panel, { selector: "[role^='menuitem']", onEscape: open ? dismiss : undefined });
+
+  // Opening puts you on the first row. Required for the keyboard path to work
+  // at all — arrows move focus, so something has to be focused first — and
+  // harmless for the mouse path, which is how every native menu behaves.
+  useEffect(() => {
+    if (!open) return;
+    panel.current?.querySelector<HTMLElement>("[role^='menuitem']")?.focus();
   }, [open]);
 
   const reduced = prefersReducedMotion();
@@ -106,6 +117,16 @@ export function MoreMenu({
         aria-expanded={open}
         aria-label={label}
         onClick={() => setOpen((v) => !v)}
+        onKeyDown={(e) => {
+          // Down from a closed trigger opens AND enters, which is what the
+          // ARIA pattern specifies and what every native menu does. Without
+          // it, opening by keyboard leaves focus on the trigger and the first
+          // Down is swallowed getting into the list.
+          if (e.key === "ArrowDown" && !open) {
+            e.preventDefault();
+            setOpen(true);
+          }
+        }}
         title={label}
         className={cn(
           "inline-flex items-center justify-center font-ui font-semibold press select-none",
@@ -120,6 +141,7 @@ export function MoreMenu({
       <AnimatePresence>
         {open && (
           <motion.div
+            ref={panel}
             role="menu"
             initial={{ opacity: 0, y: reduced ? 0 : -4, scale: reduced ? 1 : 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}

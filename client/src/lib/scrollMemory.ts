@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, type RefObject } from "react";
 
 // Where you were on a page you are coming back to.
 //
@@ -74,4 +74,81 @@ export function useScrollMemory(key: string, ready: boolean, restore = true): vo
       if (frame) cancelAnimationFrame(frame);
     };
   }, [key, ready, restore]);
+}
+
+// ── A scrolling pane, per item inside it ─────────────────────────────────
+//
+// The editor's form pane is the one place in the product where F3 was still
+// only half kept: the rail remembered which slide you were on, and every list
+// remembered where you were in it, but coming back to a long slide form put
+// you at the top of it. A half-kept promise is worse than an unmade one,
+// because it teaches people the product remembers and then catches them out.
+//
+// Keyed per slide rather than per pane, which also makes moving BETWEEN slides
+// behave: slide 6 opens at the top the first time you see it, and returns to
+// your notes the second time. A pane-level memory would have done the opposite
+// of what you want in both cases — dropping you into the middle of a form you
+// have never read.
+//
+// Scoped to one deck at a time. You edit one deck at a time, and bounding it
+// this way means the record cannot grow by one entry per slide per deck for as
+// long as the tab is open.
+
+const PANE_KEY = "menti_pane_scroll";
+
+function readPane(deckId: string): Record<string, number> {
+  try {
+    const raw = JSON.parse(sessionStorage.getItem(PANE_KEY) || "{}");
+    return raw?.deckId === deckId ? (raw.slides ?? {}) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Remember `el`'s scroll position against `itemKey`, and restore it whenever
+ * `itemKey` changes.
+ *
+ * Always sets a position — the stored one, or 0. Leaving it alone for an item
+ * with no stored position would strand the reader halfway down a form they
+ * have never opened, which is the failure this is meant to prevent, pointed
+ * the other way.
+ */
+export function usePaneScrollMemory(
+  ref: RefObject<HTMLElement | null>,
+  deckId: string | undefined,
+  itemKey: string | null
+): void {
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !deckId || !itemKey) return;
+
+    // After paint: the pane's content is swapped by a keyed remount, so its
+    // height is only final once the new form has laid out.
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = readPane(deckId)[itemKey] ?? 0;
+    });
+
+    let frame = 0;
+    const onScroll = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        try {
+          sessionStorage.setItem(
+            PANE_KEY,
+            JSON.stringify({ deckId, slides: { ...readPane(deckId), [itemKey]: el.scrollTop } })
+          );
+        } catch {
+          /* private-mode quota; costs the restore, nothing else */
+        }
+      });
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      cancelAnimationFrame(raf);
+      el.removeEventListener("scroll", onScroll);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [ref, deckId, itemKey]);
 }

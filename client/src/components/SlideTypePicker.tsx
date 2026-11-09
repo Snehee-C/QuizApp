@@ -3,6 +3,7 @@ import { motion } from "motion/react";
 import { cn } from "../lib/cn";
 import { SLIDE_GROUPS, typesInGroup } from "../slides/registry";
 import { duration as dur, ease, prefersReducedMotion } from "../lib/motion";
+import { useArrowFocus } from "../lib/arrowFocus";
 import { Input } from "./ui/Card";
 
 /**
@@ -54,22 +55,18 @@ export function SlideTypePicker({
   const first = groups[0]?.types[0]?.type ?? null;
 
   useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-      }
-    }
     function onDown(e: PointerEvent) {
       if (!panel.current?.contains(e.target as Node)) onClose();
     }
-    window.addEventListener("keydown", onKey);
     window.addEventListener("pointerdown", onDown, true);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("pointerdown", onDown, true);
-    };
+    return () => window.removeEventListener("pointerdown", onDown, true);
   }, [onClose]);
+
+  // Escape, and arrows across the card grid — the same hook the navigator and
+  // the menus use. It leaves Left/Right alone while the filter box has focus,
+  // because there they belong to the caret, so Down is the way out of the box
+  // and into the cards and typing is never interrupted (lib/arrowFocus.ts).
+  useArrowFocus(panel, { selector: "button[data-type]", onEscape: onClose });
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center px-6 py-10">
@@ -128,6 +125,7 @@ export function SlideTypePicker({
                 <button
                   key={t.type}
                   type="button"
+                  data-type={t.type}
                   onClick={() => onPick(t.type)}
                   className={cn(
                     "text-left px-4 py-3 rounded-md bg-surface-2 outline-none",

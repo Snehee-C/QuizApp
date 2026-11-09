@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { motion } from "motion/react";
 import { cn } from "../lib/cn";
 import { duration as dur, ease, prefersReducedMotion } from "../lib/motion";
+import { useArrowFocus } from "../lib/arrowFocus";
 
 /**
  * Go to slide 9 of 20.
@@ -98,35 +99,10 @@ export function SlideNavigator({
     (here ?? panel.current?.querySelector<HTMLButtonElement>("button"))?.focus();
   }, []);
 
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-        return;
-      }
-      // Arrow keys move focus INSIDE the panel. This is the whole reason the
-      // presenter's global key handler is suppressed while the navigator is
-      // open: ArrowRight there is `presenter:next`, so browsing the map with
-      // the keyboard would have advanced the live room behind the panel.
-      const keys = ["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp", "Home", "End"];
-      if (!keys.includes(e.key)) return;
-      e.preventDefault();
-      const btns = [...(panel.current?.querySelectorAll<HTMLButtonElement>("button[data-slide]") ?? [])];
-      if (btns.length === 0) return;
-      const at = btns.findIndex((b) => b === document.activeElement);
-      // Column count is read from the rendered grid rather than assumed, so
-      // Up/Down keep working when the panel reflows at a different width.
-      const cols = countColumns(btns);
-      const step =
-        e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : e.key === "ArrowDown" ? cols : -cols;
-      const next =
-        e.key === "Home" ? 0 : e.key === "End" ? btns.length - 1 : Math.min(btns.length - 1, Math.max(0, at + step));
-      btns[next]?.focus();
-    }
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  // Arrows move focus inside the panel, and must get there before the
+  // presenter's global handler does — ArrowRight there is `presenter:next`,
+  // a broadcast to every phone in the room (lib/arrowFocus.ts).
+  useArrowFocus(panel, { selector: "button[data-slide]", onEscape: onClose });
 
   // A scrim that is a real element, not a backdrop-filter: this sits over a
   // projected stage, and DESIGN.md §7 budgets backdrop blur to exactly one
@@ -253,16 +229,4 @@ export function SlideNavigator({
       </motion.div>
     </>
   );
-}
-
-/** How many cards share the first row — the grid's real column count. */
-function countColumns(btns: HTMLButtonElement[]): number {
-  if (btns.length === 0) return 1;
-  const top = btns[0].getBoundingClientRect().top;
-  let n = 0;
-  for (const b of btns) {
-    if (Math.abs(b.getBoundingClientRect().top - top) > 1) break;
-    n++;
-  }
-  return Math.max(1, n);
 }

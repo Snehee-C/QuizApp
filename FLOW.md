@@ -386,6 +386,36 @@ defect P1 exists to prevent.
 twenty-deck list that is 120 targets reduced to 80, and the irreversible one
 is no longer adjacent to the one you came for.
 
+### One interaction, four popups
+The slide navigator had arrow-key navigation and the three other popups did
+not, which is P1 at the level of behaviour: two spellings of one interaction.
+Adding a second and third hand-rolled key handler would have been the obvious
+move and would have guaranteed drift — the kind nobody notices, because nobody
+discovers that Home works in one menu and not another until they need it.
+
+So the logic came out into `lib/arrowFocus.ts` and all four adopted it. It is
+a floor as much as a consistency argument: ARIA's menu pattern specifies arrow
+navigation for `role="menu"`, and a menu you can only Tab through is not a menu
+to anyone not using a mouse, whatever it looks like.
+
+Geometry decides the column count rather than a prop, so the same hook serves a
+vertical menu and a reflowing card grid without being told which it is — and
+the question is asked of the DOM when the key is pressed, so a grid that
+reflows at a narrower width keeps working. Measured across all four:
+
+| | Navigator (4-col grid) | Presenter `More` | Deck row `•••` | Type picker |
+|---|---|---|---|---|
+| Arrows move focus | ✓ (Down crosses a row: 1 → 5) | ✓ | ✓ | ✓ |
+| `Home` / `End` | ✓ | ✓ | ✓ | ✓ |
+| `Escape` closes | ✓ | ✓ + focus back on trigger | ✓ + focus back on trigger | ✓ |
+| `Down` on a closed trigger opens *and* enters | — | ✓ | ✓ | — |
+| `Enter` commits | ✓ jumps | ✓ | ✓ | ✓ adds the slide |
+
+The one place the hook has to know where it is standing: in a text field,
+Left/Right belong to the caret. The type picker's filter box keeps them —
+verified, the caret moves and focus stays — and `Down` is the way out of the
+box and into the cards.
+
 ### Every return to a list
 `HashRouter` has no scroll restoration, and the browser's own is defeated by a
 client-rendered list that does not exist yet when the restore would fire. The
@@ -400,6 +430,39 @@ ended a session lands on the deck list with "You just ran …" on it — and was
 being scrolled eleven hundred pixels past it, to the row they happened to be
 looking at before they presented. **Arriving with news is not the same arrival
 as returning.**
+
+### The editor's form pane
+The last place in the product that forgot where you were. The rail remembered
+which slide you were on and every list remembered its scroll, but coming back
+to a long slide form put you at the top of it. A half-kept promise is worse
+than an unmade one, because it teaches people the product remembers and then
+catches them out.
+
+Keyed per slide rather than per pane, which also makes moving *between* slides
+behave: a slide you have never opened starts at the top, and one you have
+returns to where you were. A pane-level memory would have got both backwards —
+dropping you into the middle of a form you have never read. Verified: unvisited
+slide opens at 0, revisited slide returns to 356, and it survives leaving the
+editor entirely and a full reload.
+
+### Export a deck
+`/transfer` was two tasks wearing one page, and reading it properly changed the
+plan (§5). The import half is a scoped task. The export half was **a second
+copy of the deck list** — you left the deck list, found the same deck again in
+another list one navigation away, and pressed Download beside it.
+
+| | Before | After |
+|---|---|---|
+| Presses | 2 | 2 |
+| Lists to scan | **two** | one — the one you were already looking at |
+| Page changes | 1 | 0 |
+| `DeckTransfer.tsx` | 361 lines | **231** |
+
+The press count is unchanged and that is not the point: a whole screen existed
+as a synonym for a row you were already on. Export is a per-deck verb, so it
+lives on the deck, in its `•••` menu, and `lib/deckFile.ts` is the single
+implementation. The page it left is now titled `Import a deck`, does one thing,
+and says where the other verb went.
 
 ### Signed-out deep links
 `/edit/<id>` while logged out used to bounce to `/login` and then land on the
@@ -430,6 +493,9 @@ redirect).
 | `lib/scrollMemory.ts` | Lists come back to where you left them — and deliberately do not when the page has news. |
 | `components/SpeakerWindow.ts` | Carries the same slide list, clickable, on the one surface a projector never shows. |
 | `components/MoreMenu.tsx` | Grew `placement`, `size`, per-row `detail` and `menuitemcheckbox` so one disclosure mechanism serves both a dense list row and the presenter's bar. |
+| `lib/arrowFocus.ts` | One keyboard implementation for all four popups, replacing one real handler and three absences. |
+| `lib/deckFile.ts` | Exporting a deck to a file, as one operation rather than a page. |
+| `lib/scrollMemory.ts` | Gained `usePaneScrollMemory` for a scrolling element keyed per item, alongside the window-level hook. |
 | `lib/presenterPrefs.ts` | Host-machine preferences (localStorage, like the stage theme) and what the current room has been shown (sessionStorage, keyed by join code). |
 | ~~`components/ui/SoundToggle.tsx`~~ | **Deleted.** Its logic moved into the presenter's settings menu, which was the only place it was used. "A future participant view might want it" is how a codebase fills with well-built orphans; git has it if we were wrong. |
 
@@ -484,7 +550,8 @@ question and navigator-open.
 | Optimising for click count | "The 3-click rule is an arbitrary rule of thumb that is not backed by data," and click counting "does not take into account cognitive factors … [or] figure out where they currently are in the site's structure" — [NN/g](https://www.nngroup.com/articles/3-click-rule/). The counts in §3 are evidence of *missing doors*, not a target. |
 | Mirroring the deck position onto the player's phone | `DESIGN.md` already rejected mirroring question text: the phone is a controller and attention belongs on the shared screen. A progress counter is status rather than content, so it is arguable — and therefore deferred to §6 rather than smuggled in here. |
 | Putting the slide navigator **only** in the speaker window | It is the Keynote-correct home and the wrong *only* home: it needs a popup that can be blocked and a second display. A navigation surface that exists only when a popup succeeded is not a navigation surface. It is in both. |
-| Converting `/templates` to a sheet | On reflection this citation was applied too broadly when it was written. A sheet is for "a scoped task closely related to the current context"; the template gallery is other people's decks, with its own loading state, empty state and content. That is a **destination**, not a task — Apple's own App Store puts browse behind a tab, not a sheet. `/transfer` is the one that is genuinely sheet-shaped, and it is still queued (§6). The measurable harm both pages caused was losing the deck list's scroll position, and that is fixed for every page rather than for two. |
+| Converting `/templates` to a sheet | A sheet is for "a scoped task closely related to the current context"; the template gallery is other people's decks, with its own loading state, empty state and content. That is a **destination**, not a task — Apple's own App Store puts browse behind a tab, not a sheet. |
+| Converting `/transfer` to a sheet | **A correction to this table.** It previously said `/transfer` "is the one that is genuinely sheet-shaped", asserted from the citation rather than from the file. Reading it, the page was two tasks: an import (sheet-shaped, yes) and an export that was a second copy of the deck list. Putting *that* in a sheet would have floated a duplicate deck list over the real one. The duplicate is deleted and export now lives on the deck row (§3); what remains is a small single-purpose import page. Making it a sheet would mean a third hand-rolled modal shell, in the same batch that deleted duplicated interaction code rather than adding it — extracting a shared `Sheet` is the prerequisite, and it wants a second genuine customer to be designed against. |
 | A deck setting for the navigator's masking | It would have to be stored, and deck fields are the server's. It is also the wrong shape: the right rule needs no setting, because "has the room seen this" is a fact the presenter already knows rather than a preference anyone should have to express. |
 | "Everything before the current slide" as the seen rule | The obvious implementation, and it leaks. A host who jumps 1→8 never showed 4 through 7, and a rule based on position rather than history would have revealed them. |
 | Moving the live-session breadcrumb to localStorage | It would let a host see the live band in a *second tab*, and it would cost correctness to do it. Two tabs presenting two different decks share one localStorage, so the editor in tab one would offer "Back to the room" pointing at tab two's room. Measured, the current failure is benign: a second tab shows no band, no marker, a fully usable editor and zero errors — it degrades to exactly the behaviour that existed before any of this was built. **Silent absence is an acceptable failure; confident wrongness in front of an audience is not.** A durable fix wants the server to answer "is anything live for me", which it has no endpoint for. |
@@ -496,20 +563,18 @@ question and navigator-open.
 ## 6. What is still wrong
 
 Counting honestly, because this document's standard is that a system wrong
-about itself cannot be trusted about anything else. Of the first pass's ten
-findings: **seven are fully fixed** (the seventeen-type wall, ±1 stepping, the
-control bar, the player's position, the lobby code echo, the run that just
-happened, and now the navigator's leak), **one is partly fixed** (the page-swap
-complaint — scroll survives every return, `/transfer` is still a page), and
-**two remain** (deletion confirms and the editor pane's scroll). The second
-pass's open question, where the editor opens when you duck out of a live room,
-is settled in §3. Two further items were settled by deciding against them
-rather than by building: the live-crumb's tab scope and a deck setting for
-masking, both in §5.
+about itself cannot be trusted about anything else.
 
-What is left, in the order it costs a person something. The top two are both
-blocked on `server/` and are **not** ours to take — they are recorded here so
-the list stays complete, not as work in flight.
+Of the first pass's ten findings, **nine are fully fixed** and **one remains**
+(deletion confirms). Of everything raised since, three were settled by deciding
+against them rather than by building — the live crumb's tab scope, a deck
+setting for navigator masking, and `/transfer` as a sheet — and all three are
+in §5 with their reasoning and, in the last case, a correction to what this
+document previously claimed.
+
+What is left, in the order it costs a person something. The top two are blocked
+on `server/` and are **not** ours to take; they are recorded so the list stays
+complete, not as work in flight.
 
 1. **`confirm()` still guards both deletions.** *(blocked: needs `server/`)* A
    native modal with no undo, for an irreversible act. F5 is half-satisfied:
@@ -520,39 +585,33 @@ the list stays complete, not as work in flight.
    `server/`)* A slide added or deleted mid-session invalidates the list. The
    client notices — the authoritative `totalSlides` stops matching — and
    discards both the titles and the shown-slides set, re-learning a title each
-   time the host lands on a slide. Honest, and it is still a client working
-   around a protocol gap; the real fix is the server re-issuing titles on
-   `slide:changed`.
-3. **The editor restores selection but not scroll.** Come back to a long slide
-   form and you are at the top of it. F3 is satisfied for the rail and for every
-   list in the product, and not for that one pane.
-4. **`/transfer` should be a sheet.** Import and export is a genuinely
-   self-contained task — file in, file out — and it is a full page swap with its
-   own header. Now that scroll survives the round trip the remaining cost is
-   structural rather than measurable, which is why it is listed rather than done
-   on the way past. (`/templates` is a destination, not a task — §5.)
-5. **Neither menu has arrow-key navigation between items.** `MoreMenu` opens,
-   closes on Escape and on an outside click, and returns focus to its trigger,
-   but moving between rows is Tab, not Down — and it is now the presenter's
-   settings cluster, not just a row overflow. `SlideNavigator` does implement
-   arrow movement; the menus should match it, and so should the type picker,
-   where only "filter, then Enter for the first match" is wired.
-6. **`LastRunBar` only knows about runs that ended in this tab.** Close the
+   time the host lands on a slide. Honest, and still a client working around a
+   protocol gap.
+3. **`LastRunBar` only knows about runs that ended in this tab.** Close the
    browser and the pointer to your last session is gone — the results are still
-   in `Session history`, three presses away, which is where everyone was before.
-   A durable answer needs a "recent sessions" endpoint that does not exist.
-7. **The deck title is still an unlabelled drill-in.** Now redundant rather
+   in `Session history`, two presses away. A durable answer needs a "recent
+   sessions" endpoint that does not exist.
+4. **The deck title is still an unlabelled drill-in.** Now redundant rather
    than load-bearing — `Edit` sits beside it — so a consistency wrinkle rather
    than a trap. It stays listed because the original defect in this product was
    exactly this affordance being the *only* way in, and a system that forgets
    its own near-misses re-earns them.
-8. **The type picker has no "recently used".** The filter pays back most of
+5. **The type picker has no "recently used".** The filter pays back most of
    what progressive disclosure costs an expert, but an author building a
    twelve-question quiz types the same three letters twelve times. Remembering
    the last type used in this deck would make the common case one press again.
-9. **The reveal preference is per host, not per deck.** A host who runs a
-   trivia night and a staff all-hands from the same account gets one answer for
-   both. Per-deck is the better unit and is a deck field, which is the server's.
+6. **The reveal preference is per host, not per deck.** *(blocked: needs
+   `server/`)* A host who runs a trivia night and a staff all-hands from one
+   account gets one answer for both. Per-deck is the better unit and is a deck
+   field.
+7. **There is no shared `Sheet`.** Three modal surfaces now exist — the slide
+   navigator, the type picker, and whatever `/transfer` becomes — and two of
+   them each own a scrim, a panel and a dismiss. `lib/arrowFocus.ts` took the
+   keyboard half out; the presentation half is still duplicated, and it is the
+   prerequisite for the `/transfer` decision in §5 rather than a separate task.
+8. **`MoreMenu` has no typeahead.** Arrows, `Home`, `End` and `Escape` all work
+   now, but ARIA's menu pattern also specifies jumping to an item by first
+   letter. Low cost on a three-row menu; worth it if a menu ever gets long.
 
 ## 7. Sources
 
