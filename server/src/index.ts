@@ -8,7 +8,7 @@ import { authRouter } from "./routes/auth.js";
 import { presentationsRouter } from "./routes/presentations.js";
 import { sessionsRouter } from "./routes/sessions.js";
 import { transferRouter } from "./routes/transfer.js";
-import { registerSessionHandlers } from "./sockets/session.js";
+import { initSessionRuntime, liveSessionCount, registerSessionHandlers } from "./sockets/session.js";
 
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -61,7 +61,15 @@ function lanAddresses(): { address: string; iface: string }[] {
 }
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), lan: lanAddresses().map((e) => e.address) });
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    lan: lanAddresses().map((e) => e.address),
+    // Rooms held in memory right now. Not a session list and not a count of
+    // anything a user owns — just the size of the cache, so its eviction is
+    // observable from outside the process.
+    liveSessions: liveSessionCount(),
+  });
 });
 
 // Served to the presenter so it can build a join URL that works off-machine.
@@ -85,6 +93,13 @@ const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: corsOrigin },
 });
+
+// Recovery and housekeeping have to run with no socket in sight: a process
+// that has just come up owns every ACTIVE session in the database, including
+// the rooms a previous process was mid-way through. This also closes sessions
+// an older process abandoned before recovery existed — honestly, with a real
+// endedAt, never by deleting anything.
+initSessionRuntime(io);
 
 io.on("connection", (socket) => {
   registerSessionHandlers(io, socket);

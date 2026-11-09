@@ -84,13 +84,40 @@ export function stripAnswerKey(config: any): any {
 export const MIN_POINTS = 500;
 export const MAX_POINTS = 1000;
 
+/**
+ * The bounds any countdown is held to, before `timeScale` stretches it.
+ *
+ * Nothing validated this: `0` (a host who cleared the number field), a negative
+ * value, and anything past `setTimeout`'s 2^31-1 ms signed range — which Node
+ * silently clamps to 1 ms — all produced the same total failure, an auto-reveal
+ * that fires on landing and a question that is dead before the room can read
+ * it. The floor is deliberately a readable amount of time rather than 1 s; the
+ * ceiling leaves room for the x3 accessibility stretch and still sits two
+ * orders of magnitude inside the timer's range.
+ */
+export const MIN_TIME_LIMIT_SEC = 5;
+export const MAX_TIME_LIMIT_SEC = 600;
+export const DEFAULT_TIME_LIMIT_SEC = 20;
+
+export function clampTimeLimitSec(raw: unknown): number {
+  const n = typeof raw === "number" && Number.isFinite(raw) ? raw : DEFAULT_TIME_LIMIT_SEC;
+  return Math.min(MAX_TIME_LIMIT_SEC, Math.max(MIN_TIME_LIMIT_SEC, Math.round(n)));
+}
+
 export function speedPoints(
   timeLimitSec: number,
   ctx: GradeContext,
   min = MIN_POINTS,
   max = MAX_POINTS
 ): number {
-  const limitMs = Math.max(1, timeLimitSec * 1000);
+  // Already clamped by the registry on the way in, and by `scaledLimit` when a
+  // session stretches it — but grading must not be able to divide by a window
+  // of zero no matter who calls it, so guard here too. The ceiling allows the
+  // x3 stretch of the longest legal question.
+  const safeLimit = Number.isFinite(timeLimitSec)
+    ? Math.min(MAX_TIME_LIMIT_SEC * 3, Math.max(1, timeLimitSec))
+    : DEFAULT_TIME_LIMIT_SEC;
+  const limitMs = Math.max(1, safeLimit * 1000);
   const startedAt = ctx.slideStartedAt ?? ctx.now;
   const elapsed = Math.max(0, Math.min(ctx.now - startedAt, limitMs));
   const speed = 1 - elapsed / limitMs; // 1 = instant, 0 = used the whole clock

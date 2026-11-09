@@ -5,7 +5,7 @@
 // slide.type.
 
 import type { SlideServerDef, GradeContext, Graded, RawResponse } from "./types.js";
-import { stripAnswerKey } from "./types.js";
+import { clampTimeLimitSec, DEFAULT_TIME_LIMIT_SEC, stripAnswerKey } from "./types.js";
 
 import { multipleChoice } from "./multipleChoice.js";
 import { wordCloud } from "./wordCloud.js";
@@ -103,9 +103,15 @@ export function isTimed(type: string, config: any): boolean {
   return def?.isTimed ? def.isTimed(config) : false;
 }
 
+/**
+ * The countdown a slide runs, clamped. This is the single boundary: the
+ * auto-reveal timer, the `timeLimitSec` on the wire and the scoring window all
+ * read it, so a config carrying `0`, a negative, or a value past setTimeout's
+ * range can no longer close the question the instant it opens.
+ */
 export function timeLimitSec(type: string, config: any): number {
   const def = slideDef(type);
-  return def?.timeLimitSec ? def.timeLimitSec(config) : 20;
+  return clampTimeLimitSec(def?.timeLimitSec ? def.timeLimitSec(config) : DEFAULT_TIME_LIMIT_SEC);
 }
 
 export function revealPayload(type: string, config: any): Record<string, unknown> {

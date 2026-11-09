@@ -20,7 +20,22 @@ sessionsRouter.get("/:sessionId/export", async (req: AuthedRequest, res) => {
     return res.status(404).json({ error: "Not found" });
   }
 
-  const rows = [["Slide Question", "Slide Type", "Participant", "Answer", "Submitted At"]];
+  // Who the ids belong to. The export used to emit a bare `participantId` — a
+  // cuid — so the one artefact a host keeps after the session named nobody at
+  // all. The id stays in its own column because it is the join key back to the
+  // live data and to the Q&A rows; the name is simply now also present.
+  const roster = new Map(
+    (
+      await prisma.participant.findMany({
+        where: { sessionId: session.id },
+        select: { participantId: true, name: true },
+      })
+    ).map((p) => [p.participantId, p.name])
+  );
+
+  const rows = [
+    ["Slide Question", "Slide Type", "Participant", "Participant ID", "Answer", "Submitted At"],
+  ];
   for (const r of session.responses) {
     // Read the question as it was ASKED, not as the deck reads today. A
     // session is a record of something that already happened; the slide row is
@@ -36,6 +51,9 @@ sessionsRouter.get("/:sessionId/export", async (req: AuthedRequest, res) => {
     rows.push([
       r.slideQuestion ?? r.slide.question,
       type,
+      // Rows written before the roster existed have no name to resolve; they
+      // keep the behaviour they already had rather than inventing one.
+      roster.get(r.participantId) ?? "Anonymous",
       r.participantId,
       formatForExport(type, safeParse(config), safeParse(r.value)),
       r.createdAt.toISOString(),

@@ -28,10 +28,44 @@ interface LiveSession {
   slides: { id: string; type: string; question: string; config: any; order: number }[];
   currentIndex: number; // -1 = lobby
   status: "LOBBY" | "ACTIVE" | "ENDED";
+  // Who is CONNECTED right now. Drives the lobby count and the "everyone has
+  // answered" early reveal — both of which are questions about live sockets.
   participants: Map<string, { name: string; avatar: number }>;
+  // Who has EVER been in this room, names included. A socket closing is not a
+  // person ceasing to exist: the score outlives the connection, so the identity
+  // has to as well, or a winner whose phone locked is announced on the podium
+  // as "Anonymous". Loaded from the `Participant` table on a cold start, which
+  // is also what makes a room rebuildable after a restart at all.
+  roster: Map<string, { name: string; avatar: number }>;
+  // The primary presenter socket: whichever host window issued the most recent
+  // command. Kept for the `presenter:control` notice below.
   presenterSocketId: string | null;
-  // wall-clock ms when the current slide became active — used to time quiz answers
+  // EVERY host window currently attached to this room. One account can have
+  // two (a forgotten tab, a phone used as a clicker) and both legitimately pass
+  // the ownership check, so presenter-grade frames — the answer key, the live
+  // tally, the leaderboard — go to all of them. Sending them to one socket only
+  // meant the other tab silently received the PARTICIPANT view while still
+  // driving the room perfectly, with nothing on screen to say which window was
+  // the real one.
+  presenterSockets: Set<string>;
+  // wall-clock ms when the current slide became active. This is the value that
+  // goes ON THE WIRE and into the database: clients and rows both speak
+  // wall-clock, and only wall-clock survives a restart.
   currentSlideStartedAt: number | null;
+  // The same instant on the MONOTONIC clock, which is what scoring reads.
+  // Auto-reveal is a setTimeout (monotonic); grading used Date.now() (wall).
+  // A clock step therefore moved one and not the other, so a backward step
+  // handed out full marks and a forward step floored them while the question
+  // stayed open. One clock for both means a step can no longer rewrite a score
+  // behind the deadline's back.
+  currentSlideStartedMono: number | null;
+  // Audience pacing has no shared clock: the host never navigates, so there is
+  // no single moment the room "arrived". Each player arrives at their own, and
+  // that is the instant their answer must be timed from — otherwise the whole
+  // deck is graded against whenever the host last happened to touch it, and the
+  // penalty falls on reading pace, which is the exact axis `timeScale` exists
+  // to protect. participantId -> the slide they are on and when they got there.
+  audienceArrivals: Map<string, { slideId: string; mono: number }>;
   // pending auto-reveal timer for the current quiz slide (fires on time-up)
   revealTimer: ReturnType<typeof setTimeout> | null;
   // slideIds already revealed — revealing is one-shot per slide
@@ -59,9 +93,21 @@ interface LiveSession {
   // until the next navigation. Chaining every nav onto this promise means a
   // burst of Next presses is applied strictly in order.
   navChain: Promise<unknown>;
+  // Last time anything happened in this room, for the idle reaper below.
+  lastActivityAt: number;
+  // When the host ended it, so an ended room can linger briefly for stragglers
+  // and then be evicted instead of being retained for the life of the process.
+  endedAtMs: number | null;
 }
 
 const live = new Map<string, LiveSession>();
+
+// The monotonic clock. `performance.now()` cannot step backwards and cannot be
+// dragged by NTP, a VM resume or a manual correction — which is precisely why
+// setTimeout already uses it. Scoring now reads the same one.
+function monoNow(): number {
+  return performance.now();
+}
 
 // Throttle join-code guessing: the 6-digit space is only 900k, so an attacker
 // could enumerate live sessions.
@@ -80,6 +126,27 @@ const live = new Map<string, LiveSession>();
 // twice each stays comfortably under it; a script walking the code space does
 // not, and at this rate a full sweep of the 900k space takes days, by which
 // time every code it is hunting has expired with its session.
+//
+// "Anything human thumbs can reach" was the wrong unit. A restart is not thumbs
+// — it is one automatic failure per phone, simultaneously, from the single NAT
+// a venue sits behind, and 301 devices failing ONCE each exhausted a 300-budget
+// and then refused an innocent phone the host's new, valid code for a minute.
+// Two rules keep the budget on the behaviour it was written for:
+//
+//   * Only a failure against a code the DATABASE has never heard of spends the
+//     per-IP budget. That is what enumeration looks like — the 900k space is
+//     sparse, so a sweep is almost entirely misses. A failure against a code
+//     that does exist (an ended room, a room mid-recovery) is an honest client
+//     arriving at a real place at the wrong moment, and it is charged only to
+//     its own device.
+//   * A SUCCESSFUL join forgives that device's failures, and withdraws them
+//     from the IP's tally too. A phone that fumbles the code twice and then
+//     gets in has cost the building nothing, which is the truth of what
+//     happened.
+//
+// The IP check still runs BEFORE the code is looked up, deliberately: a
+// throttled caller must not be able to tell a wrong code from a right one by
+// the shape of the refusal, or the throttle becomes a free oracle.
 const JOIN_WINDOW_MS = 60_000;
 const JOIN_MAX_FAILURES_PER_DEVICE = 10;
 const JOIN_MAX_FAILURES_PER_IP = 300;
@@ -102,21 +169,52 @@ function tooManyJoinFailures(ip: string, participantId: unknown): boolean {
   return overBudget(ipKey, JOIN_MAX_FAILURES_PER_IP) || overBudget(deviceKey, JOIN_MAX_FAILURES_PER_DEVICE);
 }
 
-function recordJoinFailure(ip: string, participantId: unknown) {
+function bump(key: string, now: number) {
+  const rec = joinFailures.get(key);
+  if (!rec || now >= rec.resetAt) {
+    joinFailures.set(key, { count: 1, resetAt: now + JOIN_WINDOW_MS });
+  } else {
+    rec.count++;
+  }
+}
+
+/**
+ * Charge a failed join.
+ *
+ * `unknownCode` says whether the code is one the database has never issued —
+ * the only class of failure that looks like enumeration, and so the only class
+ * that may spend the shared per-IP budget. Everything else (a room that has
+ * ended, a malformed participant) is charged to the one device that did it.
+ */
+function recordJoinFailure(ip: string, participantId: unknown, unknownCode: boolean) {
   const now = Date.now();
   // Device keys are per-client, so the map would otherwise grow without bound
   // over a long-running server. Expired windows carry no information — drop them.
   if (joinFailures.size > 1000) {
     for (const [key, rec] of joinFailures) if (now >= rec.resetAt) joinFailures.delete(key);
   }
-  for (const key of joinKeys(ip, participantId)) {
-    const rec = joinFailures.get(key);
-    if (!rec || now >= rec.resetAt) {
-      joinFailures.set(key, { count: 1, resetAt: now + JOIN_WINDOW_MS });
-    } else {
-      rec.count++;
-    }
-  }
+  const [ipKey, deviceKey] = joinKeys(ip, participantId);
+  bump(deviceKey, now);
+  if (unknownCode) bump(ipKey, now);
+}
+
+/**
+ * A join succeeded, so the failures that preceded it were fumbles, not an
+ * attack. Clear the device's window entirely and withdraw exactly the failures
+ * it contributed from the IP's — never more, so one device cannot launder
+ * another's budget by succeeding.
+ */
+function forgiveJoinFailures(ip: string, participantId: unknown) {
+  const now = Date.now();
+  const [ipKey, deviceKey] = joinKeys(ip, participantId);
+  const dev = joinFailures.get(deviceKey);
+  joinFailures.delete(deviceKey);
+  const spent = dev && now < dev.resetAt ? dev.count : 0;
+  if (!spent) return;
+  const ipRec = joinFailures.get(ipKey);
+  if (!ipRec || now >= ipRec.resetAt) return;
+  ipRec.count = Math.max(0, ipRec.count - spent);
+  if (ipRec.count === 0) joinFailures.delete(ipKey);
 }
 
 // socket.handshake.address is the raw TCP peer, which behind a reverse proxy
@@ -325,9 +423,36 @@ async function emitResults(io: Server, joinCode: string, slideId: string) {
   // bandwagon, and for types like GUESS_NUMBER the aggregate carries fields
   // computed from the answer key. Participants get the aggregate they need in
   // the `slide:reveal` payload, after the window has closed.
-  if (s.presenterSocketId) {
-    io.to(s.presenterSocketId).emit("results:updated", { slideId, aggregate });
-  }
+  emitToPresenters(io, s, "results:updated", { slideId, aggregate });
+}
+
+/**
+ * Every host window attached to this room, not just the one that pressed the
+ * last key. A second tab is a legitimate thing to have open — and whichever one
+ * is not currently "primary" was being served the participant view, which is
+ * how a host ended up driving a room from a window that could not highlight the
+ * correct answer, had no answer tally and no leaderboard.
+ */
+function presenterTargets(s: LiveSession): string[] {
+  return [...s.presenterSockets];
+}
+
+function emitToPresenters(io: Server, s: LiveSession, event: string, payload: any) {
+  const targets = presenterTargets(s);
+  if (targets.length === 0) return;
+  io.to(targets).emit(event, payload);
+}
+
+/**
+ * Tell every host window who is currently primary and how many of them there
+ * are, so "which of these two tabs is the real one" stops being unanswerable.
+ * Purely informational — both windows are fully functional either way.
+ */
+function announcePresenters(io: Server, s: LiveSession) {
+  emitToPresenters(io, s, "presenter:control", {
+    controllingSocketId: s.presenterSocketId,
+    presenterCount: s.presenterSockets.size,
+  });
 }
 
 // Score is the sum of `points` across all of a participant's responses in this
@@ -340,12 +465,18 @@ async function computeLeaderboard(s: LiveSession, limit = 10) {
     where: { sessionId: s.sessionId },
     _sum: { points: true },
   });
+  // Resolve names through the ROSTER, not the connected set. A player who locks
+  // their phone, closes the tab or simply walks out keeps their points — and
+  // used to lose their name with their socket, so the winner of a quiz could be
+  // announced on the podium, in front of the room, as "Anonymous" with the
+  // wrong avatar. The roster outlives the connection, so the person does too.
+  const who = (id: string) => s.roster.get(id) ?? s.participants.get(id);
   const entries = rows
     .map((r) => ({
       participantId: r.participantId,
-      name: s.participants.get(r.participantId)?.name ?? "Anonymous",
+      name: who(r.participantId)?.name ?? "Anonymous",
       score: r._sum.points ?? 0,
-      avatar: s.participants.get(r.participantId)?.avatar ?? 0,
+      avatar: who(r.participantId)?.avatar ?? 0,
     }))
     .sort((a, b) => b.score - a.score);
   return { entries: entries.slice(0, limit), fullEntries: entries };
@@ -358,8 +489,7 @@ async function computeLeaderboard(s: LiveSession, limit = 10) {
 // Takes already-computed entries so callers that just ran computeLeaderboard
 // (e.g. to grade a submission) don't pay for a second identical query.
 function sendLeaderboardToPresenter(io: Server, s: LiveSession, entries: LeaderboardEntryRow[]) {
-  if (!s.presenterSocketId) return;
-  io.to(s.presenterSocketId).emit("leaderboard:updated", { entries });
+  emitToPresenters(io, s, "leaderboard:updated", { entries });
 }
 
 interface LeaderboardEntryRow {
@@ -376,6 +506,10 @@ async function revealSlide(io: Server, joinCode: string, slide: LiveSession["sli
   const s = live.get(joinCode);
   if (!s) return;
   s.revealedSlides.add(slide.id);
+  // A reveal is irreversible, so it is session state rather than UI state: a
+  // room rebuilt after a restart must not re-open a question the audience has
+  // already been shown the answer to.
+  await persistRevealed(s);
 
   const responses = await prisma.response.findMany({
     where: { sessionId: s.sessionId, slideId: slide.id },
@@ -399,16 +533,386 @@ async function revealSlide(io: Server, joinCode: string, slide: LiveSession["sli
   sendLeaderboardToPresenter(io, s, entries);
 }
 
+// ---------------------------------------------------------------------------
+// Restart recovery
+// ---------------------------------------------------------------------------
+//
+// `live` is process memory. A redeploy, a crash or an `npm start` empties it
+// while every row it described survives — the session is still ACTIVE, still
+// has a currentSlideId, still owns its scored responses — and before this,
+// nothing could ever reach that state again: `resume-session` scanned only the
+// map, so the recovery path could not see a session it had not itself created.
+// The host's only move was a new session with a new join code that every phone
+// in the room had to re-type, and the evidence that this had happened over and
+// over was 330 ACTIVE/LOBBY rows in the dev database that nothing would ever
+// close.
+//
+// So the map stops being the source of truth and becomes a cache of it. Any
+// path that needs a room — the host resuming, a phone re-joining, a presenter
+// command, a submit — resolves it through `loadLive`, which rebuilds the entry
+// from the database on a miss. The join code does not change, which is the
+// whole point: the room comes back to the phones rather than the phones having
+// to be sent somewhere new.
+//
+// What is reconstructable, and from where:
+//   * the deck and the slide on screen  -> Session.currentSlideId + Slide rows
+//   * who is in the room, with names    -> Participant rows (see schema)
+//   * scores and answers                -> Response rows (already durable)
+//   * which questions are closed        -> Session.revealedSlideIds
+//   * how long the open question has run-> Session.currentSlideStartedAt
+// Only the live sockets are genuinely gone, and those come back by themselves.
+
+let ioRef: Server | null = null;
+
+/** Concurrent misses on the same code must not build two rival rooms. */
+const rehydrating = new Map<string, Promise<LiveSession | null>>();
+
+function emptyLiveShell(): Pick<
+  LiveSession,
+  | "revealTimer"
+  | "revealedSlides"
+  | "revealPayloads"
+  | "participantSockets"
+  | "presenterSockets"
+  | "audienceArrivals"
+  | "leaderboardView"
+  | "navChain"
+  | "lastActivityAt"
+  | "endedAtMs"
+> {
+  return {
+    revealTimer: null,
+    revealedSlides: new Set(),
+    revealPayloads: new Map(),
+    participantSockets: new Map(),
+    presenterSockets: new Set(),
+    audienceArrivals: new Map(),
+    leaderboardView: null,
+    navChain: Promise.resolve(),
+    lastActivityAt: Date.now(),
+    endedAtMs: null,
+  };
+}
+
+/**
+ * The live room for a join code, rebuilt from the database if this process has
+ * never seen it. Returns null only when no such session exists at all.
+ */
+async function loadLive(joinCode: unknown): Promise<LiveSession | null> {
+  if (typeof joinCode !== "string" || !joinCode) return null;
+  const hit = live.get(joinCode);
+  if (hit) return hit;
+  const inflight = rehydrating.get(joinCode);
+  if (inflight) return inflight;
+  const p = rehydrateSession(joinCode).finally(() => rehydrating.delete(joinCode));
+  rehydrating.set(joinCode, p);
+  return p;
+}
+
+async function rehydrateSession(joinCode: string): Promise<LiveSession | null> {
+  const row = await prisma.session.findUnique({
+    where: { joinCode },
+    include: {
+      presentation: {
+        // Same rule as create-session: a tombstoned slide is not part of the
+        // deck, so a recovered room must not serve one either.
+        include: { slides: { where: { deletedAt: null }, orderBy: { order: "asc" } } },
+      },
+      participants: { select: { participantId: true, name: true, avatar: true } },
+    },
+  });
+  if (!row) return null;
+  // Someone else finished first while we were in the database.
+  const raced = live.get(joinCode);
+  if (raced) return raced;
+
+  const slides = row.presentation.slides.map((sl) => ({
+    id: sl.id,
+    type: sl.type,
+    question: sl.question,
+    config: safeParse(sl.config),
+    order: sl.order,
+  }));
+
+  // Where the room was standing. A currentSlideId that no longer resolves means
+  // the slide was deleted while the process was down; seat the room on the
+  // first surviving slide rather than yanking it back to the lobby, which would
+  // look to every phone like the session had been abandoned.
+  let currentIndex = -1;
+  if (row.currentSlideId) {
+    const i = slides.findIndex((sl) => sl.id === row.currentSlideId);
+    currentIndex = i >= 0 ? i : slides.length > 0 ? 0 : -1;
+  }
+  const status: LiveSession["status"] =
+    row.status === "ENDED" ? "ENDED" : currentIndex >= 0 ? "ACTIVE" : "LOBBY";
+
+  const s: LiveSession = {
+    ...emptyLiveShell(),
+    sessionId: row.id,
+    presentationId: row.presentationId,
+    ownerId: row.presentation.ownerId,
+    pacing: row.presentation.pacing === "AUDIENCE" ? "AUDIENCE" : "PRESENTER",
+    filterMode: (row.presentation.filterMode as FilterMode) ?? "mask",
+    timeScale: clampTimeScale(row.presentation.timeScale),
+    slides,
+    currentIndex,
+    status,
+    // Nobody is CONNECTED yet — their sockets died with the old process — but
+    // everyone who was ever here is known, so scores resolve to people from the
+    // first frame after recovery rather than to "Anonymous".
+    participants: new Map(),
+    roster: new Map(row.participants.map((p) => [p.participantId, { name: p.name, avatar: p.avatar }])),
+    presenterSocketId: null,
+    currentSlideStartedAt: null,
+    currentSlideStartedMono: null,
+    endedAtMs: row.endedAt ? row.endedAt.getTime() : null,
+  };
+
+  for (const id of parseIdList(row.revealedSlideIds)) s.revealedSlides.add(id);
+
+  // Put the open question back on the clock it was already running. Without
+  // this the choice is between restarting every countdown — a second full-speed
+  // scoring window for everyone — and scoring against nothing.
+  if (currentIndex >= 0 && row.currentSlideStartedAt) {
+    const startedWall = row.currentSlideStartedAt.getTime();
+    s.currentSlideStartedAt = startedWall;
+    s.currentSlideStartedMono = monoNow() - Math.max(0, Date.now() - startedWall);
+  }
+
+  // Rebuild the exact frames a reveal left behind, so a phone that re-joins
+  // onto a closed question is told it is closed instead of being handed a
+  // ticking clock it can never beat. The aggregate is recomputed from the rows,
+  // which is faithful: the question is shut, so no answer can still arrive.
+  const revealedIds = [...s.revealedSlides].filter((id) => slides.some((sl) => sl.id === id));
+  if (revealedIds.length > 0) {
+    const responses = await prisma.response.findMany({
+      where: { sessionId: row.id, slideId: { in: revealedIds } },
+      select: { slideId: true, participantId: true, value: true },
+    });
+    const bySlide = new Map<string, { participantId: string; value: string }[]>();
+    for (const r of responses) {
+      const list = bySlide.get(r.slideId) ?? [];
+      list.push({ participantId: r.participantId, value: r.value });
+      bySlide.set(r.slideId, list);
+    }
+    for (const id of revealedIds) {
+      const slide = slides.find((sl) => sl.id === id)!;
+      s.revealPayloads.set(id, {
+        slideId: id,
+        aggregate: computeAggregate(slide.type, slide.config, bySlide.get(id) ?? []),
+        ...revealPayload(slide.type, slide.config),
+      });
+    }
+  }
+
+  live.set(joinCode, s);
+
+  // Re-arm the auto-reveal with what is LEFT of the window, not a fresh one. If
+  // the time ran out while the process was down, this fires straight away and
+  // the question closes honestly rather than re-opening.
+  if (ioRef && status !== "ENDED") {
+    const remaining =
+      s.currentSlideStartedAt !== null
+        ? scaledLimit(s, s.slides[currentIndex]) * 1000 - (Date.now() - s.currentSlideStartedAt)
+        : undefined;
+    armRevealTimer(ioRef, joinCode, s, remaining);
+  }
+
+  console.log(
+    `[recover] rebuilt session ${joinCode} from the database ` +
+      `(status=${status} index=${currentIndex} roster=${s.roster.size} revealed=${s.revealedSlides.size})`
+  );
+  return s;
+}
+
+/**
+ * Arm the time-up auto-reveal for whatever slide is on screen. One place, so
+ * the fresh-navigation case and the recovered-mid-question case cannot drift.
+ */
+function armRevealTimer(io: Server, joinCode: string, s: LiveSession, remainingMs?: number) {
+  if (s.revealTimer) {
+    clearTimeout(s.revealTimer);
+    s.revealTimer = null;
+  }
+  const idx = s.currentIndex;
+  if (idx < 0 || idx >= s.slides.length) return;
+  const slideObj = s.slides[idx];
+  if (s.revealedSlides.has(slideObj.id)) return;
+  if (!isTimed(slideObj.type, slideObj.config)) return;
+  const ms = remainingMs ?? scaledLimit(s, slideObj) * 1000;
+  s.revealTimer = setTimeout(() => revealSlide(io, joinCode, slideObj), Math.max(0, ms));
+}
+
+function parseIdList(raw: string): string[] {
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Note that a player has arrived at a slide, which starts THEIR clock on it.
+ *
+ * First arrival only, and keyed per (player, slide). Re-stamping would make the
+ * clock resettable at will — leave and come back, or page away and back, and
+ * the window reopens at full speed — which is a worse scoring bug than the one
+ * this fixes.
+ */
+function arrivalKey(participantId: string, slideId: string) {
+  return `${participantId} ${slideId}`;
+}
+
+function markArrival(s: LiveSession, participantId: string, slideId: string | null) {
+  if (s.pacing !== "AUDIENCE" || !slideId) return;
+  const key = arrivalKey(participantId, slideId);
+  if (s.audienceArrivals.has(key)) return;
+  s.audienceArrivals.set(key, { slideId, mono: monoNow() });
+}
+
+/**
+ * The moment the submitting player's clock on this slide started, on the
+ * monotonic scale. In presenter pacing that is when the host put the slide up;
+ * in audience pacing it is when THAT player reached it, because there is no
+ * shared moment to measure from. Null means "no clock" — speedPoints then
+ * treats the answer as instant, which is the right way to fail: a player is
+ * never charged for a clock the server could not account for.
+ */
+function scoringStartedAt(s: LiveSession, participantId: string, slideId: string): number | null {
+  if (s.pacing !== "AUDIENCE") return s.currentSlideStartedMono;
+  return s.audienceArrivals.get(arrivalKey(participantId, slideId))?.mono ?? null;
+}
+
+/**
+ * The same arrival, expressed on the wall clock the wire speaks. Monotonic time
+ * is meaningless to a browser — it counts from this process's start — so it is
+ * converted at the boundary rather than leaked.
+ */
+function arrivalWallClock(s: LiveSession, participantId: string, slideId: string): number | null {
+  const mono = s.audienceArrivals.get(arrivalKey(participantId, slideId))?.mono;
+  return mono === undefined ? null : Date.now() - (monoNow() - mono);
+}
+
+/** Reveals are one-shot and irreversible, so they belong in the row. */
+async function persistRevealed(s: LiveSession) {
+  await prisma.session
+    .updateMany({
+      where: { id: s.sessionId },
+      data: { revealedSlideIds: JSON.stringify([...s.revealedSlides]) },
+    })
+    .catch((e) => console.error("could not persist reveal state", e));
+}
+
+// ---------------------------------------------------------------------------
+// Housekeeping
+// ---------------------------------------------------------------------------
+
+// An ended room is kept briefly so stragglers still get a real answer, then
+// dropped — `live.delete` used to be reachable from exactly one place (a deck
+// deleted under a running room), so every session a process ever ran stayed in
+// memory for the life of that process. Eviction is only safe now that a miss
+// rebuilds from the database; before this change, dropping an entry destroyed
+// the room.
+const ENDED_RETENTION_MS = Number(process.env.ENDED_RETENTION_MS ?? 5 * 60_000);
+// A host who closes the tab without ending leaves a room nobody will ever
+// touch again. It is NOT ended — the data must stay exactly as it is — but
+// there is no reason to hold the slide snapshot in memory, which for a
+// 200-slide deck is several megabytes.
+const IDLE_EVICT_MS = 6 * 3_600_000;
+// How long a session has to have been open before an unattended process
+// considers it abandoned rather than simply long. Deliberately generous: this
+// must never close a room that is merely riding out a restart, which is the
+// failure it exists to clean up after.
+const STALE_SESSION_MS = Number(process.env.STALE_SESSION_HOURS ?? 12) * 3_600_000;
+
+function reapLive() {
+  const now = Date.now();
+  for (const [code, s] of live) {
+    const endedLongEnough = s.endedAtMs !== null && now - s.endedAtMs > ENDED_RETENTION_MS;
+    const idle = now - s.lastActivityAt > IDLE_EVICT_MS;
+    if (!endedLongEnough && !idle) continue;
+    if (s.revealTimer) {
+      clearTimeout(s.revealTimer);
+      s.revealTimer = null;
+    }
+    live.delete(code);
+  }
+}
+
+/**
+ * Close sessions a long-dead process left open.
+ *
+ * These are rooms that were ACTIVE or in the LOBBY when something restarted,
+ * before recovery existed. Their data is untouched — the responses, the roster
+ * and the slide pointer all stay — but the row stops claiming to be live and
+ * gets an honest `endedAt`: the last thing that actually happened in it, which
+ * is what history and duration reporting should read. Closing is not erasing.
+ */
+async function closeStaleSessions() {
+  const cutoff = new Date(Date.now() - STALE_SESSION_MS);
+  const stale = await prisma.session.findMany({
+    where: { status: { not: "ENDED" }, startedAt: { lt: cutoff } },
+    select: { id: true, joinCode: true, startedAt: true },
+  });
+  // Never touch a room this process is currently serving, however old it is.
+  const inUse = new Set([...live.values()].map((s) => s.sessionId));
+  const targets = stale.filter((row) => !inUse.has(row.id));
+  if (targets.length === 0) return;
+
+  const lastActivity = await prisma.response.groupBy({
+    by: ["sessionId"],
+    where: { sessionId: { in: targets.map((t) => t.id) } },
+    _max: { createdAt: true },
+  });
+  const endedAtFor = new Map(lastActivity.map((r) => [r.sessionId, r._max.createdAt]));
+  for (const row of targets) {
+    await prisma.session.updateMany({
+      where: { id: row.id, status: { not: "ENDED" } },
+      data: { status: "ENDED", endedAt: endedAtFor.get(row.id) ?? row.startedAt },
+    });
+  }
+  console.log(`[reconcile] closed ${targets.length} session(s) abandoned by an earlier process`);
+}
+
+/**
+ * Wire the module to the server. Called once at boot — the per-socket handler
+ * registration below cannot do this, because recovery and housekeeping have to
+ * work with no socket in sight.
+ */
+/**
+ * How many rooms this process is holding in memory. Exposed on /api/health so
+ * the retention above is observable rather than a claim — "the map never
+ * shrinks" was true for a long time and nothing on the outside could tell.
+ */
+export function liveSessionCount(): number {
+  return live.size;
+}
+
+export function initSessionRuntime(io: Server) {
+  ioRef = io;
+  closeStaleSessions().catch((e) => console.error("startup reconciliation failed", e));
+  // Overridable so the eviction can actually be exercised rather than taken on
+  // trust — and so an operator can tighten it on a memory-constrained box.
+  const every = Number(process.env.LIVE_REAP_INTERVAL_MS ?? 10 * 60_000);
+  const timer = setInterval(() => {
+    reapLive();
+    closeStaleSessions().catch((e) => console.error("reconciliation failed", e));
+  }, every);
+  timer.unref();
+}
+
 export function registerSessionHandlers(io: Server, socket: Socket) {
+  ioRef = io;
   // Q&A and reactions live in their own module but need to resolve the same
   // in-memory session map and reuse this file's presenter authorization.
   registerQaHandlers(io, socket, {
-    sessionFor: (joinCode) => {
-      const s = live.get(joinCode);
+    sessionFor: async (joinCode) => {
+      const s = await loadLive(joinCode);
       return s ? { sessionId: s.sessionId, ownerId: s.ownerId, filterMode: s.filterMode } : undefined;
     },
-    isPresenter: (payload) => {
-      const s = payload?.joinCode ? live.get(payload.joinCode) : undefined;
+    isPresenter: async (payload) => {
+      const s = await loadLive(payload?.joinCode);
       if (!s) return false;
       const auth = payload?.token ? verifyToken(payload.token) : null;
       return !!auth && auth.userId === s.ownerId;
@@ -419,8 +923,14 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   // user owns this session. The join code alone is NOT sufficient — it's shown
   // on screen to every participant. On success we also refresh presenterSocketId
   // so presenter-only pushes (e.g. leaderboard:updated) survive a reconnect.
-  function requirePresenter(payload: any, cb?: Function): LiveSession | null {
-    const s = payload?.joinCode ? live.get(payload.joinCode) : undefined;
+  //
+  // Now resolves through `loadLive`, so a command that arrives at a process
+  // which has never seen this room rebuilds it from the database instead of
+  // answering SESSION_GONE against a session the row still calls ACTIVE. That
+  // reattach-on-command behaviour is load-bearing for resume and is unchanged;
+  // what changed is only where the room may be found.
+  async function requirePresenter(payload: any, cb?: Function): Promise<LiveSession | null> {
+    const s = await loadLive(payload?.joinCode);
     if (!s) {
       reject(cb, "SESSION_GONE", "Session not found");
       return null;
@@ -430,8 +940,26 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       reject(cb, "UNAUTHORIZED", "Unauthorized");
       return null;
     }
-    s.presenterSocketId = socket.id;
+    attachPresenter(s);
+    s.lastActivityAt = Date.now();
     return s;
+  }
+
+  /**
+   * Register this socket as one of the room's host windows and make it primary.
+   *
+   * The old code kept a single `presenterSocketId` and re-pointed it on every
+   * command, so two tabs on one account traded ownership back and forth and the
+   * loser silently dropped to the participant view — stripped answer key, no
+   * results, no leaderboard — while still driving the room perfectly. Keeping
+   * the full set means both windows stay correct; the primary pointer now only
+   * says who pressed the last key, which is reported rather than acted on.
+   */
+  function attachPresenter(s: LiveSession) {
+    const changed = s.presenterSocketId !== socket.id || !s.presenterSockets.has(socket.id);
+    s.presenterSockets.add(socket.id);
+    s.presenterSocketId = socket.id;
+    if (changed && s.presenterSockets.size > 1) announcePresenters(io, s);
   }
 
   // ---- Presenter: create a live session from a presentation ----
@@ -460,6 +988,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     });
 
     const liveSession: LiveSession = {
+      ...emptyLiveShell(),
       sessionId: session.id,
       presentationId,
       ownerId: auth.userId,
@@ -476,15 +1005,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       currentIndex: -1,
       status: "LOBBY",
       participants: new Map(),
+      roster: new Map(),
       presenterSocketId: socket.id,
       currentSlideStartedAt: null,
-      revealTimer: null,
-      revealedSlides: new Set(),
-      revealPayloads: new Map(),
-      participantSockets: new Map(),
-      leaderboardView: null,
-      navChain: Promise.resolve(),
+      currentSlideStartedMono: null,
     };
+    liveSession.presenterSockets.add(socket.id);
     live.set(joinCode, liveSession);
 
     socket.join(joinCode);
@@ -495,6 +1021,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       joinCode,
       sessionId: session.id,
       pacing: liveSession.pacing,
+      presenterCount: liveSession.presenterSockets.size,
       theme: presentation.theme,
       // Speaker notes are presenter-only and never broadcast to the room.
       notes: presentation.slides.map((sl) => ({ id: sl.id, notes: sl.notes })),
@@ -528,9 +1055,39 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
         found = s;
       }
     }
+
+    // Nothing in memory does NOT mean nothing is running. This process may
+    // simply never have seen the room: a redeploy or a crash empties `live`
+    // while the session row is still ACTIVE, still pointing at a slide, still
+    // owning its scored responses. Scanning only the map is what made a restart
+    // unrecoverable — the host's one route back could not see a session it had
+    // not itself created, so the only option left was a new room with a new
+    // join code that every phone had to re-type.
+    //
+    // Same ownership rule, same "newest wins" tie-break, now asked of the
+    // database. The join code is deliberately the one the room already has.
+    if (!found) {
+      const row = await prisma.session.findFirst({
+        where: {
+          presentationId,
+          status: { not: "ENDED" },
+          presentation: { ownerId: auth.userId },
+        },
+        orderBy: { startedAt: "desc" },
+        select: { joinCode: true },
+      });
+      if (row) {
+        const recovered = await loadLive(row.joinCode);
+        if (recovered && recovered.status !== "ENDED") {
+          joinCode = row.joinCode;
+          found = recovered;
+        }
+      }
+    }
     if (!joinCode || !found) return reject(cb, "NO_LIVE_SESSION", "No live session to resume");
 
-    found.presenterSocketId = socket.id;
+    found.lastActivityAt = Date.now();
+    attachPresenter(found);
     socket.join(joinCode);
     socket.data.joinCode = joinCode;
     socket.data.role = "presenter";
@@ -576,6 +1133,14 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // path exists to prevent. Same field names, same element shape as the
       // broadcast, so the client reduces both through one path.
       ...participantsPayload(found),
+      // How many people this room has EVER had, which after a restart is the
+      // only honest answer to "did the resume work". `count` above is live
+      // sockets and is legitimately 0 for the few seconds before the phones
+      // reconnect — a host reading that alone would conclude the resume failed
+      // and start a fresh room, which is the exact data loss resume prevents.
+      rosterSize: found.roster.size,
+      // How many host windows are attached to this room, this one included.
+      presenterCount: found.presenterSockets.size,
       // The presenter is the one party entitled to the answer key.
       currentSlide: current,
       revealed,
@@ -672,7 +1237,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // the count.
       const stillAlive = await prisma.session.updateMany({
         where: { id: s.sessionId },
-        data: { status: s.status, currentSlideId: currentSlideOf(s)?.id ?? null },
+        data: {
+          status: s.status,
+          currentSlideId: currentSlideOf(s)?.id ?? null,
+          currentSlideStartedAt:
+            s.currentSlideStartedAt === null ? null : new Date(s.currentSlideStartedAt),
+        },
       });
       if (stillAlive.count === 0) {
         sessionVanished(joinCode, cb);
@@ -694,25 +1264,31 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
 
     s.currentIndex = clamped;
     s.status = clamped < 0 ? "LOBBY" : "ACTIVE";
+    // Two readings of the same instant: the wall clock goes on the wire and
+    // into the row (clients and rows both speak wall time, and only wall time
+    // survives a restart); the monotonic one is what scoring reads, so a clock
+    // step can no longer move the score without moving the deadline.
     s.currentSlideStartedAt = clamped >= 0 ? Date.now() : null;
+    s.currentSlideStartedMono = clamped >= 0 ? monoNow() : null;
 
     const slide = currentSlideOf(s);
+
+    // In audience pacing the host's navigation is also the moment everyone
+    // present arrives, for those who have not moved themselves yet.
+    if (slide) for (const pid of s.participants.keys()) markArrival(s, pid, slide.id);
 
     // Landing on a quiz slide that hasn't been revealed yet: arm the time-up
     // auto-reveal. A revisit of an already-revealed slide keeps its reveal and
     // does NOT restart the timer.
-    if (clamped >= 0 && slide && !s.revealedSlides.has(slide.id)) {
-      const slideObj = s.slides[clamped];
-      if (isTimed(slideObj.type, slideObj.config)) {
-        s.revealTimer = setTimeout(
-          () => revealSlide(io, joinCode, slideObj),
-          scaledLimit(s, slideObj) * 1000
-        );
-      }
-    }
+    armRevealTimer(io, joinCode, s);
     const persisted = await prisma.session.updateMany({
       where: { id: s.sessionId },
-      data: { status: s.status, currentSlideId: slide?.id ?? null },
+      data: {
+        status: s.status,
+        currentSlideId: slide?.id ?? null,
+        currentSlideStartedAt:
+          s.currentSlideStartedAt === null ? null : new Date(s.currentSlideStartedAt),
+      },
     });
     if (persisted.count === 0) {
       sessionVanished(joinCode, cb);
@@ -734,15 +1310,17 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
           ? scaledLimit(s, s.slides[clamped])
           : null,
     };
+    // Excepting EVERY host window, not just the primary one. With a single
+    // pointer the other tab fell through to the room's broadcast and quietly
+    // received the stripped slide — so it could not highlight the correct
+    // answer at reveal, while still being the window the host was pressing.
     io.to(joinCode)
-      .except(s.presenterSocketId ?? "")
+      .except(presenterTargets(s))
       .emit("slide:changed", { ...common, currentSlide: slide });
-    if (s.presenterSocketId) {
-      io.to(s.presenterSocketId).emit("slide:changed", {
-        ...common,
-        currentSlide: currentSlideOf(s, true),
-      });
-    }
+    emitToPresenters(io, s, "slide:changed", {
+      ...common,
+      currentSlide: currentSlideOf(s, true),
+    });
 
     // Landing back on a slide that was already revealed: `slide:changed` on its
     // own looks identical to opening a fresh question, so the room gets a
@@ -779,8 +1357,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       });
   }
 
-  socket.on("presenter:goto", (args, cb) => {
-    const s = requirePresenter(args, cb);
+  socket.on("presenter:goto", async (args, cb) => {
+    const s = await requirePresenter(args, cb);
     if (!s) return;
     navigate(s, args.joinCode, (cur) => {
       const n = wireIndex(args.index);
@@ -802,8 +1380,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     }, cb);
   });
 
-  socket.on("presenter:next", (args, cb) => {
-    const s = requirePresenter(args, cb);
+  socket.on("presenter:next", async (args, cb) => {
+    const s = await requirePresenter(args, cb);
     if (!s) return;
     // When the slide on screen was deleted out from under the room, the prune
     // has already moved it forward into the vacancy — but silently, with no
@@ -815,8 +1393,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     navigate(s, args.joinCode, (cur, vacancy) => vacancy ?? cur.currentIndex + 1, cb);
   });
 
-  socket.on("presenter:prev", (args, cb) => {
-    const s = requirePresenter(args, cb);
+  socket.on("presenter:prev", async (args, cb) => {
+    const s = await requirePresenter(args, cb);
     if (!s) return;
     // Floors at 0, not -1. Back is the key a host hits to correct a mis-step,
     // and on slide 0 the old floor dropped the entire room to the waiting
@@ -832,7 +1410,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
 
   // ---- Presenter: request the current leaderboard on demand ----
   socket.on("presenter:get-leaderboard", async (args, cb) => {
-    const s = requirePresenter(args, cb);
+    const s = await requirePresenter(args, cb);
     if (!s) return;
     const { entries } = await computeLeaderboard(s);
     cb?.({ ok: true, entries });
@@ -842,7 +1420,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   // participants) at the same moment — this is what makes it a shared
   // "big screen" moment instead of presenter-only data. ----
   socket.on("presenter:show-leaderboard", async (args, cb) => {
-    const s = requirePresenter(args, cb);
+    const s = await requirePresenter(args, cb);
     if (!s) return;
     const { entries } = await computeLeaderboard(s);
     // Remember the exact frame the room is now looking at. A phone that
@@ -855,8 +1433,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     cb?.({ ok: true, entries });
   });
 
-  socket.on("presenter:hide-leaderboard", (args, cb) => {
-    const s = requirePresenter(args, cb);
+  socket.on("presenter:hide-leaderboard", async (args, cb) => {
+    const s = await requirePresenter(args, cb);
     if (!s) return;
     s.leaderboardView = null;
     io.to(args.joinCode).emit("leaderboard:hide", {});
@@ -864,7 +1442,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   });
 
   socket.on("presenter:end", async (args, cb) => {
-    const s = requirePresenter(args, cb);
+    const s = await requirePresenter(args, cb);
     if (!s) return;
     const joinCode = args.joinCode;
     // Idempotent: a second End (a double click, a retried ack) must not rewrite
@@ -880,6 +1458,13 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       s.revealTimer = null;
     }
     s.status = "ENDED";
+    // Starts the eviction clock. The entry lingers briefly so a straggler's
+    // ack is still answered out of memory, then the reaper drops it — and a
+    // late arrival after that rebuilds it from the row, which is what makes
+    // dropping it safe at all. Before recovery existed, `live.delete` was
+    // reachable from exactly one place and every session a process had ever
+    // run stayed resident for the life of that process.
+    s.endedAtMs = Date.now();
     await prisma.session.updateMany({
       where: { id: s.sessionId },
       data: { status: "ENDED", endedAt: new Date() },
@@ -892,18 +1477,35 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   // ---- Participant: join by code ----
   socket.on("participant:join", async ({ joinCode, participantId, name, avatar }, cb) => {
     const ip = clientIp(socket);
+    // Checked before the code is resolved, deliberately: a throttled caller
+    // must not be able to read a wrong code off the shape of the refusal.
     if (tooManyJoinFailures(ip, participantId)) {
       return reject(cb, "RATE_LIMITED", "Too many attempts. Try again in a minute.");
     }
-    const s = live.get(joinCode);
+    // Resolved through the database, so a phone coming back to a room whose
+    // server restarted lands in the room it is actually looking for instead of
+    // being told its code is invalid.
+    const s = await loadLive(joinCode);
     if (!s) {
-      recordJoinFailure(ip, participantId);
+      // No such code has ever been issued. This is the only failure shape that
+      // looks like somebody walking the code space, so it is the only one that
+      // spends the shared per-IP budget.
+      recordJoinFailure(ip, participantId, true);
       return reject(cb, "BAD_CODE", "Invalid code");
     }
-    if (s.status === "ENDED") return reject(cb, "SESSION_ENDED", "Session has ended");
+    if (s.status === "ENDED") {
+      // A real room at the wrong moment. Charged to this device only — a whole
+      // venue re-joining a finished session must not lock out the building.
+      recordJoinFailure(ip, participantId, false);
+      return reject(cb, "SESSION_ENDED", "Session has ended");
+    }
     if (typeof participantId !== "string" || !participantId) {
       return reject(cb, "BAD_PARTICIPANT", "Invalid participant");
     }
+    // They are in. Whatever they fumbled on the way here was a fumble, so give
+    // the budget back — to them and to the IP they share with the room.
+    forgiveJoinFailures(ip, participantId);
+    s.lastActivityAt = Date.now();
 
     socket.join(joinCode);
     socket.data.joinCode = joinCode;
@@ -912,21 +1514,53 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // This socket is now the one that owns this identity. Disconnect consults
     // this to tell a stale tab's teardown apart from the real player leaving.
     s.participantSockets.set(participantId, socket.id);
-    // preserve existing name/avatar if this participantId already joined (reconnect)
-    const existing = s.participants.get(participantId);
+    // preserve existing name/avatar if this participantId already joined
+    // (reconnect). The ROSTER is consulted, not just the connected set: a
+    // player whose socket dropped is absent from `participants` but has lost
+    // nothing, so a silent reconnect that sends no name must restore theirs
+    // rather than christen them "Anonymous".
+    const existing = s.participants.get(participantId) ?? s.roster.get(participantId);
     // Cap before filtering, matching `qa:ask`'s treatment of authorName. The
     // lobby chip and the leaderboard row have no defence against a 120-char
     // nickname, and the filter only masks content — it never truncates.
     const rawName = String(name ?? "").trim().slice(0, MAX_NICKNAME_LEN);
-    s.participants.set(participantId, {
+    const identity = {
       name: filterNickname(rawName || existing?.name || "Anonymous"),
       avatar: typeof avatar === "number" ? avatar : existing?.avatar ?? 0,
-    });
+    };
+    s.participants.set(participantId, identity);
+    s.roster.set(participantId, identity);
+
+    // Write the person down. Until this existed a name lived only in process
+    // memory, which is why a dropped socket cost a player their identity on the
+    // podium and why a restart could never rebuild a room: the scores survived
+    // with nothing anywhere to say whose they were. Awaited so the roster and
+    // the row cannot disagree about who is here.
+    try {
+      await prisma.participant.upsert({
+        where: { sessionId_participantId: { sessionId: s.sessionId, participantId } },
+        create: {
+          sessionId: s.sessionId,
+          participantId,
+          name: identity.name,
+          avatar: identity.avatar,
+        },
+        update: { name: identity.name, avatar: identity.avatar, lastSeenAt: new Date() },
+      });
+    } catch (e) {
+      // A roster write failing must not keep a player out of the room — they
+      // can still answer, and they are already in the in-memory roster above.
+      console.error("could not persist participant", e);
+    }
 
     io.to(joinCode).emit("participant:count", participantsPayload(s));
 
     const current = currentSlideOf(s);
     const idx = s.currentIndex;
+
+    // Audience pacing: this is the moment this player reached this slide, and
+    // therefore the moment their clock on it starts.
+    if (current) markArrival(s, participantId, current.id);
 
     // A re-join (reconnect, reload, resumed tab) must land the phone in the
     // state the room is actually in, not at the top of a fresh question. Two
@@ -985,8 +1619,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   });
 
   // ---- Participant: self-navigate (audience-paced decks only) ----
-  socket.on("participant:goto", ({ joinCode, participantId, index }, cb) => {
-    const s = live.get(joinCode);
+  socket.on("participant:goto", async ({ joinCode, participantId, index }, cb) => {
+    const s = await loadLive(joinCode);
     if (!s) return reject(cb, "SESSION_GONE", "Session not found");
     // The same guard `presenter:goto/next/prev` and `participant:submit` all
     // carry, and the only handler that was missed. Nothing can be scored once
@@ -994,9 +1628,19 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // finished deck: a live-looking question that silently answers nothing.
     if (s.status === "ENDED") return reject(cb, "SESSION_ENDED", "Session has ended");
     if (s.pacing !== "AUDIENCE") return reject(cb, "HOST_PACED", "The host is driving this deck");
-    if (socket.data.role !== "participant" || socket.data.participantId !== participantId) {
+    // Who you are AND which room you are in — the same pairing `qa:list`
+    // carries. Without the room half a socket joined to one session could
+    // drive, and score into, another: the row lands in a room whose roster has
+    // never heard of them, which is a second way to manufacture an unnamed
+    // entry in someone else's standings.
+    if (
+      socket.data.role !== "participant" ||
+      socket.data.participantId !== participantId ||
+      socket.data.joinCode !== joinCode
+    ) {
       return reject(cb, "NOT_JOINED", "Join the session first");
     }
+    s.lastActivityAt = Date.now();
     // Self-pacing is the one navigation the host never performs, so without
     // this the snapshot of an audience-paced deck is never reconciled at all
     // and a deleted slide stays reachable for the whole session. Runs on the
@@ -1008,7 +1652,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
         await reconcileDeletedSlides(s);
         if (s.slides.length === 0) return reject(cb, "SLIDE_GONE", "Slide not found");
         const clamped = Math.max(0, Math.min(wireIndex(index) ?? 0, s.slides.length - 1));
-        const slide = publicSlide(s.slides[clamped]);
+        const slideObj = s.slides[clamped];
+        const slide = publicSlide(slideObj);
+        // THIS player has now reached THIS slide, and that is the instant their
+        // answer will be timed from. First arrival wins, so stepping back and
+        // forward cannot reopen the window.
+        markArrival(s, participantId, slideObj.id);
         // Only this socket is told — everyone else stays where they are, which
         // is the whole point of audience pacing.
         cb?.({
@@ -1016,9 +1665,15 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
           index: clamped,
           currentSlide: slide,
           totalSlides: s.slides.length,
-          // Self-paced slides have no shared clock, so timed scoring is not
-          // meaningful here; the client hides the countdown.
-          startedAt: null,
+          // A self-paced slide has no SHARED clock, but it does have this
+          // player's own, which is what their score is now measured against.
+          // Reported in wall-clock ms, same units and same name as every other
+          // `startedAt` on the wire, so a countdown can be rendered against it
+          // rather than the player being graded on a clock they cannot see.
+          startedAt: arrivalWallClock(s, participantId, slideObj.id),
+          timeLimitSec: isTimed(slideObj.type, slideObj.config)
+            ? scaledLimit(s, slideObj)
+            : null,
         });
       })
       .catch((e) => {
@@ -1029,20 +1684,26 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
 
   // ---- Participant: submit a response ----
   socket.on("participant:submit", async ({ joinCode, slideId, participantId, value }, cb) => {
-    const s = live.get(joinCode);
+    const s = await loadLive(joinCode);
     if (!s) return reject(cb, "SESSION_GONE", "Session not found");
     if (s.status === "ENDED") return reject(cb, "SESSION_ENDED", "Session has ended");
     // Bind the answer to the connection that joined: a socket can only submit
     // as the participantId it joined with, so one student can't overwrite
     // another's answer or inject leaderboard scores under an arbitrary id.
-    if (socket.data.role !== "participant" || socket.data.participantId !== participantId) {
+    // The join code is checked too, so a socket seated in one room cannot score
+    // into another — the row would land under a participantId that room's
+    // roster has never heard of, which is exactly how an unnamed entry appears
+    // in somebody else's standings.
+    if (
+      socket.data.role !== "participant" ||
+      socket.data.participantId !== participantId ||
+      socket.data.joinCode !== joinCode
+    ) {
       return reject(cb, "NOT_JOINED", "Join the session before submitting");
     }
     const slide = s.slides.find((x) => x.id === slideId);
     if (!slide) return reject(cb, "SLIDE_GONE", "Slide not found");
-
-    // Once a slide is revealed, answers are locked — the window has closed.
-    if (s.revealedSlides.has(slideId)) return reject(cb, "TOO_LATE", "Time's up");
+    s.lastActivityAt = Date.now();
 
     // Content slides (headings, images) take no responses at all.
     if (!isInteractive(slide.type)) return reject(cb, "NOT_ANSWERABLE", "This slide takes no answers");
@@ -1060,15 +1721,77 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     if (value === REJECTED) {
       return reject(cb, "FILTERED", "Let's keep it friendly — try rephrasing.");
     }
+    const encoded = JSON.stringify(value);
+
+    // ---- A re-send of an answer already stored is not a new answer ----
+    //
+    // The offline queue settles only on an ack BODY, which is correct: the
+    // server may have the row while the phone has nothing. So when a link drops
+    // between the write and the ack, the identical answer is re-sent on
+    // reconnect — and re-grading it from scratch charged the player for the
+    // outage. Measured: 972 points at submit, 933 after a 6.5 s drop, with the
+    // player having changed nothing. The mechanism built to protect people on
+    // weak connections was the thing billing them for it.
+    //
+    // The test is the stored bytes, not a lock: changing your answer is a
+    // supported feature and a DIFFERENT value falls straight through to the
+    // re-grade below, timed from now, as it must be — otherwise an early answer
+    // would buy an unlimited window to swap it later.
+    //
+    // Deliberately ahead of the revealed/TOO_LATE guard. A re-send that arrives
+    // after the question closed writes nothing and changes nothing; answering
+    // it with "Time's up" would tell a player who answered on time that they
+    // did not, and hand the ack queue an error for a success.
+    const prior = await prisma.response.findUnique({
+      where: {
+        sessionId_slideId_participantId: { sessionId: s.sessionId, slideId, participantId },
+      },
+      select: { value: true, correct: true, points: true },
+    });
+    if (prior && prior.value === encoded) {
+      if (!isTimed(slide.type, slide.config)) return cb?.({ ok: true, isQuiz: false });
+      const { fullEntries } = await computeLeaderboard(s);
+      const rank = fullEntries.findIndex((e) => e.participantId === participantId) + 1;
+      const totalScore = fullEntries.find((e) => e.participantId === participantId)?.score ?? 0;
+      return cb?.({
+        ok: true,
+        isQuiz: true,
+        correct: prior.correct,
+        points: prior.points,
+        totalScore,
+        rank,
+        // Says "we already had this" rather than "we scored this again", so a
+        // client can tell an idempotent settle from a fresh result.
+        duplicate: true,
+      });
+    }
+
+    // Once a slide is revealed, answers are locked — the window has closed.
+    if (s.revealedSlides.has(slideId)) return reject(cb, "TOO_LATE", "Time's up");
 
     const graded = gradeSubmission(
       slide.type,
-      // Grade against the stretched window too — otherwise relaxed timing
-      // quietly costs every player points for answering at the same relative
-      // moment, turning an accessibility option into a scoring penalty.
-      s.timeScale === 1 ? slide.config : { ...slide.config, timeLimitSec: scaledLimit(s, slide) },
+      // Always the session's authoritative window, not the raw config. It is
+      // already clamped and already stretched by `timeScale` — grading against
+      // the unstretched value quietly costs every player points for answering
+      // at the same relative moment, turning an accessibility option into a
+      // scoring penalty.
+      { ...slide.config, timeLimitSec: scaledLimit(s, slide) },
       value,
-      { slideStartedAt: s.currentSlideStartedAt, now: Date.now() }
+      {
+        // The monotonic clock on both sides. Wall-clock grading against a
+        // monotonic deadline meant a clock step rewrote scores while the
+        // question's own expiry did not move: a step back handed out full
+        // marks, a step forward floored them, both silently.
+        //
+        // WHICH start, though, is a per-player question in audience pacing:
+        // the host never navigates there, so grading off the room's shared
+        // start measured every answer from whenever the host last happened to
+        // touch the deck — or, if they never did, from nothing at all, which
+        // disabled speed scoring without saying so.
+        slideStartedAt: scoringStartedAt(s, participantId, slideId),
+        now: monoNow(),
+      }
     );
 
     // The question AS ASKED, stored alongside the answer. `slide` here is the
@@ -1094,13 +1817,13 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
           sessionId: s.sessionId,
           slideId,
           participantId,
-          value: JSON.stringify(value),
+          value: encoded,
           correct: graded.correct,
           points: graded.points,
           ...asAsked,
         },
         update: {
-          value: JSON.stringify(value),
+          value: encoded,
           correct: graded.correct,
           points: graded.points,
           ...asAsked,
@@ -1162,11 +1885,26 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // whose old transport has not timed out yet — and the loser's teardown
     // used to delete the live player: they vanished from the lobby and, with
     // no entry left in `participants`, reached the podium as "Anonymous".
+    //
+    // Only the CONNECTED set is touched. `roster` deliberately keeps them: a
+    // closed socket is a phone that locked, not a person who was never here,
+    // and the score is already durable. Dropping the name alongside the socket
+    // is what put a winner on the podium as "Anonymous", in front of the room,
+    // with somebody else's avatar.
     const pid = socket.data.participantId;
     if (socket.data.role === "participant" && pid && s.participantSockets.get(pid) === socket.id) {
       s.participantSockets.delete(pid);
       s.participants.delete(pid);
       io.to(joinCode).emit("participant:count", participantsPayload(s));
+    }
+    // A host window closing gives up its share of the presenter view. If it was
+    // the primary, hand that title to whichever window is still open rather
+    // than leaving the room with a pointer at a dead socket.
+    if (s.presenterSockets.delete(socket.id)) {
+      if (s.presenterSocketId === socket.id) {
+        s.presenterSocketId = presenterTargets(s)[0] ?? null;
+      }
+      if (s.presenterSockets.size > 0) announcePresenters(io, s);
     }
     // If the session is ending (presenter gone), tear down any pending reveal.
     if (s.status === "ENDED" && s.revealTimer) {

@@ -89,14 +89,56 @@ model Session {
   // status: LOBBY | ACTIVE | ENDED
   status         String       @default("LOBBY")
   currentSlideId String?
+  // Wall-clock moment the room landed on `currentSlideId`. Lives here, not only
+  // in memory, because a restart has to be able to put the question back on the
+  // clock it was already running: without it a recovered room either restarts
+  // every countdown (handing out a second full-speed scoring window) or scores
+  // against nothing. Null in the lobby.
+  currentSlideStartedAt DateTime?
+  // JSON array of slideIds whose answer has already been revealed. Revealing is
+  // one-shot and irreversible, so it is session state, not UI state — a
+  // recovered room must not re-open a question the audience has already been
+  // shown the answer to.
+  revealedSlideIds String   @default("[]")
   startedAt      DateTime     @default(now())
   // Set when the host ends the session, so history can show real durations
   // and distinguish a finished run from one that was abandoned.
   endedAt        DateTime?
   responses      Response[]
   questions      Question[]
+  participants   Participant[]
 
   @@index([presentationId, startedAt])
+  @@index([status, startedAt])
+}
+
+// Who is in the room, as a durable fact rather than a socket-lifetime one.
+//
+// A player's name and avatar used to exist ONLY in the server's live map, which
+// had two consequences. A phone that locked its screen lost its identity while
+// keeping its points, so the winner of a quiz could be announced on the podium,
+// in front of the room, as "Anonymous" with the wrong avatar. And a restart
+// could never rebuild a room at all: the responses survived, but there was
+// nothing anywhere that could say whose they were.
+//
+// The row outlives the socket deliberately. `Session.endedAt` is the only thing
+// that closes a roster; leaving is not erasure.
+model Participant {
+  id            String   @id @default(cuid())
+  sessionId     String
+  session       Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  // The id the client persists in its own storage — the same value that keys
+  // Response.participantId, which is what makes a score resolvable to a person.
+  participantId String
+  name          String   @default("Anonymous")
+  avatar        Int      @default(0)
+  joinedAt      DateTime @default(now())
+  // Refreshed on every (re)join. Not a presence flag — presence is a live
+  // socket, which is not a thing a database row can know.
+  lastSeenAt    DateTime @default(now())
+
+  @@unique([sessionId, participantId])
+  @@index([sessionId])
 }
 
 // Audience Q&A: questions are asked by participants, upvoted by the room, and

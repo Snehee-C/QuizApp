@@ -47,6 +47,14 @@ const reactionBuckets = new Map<string, { count: number; resetAt: number }>();
 
 function reactionAllowed(key: string): boolean {
   const now = Date.now();
+  // One entry per (session, participant) and nothing ever removed them, so the
+  // map was a slow accumulation of every person who had ever tapped an emoji
+  // on this process. A window that has expired carries no information, so drop
+  // the expired ones whenever the map gets large — the same sweep the join
+  // throttle already does, for the same reason.
+  if (reactionBuckets.size > 1000) {
+    for (const [k, rec] of reactionBuckets) if (now >= rec.resetAt) reactionBuckets.delete(k);
+  }
   const b = reactionBuckets.get(key);
   if (!b || now >= b.resetAt) {
     reactionBuckets.set(key, { count: 1, resetAt: now + REACTION_WINDOW_MS });
@@ -115,10 +123,17 @@ export function personalise(
 }
 
 interface QaDeps {
-  /** Resolve the live session for a join code, or undefined. */
-  sessionFor: (joinCode: string) => { sessionId: string; ownerId: string; filterMode: FilterMode } | undefined;
+  /**
+   * Resolve the live session for a join code, or undefined.
+   *
+   * Asynchronous because a room is no longer only what this process happens to
+   * remember: after a restart it is rebuilt from the database on first use, and
+   * the Q&A feed has to be able to follow the room back rather than answering
+   * SESSION_GONE for a session that is demonstrably still running.
+   */
+  sessionFor: (joinCode: string) => Promise<{ sessionId: string; ownerId: string; filterMode: FilterMode } | undefined>;
   /** Verify the caller is that session's host. */
-  isPresenter: (payload: any) => boolean;
+  isPresenter: (payload: any) => Promise<boolean>;
 }
 
 export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
@@ -139,9 +154,16 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
   }
 
   socket.on("qa:ask", async ({ joinCode, participantId, name, text }, cb) => {
-    const live = deps.sessionFor(joinCode);
+    const live = await deps.sessionFor(joinCode);
     if (!live) return reject(cb, "SESSION_GONE", "Session not found");
-    if (socket.data.role !== "participant" || socket.data.participantId !== participantId) {
+    // Who you are AND which room you are in. `qa:list` already pins both; its
+    // four siblings checked only the first, so a socket seated in one session
+    // could post into another's queue.
+    if (
+      socket.data.role !== "participant" ||
+      socket.data.participantId !== participantId ||
+      socket.data.joinCode !== joinCode
+    ) {
       return reject(cb, "NOT_JOINED", "Join the session first");
     }
     const raw = String(text ?? "").trim().slice(0, MAX_QUESTION_LEN);
@@ -165,9 +187,13 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
   });
 
   socket.on("qa:vote", async ({ joinCode, participantId, questionId }, cb) => {
-    const live = deps.sessionFor(joinCode);
+    const live = await deps.sessionFor(joinCode);
     if (!live) return reject(cb, "SESSION_GONE", "Session not found");
-    if (socket.data.role !== "participant" || socket.data.participantId !== participantId) {
+    if (
+      socket.data.role !== "participant" ||
+      socket.data.participantId !== participantId ||
+      socket.data.joinCode !== joinCode
+    ) {
       return reject(cb, "NOT_JOINED", "Join the session first");
     }
     const q = await prisma.question.findFirst({
@@ -195,8 +221,8 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
 
   // ---- host moderation ----
   socket.on("qa:moderate", async (args, cb) => {
-    if (!deps.isPresenter(args)) return reject(cb, "UNAUTHORIZED", "Unauthorized");
-    const live = deps.sessionFor(args.joinCode);
+    if (!(await deps.isPresenter(args))) return reject(cb, "UNAUTHORIZED", "Unauthorized");
+    const live = await deps.sessionFor(args.joinCode);
     if (!live) return reject(cb, "SESSION_GONE", "Session not found");
     const { questionId, status } = args;
     if (!["PENDING", "APPROVED", "ANSWERED", "HIDDEN"].includes(status)) {
@@ -230,7 +256,7 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
   // gets nothing, both before a single row is read.
   socket.on("qa:list", async (args, cb) => {
     const joinCode = args?.joinCode;
-    const live = deps.sessionFor(joinCode);
+    const live = await deps.sessionFor(joinCode);
     if (!live) return reject(cb, "SESSION_GONE", "Session not found");
 
     // A token proves ownership even on a fresh socket (a presenter who
@@ -238,7 +264,7 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
     // is what the moderation and stage panels actually use. Pin it to THIS join
     // code so hosting one session is not a key to every other session's queue.
     const isHost =
-      deps.isPresenter(args) ||
+      (await deps.isPresenter(args)) ||
       (socket.data?.role === "presenter" && socket.data?.joinCode === joinCode);
 
     const viewerId =
@@ -255,8 +281,12 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
   });
 
   // ---- live reactions (ephemeral) ----
-  socket.on("reaction:send", ({ joinCode, kind }) => {
-    const live = deps.sessionFor(joinCode);
+  socket.on("reaction:send", async ({ joinCode, kind }) => {
+    // The same room check its siblings now carry. A socket that had joined
+    // nothing could previously put a burst of emoji on any projector it knew
+    // the code of, which is a wall anyone can read.
+    if (socket.data.joinCode !== joinCode) return;
+    const live = await deps.sessionFor(joinCode);
     if (!live) return;
     if (!ALLOWED_REACTIONS.includes(kind)) return;
     const who = socket.data.participantId ?? socket.id;
