@@ -1,0 +1,113 @@
+{
+  "formatVersion": 1,
+  "title": "skilltest-90s Music Pub Quiz",
+  "theme": "ember",
+  "pacing": "PRESENTER",
+  "filterMode": "mask",
+  "slides": [
+    {
+      "order": 0,
+      "type": "CONTENT_HEADING",
+      "question": "90s Music Pub Quiz",
+      "config": {
+        "subtitle": "Five rounds. No phones for anything but answering."
+      },
+      "notes": "Welcome everyone, wait for the room to fill before advancing."
+    },
+    {
+      "order": 1,
+      "type": "CONTENT_INSTRUCTIONS",
+      "question": "How to join",
+      "config": {},
+      "notes": "Read the join code off the screen twice — people mistype it."
+    },
+    {
+      "order": 2,
+      "type": "WORD_CLOUD",
+      "question": "One word: what does 1995 sound like?",
+      "config": {
+        "maxWords": 2
+      },
+      "notes": "Warm-up, not scored. Let it run until the cloud stops moving."
+    },
+    {
+      "order": 3,
+      "type": "CONTENT_HEADING",
+      "question": "Round 1 — Albums",
+      "config": {
+        "subtitle": "Four questions. 20 seconds each."
+      },
+      "notes": ""
+    },
+    {
+      "order": 4,
+      "type": "MULTIPLE_CHOICE",
+      "question": "Which band released OK Computer in 1997?",
+      "config": {
+        "options": ["Blur", "Radiohead", "Oasis", "Pulp"],
+        "isQuiz": true,
+        "allowMultiple": false,
+        "correctIndices": [1],
+        "timeLimitSec": 20
+      },
+      "notes": "Radiohead, June 1997. Index 1 — the second option."
+    },
+    {
+      "order": 5,
+      "type": "MULTIPLE_CHOICE",
+      "question": "Which TWO of these albums came out in 1991?",
+      "config": {
+        "options": ["Nevermind", "Definitely Maybe", "Ten", "Jagged Little Pill"],
+        "isQuiz": true,
+        "allowMultiple": true,
+        "correctIndices": [0, 2],
+        "timeLimitSec": 25
+      },
+      "notes": "Nevermind (Sept 1991) and Ten (Aug 1991). Definitely Maybe is 1994, Jagged Little Pill 1995. Both must be selected — no partial credit."
+    },
+    {
+      "order": 6,
+      "type": "TYPE_ANSWER",
+      "question": "Who sang \"Wannabe\"?",
+      "config": {
+        "acceptedAnswers": ["Spice Girls", "The Spice Girls"],
+        "caseSensitive": false,
+        "isQuiz": true,
+        "timeLimitSec": 25
+      },
+      "notes": "Spice Girls, 1996. Both spellings accepted; matching is case-insensitive."
+    },
+    {
+      "order": 7,
+      "type": "GUESS_NUMBER",
+      "question": "In what year did MTV first air Unplugged?",
+      "config": {
+        "correctValue": 1989,
+        "tolerance": 1,
+        "unit": "",
+        "isQuiz": true,
+        "timeLimitSec": 25
+      },
+      "notes": "1989. Tolerance of 1 means 1988-1990 all score."
+    },
+    {
+      "order": 8,
+      "type": "RANKING",
+      "question": "Rank these 90s dance floor fillers, best first",
+      "config": {
+        "items": ["Rhythm Is a Dancer", "No Limit", "Saturday Night", "Cotton Eye Joe"]
+      },
+      "notes": "Pure opinion — never scored. Borda count decides the room's order."
+    },
+    {
+      "order": 9,
+      "type": "CONTENT_BIG_NUMBER",
+      "question": "Copies of Nevermind sold worldwide",
+      "config": {
+        "value": "30m+",
+        "caption": "And it knocked Michael Jackson off the number one spot."
+      },
+      "notes": "Closing slide. Hold it while the leaderboard sinks in."
+    }
+  ]
+}
