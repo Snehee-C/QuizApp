@@ -34,6 +34,30 @@ Status: **done** — `.claude/skills/quiz-deck/` (`1fb1ce0`). Validator catches
 
 ---
 
+## Security
+
+### A `participantId` is a bearer token with no secret
+`participant:join` accepts any `participantId` the caller supplies and binds
+the socket to it. There is nothing tying that id to a device — so **knowing
+someone's id is enough to become them**: take their seat, see their result,
+and overwrite their answers (`participant:submit` upserts by that id).
+
+Surfaced while deciding how wide the leaderboard wire may be. It is the reason
+the participant-facing board stays at ten rows while the presenter's widens to
+200: every row carries a `participantId`, so a full board broadcast to phones
+would hand every player in the room the keys to every other player.
+
+Mitigated today only by ids being long and random, and by the board being
+capped. The real fix is a per-seat secret issued on first join and required
+thereafter — which also fixes the "second tab evicts the real player" family
+properly rather than by socket bookkeeping.
+
+Pre-existing, not introduced by any wave. Recorded because it currently
+constrains an unrelated design decision, which is how an implicit security
+assumption usually announces itself.
+
+---
+
 ## Known gaps
 
 ### A reloading player loses their own result
