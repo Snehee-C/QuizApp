@@ -36,6 +36,19 @@ Status: **done** — `.claude/skills/quiz-deck/` (`1fb1ce0`). Validator catches
 
 ## Known gaps
 
+### A reloading player loses their own result
+Pre-existing, surfaced while building the rank embargo. `feedback` is
+component state, and the join ack carries `answered`/`myAnswer` but no graded
+result — so a phone that reloads after a reveal comes back without `Correct`,
+without `+points`, and without its rank. The player is told less than they had.
+Fix: put the player's own score and rank on the join ack. Server change.
+
+### A climb from 11th cannot animate
+`computeLeaderboard` sends a top ten, so rows 11+ were never on any board the
+stage remembers. The bar race now runs over the whole board it receives and
+slices only the render, so this is purely a wire limit — a larger board (or a
+dedicated "previous standings" frame) gets it for free.
+
 ### The importer does not validate slide config — it accepts decks that cannot work
 Found while building the skill, and verified directly. `POST /transfer/import`
 checks the envelope, the type allow-list and the config's *shape* (plain
