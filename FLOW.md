@@ -464,6 +464,84 @@ lives on the deck, in its `•••` menu, and `lib/deckFile.ts` is the single
 implementation. The page it left is now titled `Import a deck`, does one thing,
 and says where the other verb went.
 
+### Player, self-paced: a clock they can now see
+The server changed underneath this: in audience pacing each player now has
+their own clock, stamped when they arrive at a slide, and is scored against it.
+A countdown therefore has to appear where there was none — scoring someone on a
+clock they cannot see is indefensible.
+
+The wiring had one half connected. `participant:goto` reported both `startedAt`
+and a **scaled** `timeLimitSec`; only the first was read, so the ring fell
+through to `currentSlide.config.timeLimitSec`, the raw authored value. The same
+hole existed on the other path: `slide:changed` was deliberately nulling both
+for self-paced decks, on a premise that had just stopped being true.
+
+That is worse than a cosmetic mismatch. The scaling is `timeScale`, the relaxed
+timing setting that exists for dyslexic and ADHD players, so the ring lied
+hardest to exactly the people the setting protects. Proven at the socket level
+on a deck with `timeScale: 2` — raw 10s, real window 20s:
+
+| | |
+|---|---|
+| Answer at T+0 | accepted, **980** pts |
+| Answer at T+14 — past the raw limit, inside the real one | accepted, **629** pts |
+| What the ring showed before the fix | `10`, reaching zero with **6s still to play** |
+
+Both paths now take the server's number. The server's own comment says why:
+*"The client must not re-derive this from config or the ring and the auto-reveal
+disagree."*
+
+### Player, self-paced: two things the ring exposed
+A countdown had never been seen in this context, and putting one there made two
+existing behaviours legible.
+
+**Walking back to a question you already answered handed you a fresh one.**
+`participant:goto` cleared `answered`/`myAnswer` unconditionally, so stepping
+back in a self-paced deck re-armed four tappable tiles over an answer the
+server had already scored — and `participant:submit` upserts, so one tap
+replaced a 927-point answer with a late, cheap one. It was always wrong and
+always silent; the countdown turned it into an active invitation. The join ack
+reports `answered` for the slide you land on and the `goto` ack reports it for
+nothing, so this tab is the only thing that knows — it now remembers what it
+submitted, and what reveal it already watched, per slide. Verified: the
+revisited slide shows their own result, no ring, and a tap on a different tile
+leaves the score at 927 with the server agreeing.
+
+**Zero means two different things, and which one depends on how you got there.**
+Measured: on the slide the host seats everyone on, the shared auto-reveal is
+armed and zero really is a deadline — *"Time's up. You didn't answer in time."*
+On a slide the player walked to themselves no timer is armed at all; the phone
+receives no event, the tiles stay live, and a correct answer still scores
+exactly `MIN_POINTS`. The same ring, spending its last three seconds pulsing
+rose, about a consequence that in half the cases never arrives.
+
+The ring is retired at zero and replaced by a line that says what zero cost —
+`Speed bonus used up — your answer still counts` — on self-navigated slides
+only, because on host-seated ones the reveal says the truer thing. Verified
+end to end: answering after the line appears scores exactly 500, which is the
+arithmetic the copy claims, and host-paced decks are untouched.
+
+### Deleting something, with a way back
+Both deletions were guarded by `window.confirm()`. NN/g are blunt about which
+way round this belongs: a confirmation taxes every correct action to catch the
+rare wrong one; an undo taxes none of them and catches all of them. The old
+dialog said *"This cannot be undone"* — true, and the reason it was the wrong
+design.
+
+There is no restore endpoint and rebuilding a deck from whatever the client
+still held would be a different deck, so the undo is real rather than
+compensating: **the destroy is deferred.** The row leaves the screen at once;
+the irreversible request waits six seconds; undo inside that window means the
+server is never told.
+
+The window is the whole design, so both ways of leaving it early are handled —
+unmount and `pagehide` (not `beforeunload`, which does not fire on mobile
+Safari's bfcache path) — or this would trade a confirm for a far worse bug: an
+item that returns from the dead on the next load. Verified: undo keeps the
+deck, elapsing deletes it, navigating away 0.4s in still commits, and the
+slide case restores the rail to three with the rescued slide re-selected. Zero
+native dialogs remain in the product.
+
 ### Signed-out deep links
 `/edit/<id>` while logged out used to bounce to `/login` and then land on the
 dashboard — the destination was discarded at the gate. A shared link, a
@@ -496,6 +574,7 @@ redirect).
 | `lib/arrowFocus.ts` | One keyboard implementation for all four popups, replacing one real handler and three absences. |
 | `lib/deckFile.ts` | Exporting a deck to a file, as one operation rather than a page. |
 | `lib/scrollMemory.ts` | Gained `usePaneScrollMemory` for a scrolling element keyed per item, alongside the window-level hook. |
+| `lib/undoDelete.ts` + `components/UndoBar.tsx` | Deferred destroy with a real undo, replacing both `confirm()` dialogs. |
 | `lib/presenterPrefs.ts` | Host-machine preferences (localStorage, like the stage theme) and what the current room has been shown (sessionStorage, keyed by join code). |
 | ~~`components/ui/SoundToggle.tsx`~~ | **Deleted.** Its logic moved into the presenter's settings menu, which was the only place it was used. "A future participant view might want it" is how a codebase fills with well-built orphans; git has it if we were wrong. |
 
@@ -565,53 +644,68 @@ question and navigator-open.
 Counting honestly, because this document's standard is that a system wrong
 about itself cannot be trusted about anything else.
 
-Of the first pass's ten findings, **nine are fully fixed** and **one remains**
-(deletion confirms). Of everything raised since, three were settled by deciding
-against them rather than by building — the live crumb's tab scope, a deck
-setting for navigator masking, and `/transfer` as a sheet — and all three are
-in §5 with their reasoning and, in the last case, a correction to what this
-document previously claimed.
+**All ten of the first pass's findings are now fixed**, the last of them —
+`confirm()` → undo — in this batch. Four later items were settled by deciding
+against them rather than by building: the live crumb's tab scope, a deck
+setting for navigator masking, `/transfer` as a sheet, and the sheet-shaped
+half of that page. All four are in §5 with their reasoning, one of them a
+correction to what this document previously claimed.
 
-What is left, in the order it costs a person something. The top two are blocked
-on `server/` and are **not** ours to take; they are recorded so the list stays
-complete, not as work in flight.
+Two items are **blocked on `server/` and were checked this batch rather than
+assumed** — the server work that landed unblocked `confirm()` → undo, and did
+not unblock these:
 
-1. **`confirm()` still guards both deletions.** *(blocked: needs `server/`)* A
-   native modal with no undo, for an irreversible act. F5 is half-satisfied:
-   `Delete deck` moved a layer into the `•••` menu, but it is still
-   confirm-then-destroy rather than destroy-then-undo, which is what NN/g
-   actually recommend. It needs a server-side tombstone.
-2. **`slideTitles` is issued once and never re-pushed.** *(blocked: needs
-   `server/`)* A slide added or deleted mid-session invalidates the list. The
-   client notices — the authoritative `totalSlides` stops matching — and
-   discards both the titles and the shown-slides set, re-learning a title each
-   time the host lands on a slide. Honest, and still a client working around a
-   protocol gap.
-3. **`LastRunBar` only knows about runs that ended in this tab.** Close the
+1. **`slideTitles` is still issued once and never re-pushed.** Confirmed by
+   reading the handler: it is emitted on `create-session` and `resume-session`
+   only, and `slide:changed` does not carry it. A slide added or deleted
+   mid-session invalidates the list; the client notices (the authoritative
+   `totalSlides` stops matching) and discards both the titles and the
+   shown-slides set together, re-learning a title each time the host lands on
+   a slide. Honest, and still a client working around a protocol gap.
+2. **The reveal preference is per host, not per deck.** Confirmed against
+   `schema.prisma`: `Presentation` has no column for it, so there is nowhere to
+   put a per-deck answer. A host running a trivia night and a staff all-hands
+   from one account gets one setting for both.
+
+A third is a **server design question rather than a client gap**, raised by
+this batch's measurements:
+
+3. **A self-paced countdown means two different things.** On the slide the host
+   seats everyone on, the shared auto-reveal is armed and zero closes the
+   question. On a slide the player walked to themselves, nothing is armed and
+   the question stays answerable for half marks. The client now says which one
+   it is, but the asymmetry is in the model: either audience pacing should arm
+   a per-player reveal at zero, or it should not arm one on the seated slide
+   either. Worth a decision rather than a patch.
+
+What is left that is ours, in the order it costs a person something.
+
+4. **`LastRunBar` only knows about runs that ended in this tab.** Close the
    browser and the pointer to your last session is gone — the results are still
    in `Session history`, two presses away. A durable answer needs a "recent
    sessions" endpoint that does not exist.
-4. **The deck title is still an unlabelled drill-in.** Now redundant rather
+5. **Walking past a slide silently spends its clock.** Measured: a player who
+   arrives at a slide, moves on, browses for seven seconds and comes back
+   scores 562 where someone who answered on arrival scored 1000 — the clock ran
+   the whole time, because first arrival wins. The ring is now honest about it
+   *on return*, but nothing warns you on the way past. Arguably correct
+   (stepping away must not reopen the window) and arguably a trap; it needs a
+   decision about what audience pacing is for.
+6. **The deck title is still an unlabelled drill-in.** Now redundant rather
    than load-bearing — `Edit` sits beside it — so a consistency wrinkle rather
    than a trap. It stays listed because the original defect in this product was
    exactly this affordance being the *only* way in, and a system that forgets
    its own near-misses re-earns them.
-5. **The type picker has no "recently used".** The filter pays back most of
+7. **The type picker has no "recently used".** The filter pays back most of
    what progressive disclosure costs an expert, but an author building a
-   twelve-question quiz types the same three letters twelve times. Remembering
-   the last type used in this deck would make the common case one press again.
-6. **The reveal preference is per host, not per deck.** *(blocked: needs
-   `server/`)* A host who runs a trivia night and a staff all-hands from one
-   account gets one answer for both. Per-deck is the better unit and is a deck
-   field.
-7. **There is no shared `Sheet`.** Three modal surfaces now exist — the slide
-   navigator, the type picker, and whatever `/transfer` becomes — and two of
-   them each own a scrim, a panel and a dismiss. `lib/arrowFocus.ts` took the
-   keyboard half out; the presentation half is still duplicated, and it is the
-   prerequisite for the `/transfer` decision in §5 rather than a separate task.
-8. **`MoreMenu` has no typeahead.** Arrows, `Home`, `End` and `Escape` all work
-   now, but ARIA's menu pattern also specifies jumping to an item by first
-   letter. Low cost on a three-row menu; worth it if a menu ever gets long.
+   twelve-question quiz types the same three letters twelve times.
+8. **There is no shared `Sheet`.** Two modal surfaces each own a scrim, a panel
+   and a dismiss. `lib/arrowFocus.ts` took the keyboard half out; the
+   presentation half is still duplicated, and it is the prerequisite for the
+   `/transfer` decision in §5 rather than a separate task.
+9. **`MoreMenu` has no typeahead.** Arrows, `Home`, `End` and `Escape` all work,
+   but ARIA's menu pattern also specifies jumping to an item by first letter.
+   Low cost on a three-row menu; worth it if a menu ever gets long.
 
 ## 7. Sources
 

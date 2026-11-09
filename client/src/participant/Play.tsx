@@ -173,6 +173,19 @@ export default function Play() {
   const [totalSlides, setTotalSlides] = useState(0);
   // A phone-sized bottom sheet: answering, asking questions, or reacting.
   const [tab, setTab] = useState<"answer" | "qa">("answer");
+  // The self-paced clock has run out. Measured: at that point the server stops
+  // awarding the speed half and the question stays open and answerable.
+  const [speedExpired, setSpeedExpired] = useState(false);
+  // What this player has already submitted, by slide id.
+  //
+  // Only self-paced decks can revisit a slide, and only this tab can answer
+  // "did I already answer that one" for a slide other than the current — the
+  // join ack reports it for the slide you land on, and the `participant:goto`
+  // ack does not report it at all. A ref rather than state: nothing renders
+  // from it directly, it is read at the moment of a navigation.
+  const answeredSlides = useRef<Map<string, { value: unknown; feedback: SubmitFeedback }>>(new Map());
+  /** Reveals this player has already seen, by slide id. Same reason as above. */
+  const revealedSlides = useRef<Map<string, Reveal>>(new Map());
 
   // `pacing` is read inside socket handlers but must NOT be an effect
   // dependency: the join ack sets it, so depending on it tore the whole
@@ -336,10 +349,23 @@ export default function Play() {
 
       setCurrentSlide(payload.currentSlide);
       currentSlideRef.current = payload.currentSlide ?? null;
-      // A self-paced slide has no shared clock, so it carries no countdown —
-      // the same as what `participant:goto` returns when they move themselves.
-      setStartedAt(selfPaced ? null : (payload.startedAt ?? null));
-      setTimeLimit(selfPaced ? null : (payload.timeLimitSec ?? null));
+      // The clock, in BOTH pacings now.
+      //
+      // This used to null both for self-paced decks, on the reasoning that a
+      // self-paced slide has no shared clock. The premise was true and is not
+      // any more: when the host navigates, the server marks every player
+      // present as having arrived at that instant, and scores them from it.
+      // So there IS a clock here — this is the one slide in an audience-paced
+      // deck where everyone's happens to start together.
+      //
+      // Nulling it did not mean "no ring", either. It meant the ring fell
+      // through to `currentSlide.config.timeLimitSec`, the raw authored value,
+      // so a relaxed-timing deck showed a 20s countdown over a 30s window. The
+      // server's broadcast says exactly this, and it is right: the client must
+      // not re-derive a countdown from config, or the ring and the auto-reveal
+      // disagree about when the answer closed.
+      setStartedAt(payload.startedAt ?? null);
+      setTimeLimit(payload.timeLimitSec ?? null);
       setIndex(payload.index ?? 0);
       setFeedback(null);
       setLeaderboardView(null);
@@ -353,7 +379,13 @@ export default function Play() {
     const onReveal = (payload: any) => {
       setCurrentSlide((slide) => {
         if (slide && payload.slideId === slide.id) {
-          setReveal({ raw: payload ?? {}, aggregate: payload?.aggregate });
+          const next = { raw: payload ?? {}, aggregate: payload?.aggregate };
+          setReveal(next);
+          // Kept for the self-paced walk-back, same reason as the answer: the
+          // `participant:goto` ack carries no reveal, so a revisited slide
+          // would otherwise say "answer coming up" about an answer this player
+          // already watched arrive.
+          revealedSlides.current.set(payload.slideId, next);
           playSound("reveal");
         }
         return slide;
@@ -401,13 +433,49 @@ export default function Play() {
         currentSlideRef.current = res.currentSlide ?? null;
         setIndex(res.index);
         setTotalSlides(res.totalSlides);
+        // Both halves of the clock, from the server, together.
+        //
+        // `startedAt` was already being read and `timeLimitSec` was not, so the
+        // ring fell through to `currentSlide.config.timeLimitSec` — the RAW
+        // authored value. The server's number is the same one scaled by the
+        // deck's `timeScale`, which is the relaxed-timing accessibility
+        // setting. So on exactly the decks that turn it on, the ring counted
+        // down a window the server was not using: at ×1.5 it hit zero a third
+        // of the way before the answer actually closed.
+        //
+        // A clock that lies is worse than no clock, and it lied hardest to the
+        // players the setting exists for. Null when the slide is not timed,
+        // which is also the server's answer and must not be read as "fall back
+        // to the config".
         setStartedAt(res.startedAt ?? null);
-        setFeedback(null);
-        setReveal(null);
-        setAnswered(false);
-        setMyAnswer(null);
+        setTimeLimit(res.timeLimitSec ?? null);
         setSubmitError("");
         setTab("answer");
+
+        // Walking back to a question you have already answered must not hand
+        // you a fresh one.
+        //
+        // This cleared `answered`/`myAnswer` unconditionally, so stepping back
+        // in a self-paced deck re-armed four tappable tiles over an answer the
+        // server had already scored — and `participant:submit` UPSERTS, so one
+        // tap replaced a 927-point answer with a late, cheap one. It was always
+        // wrong and it was always silent; the countdown that now renders here
+        // turned it into an active invitation to do it, which is how it
+        // surfaced at all.
+        const prior = res.currentSlide?.id
+          ? answeredSlides.current.get(res.currentSlide.id)
+          : undefined;
+        setAnswered(!!prior);
+        setMyAnswer(prior ? prior.value : null);
+        // Their own result, as they last saw it — the server does not re-send
+        // it, and a locked slide with no explanation reads as a broken one.
+        setFeedback(prior ? prior.feedback : null);
+        // And the reveal, if this player already watched it land. The
+        // distribution in it is as of the moment they saw it rather than now —
+        // the server sends no fresh one here — but a slightly stale tally is a
+        // far smaller error than telling someone the answer is still coming to
+        // a question they have already seen answered.
+        setReveal(res.currentSlide?.id ? (revealedSlides.current.get(res.currentSlide.id) ?? null) : null);
       }
     );
   }
@@ -415,6 +483,31 @@ export default function Play() {
   useEffect(() => {
     initSound({ role: "participant" });
   }, []);
+
+  // When a self-paced countdown reaches zero, say what that actually meant.
+  //
+  // The same ring renders in both pacings and means two different things. With
+  // a host driving, zero is a deadline: the server auto-reveals and the
+  // question closes. Self-paced there is no auto-reveal — measured, the phone
+  // receives no event at all, the tiles stay live, and a correct answer still
+  // scores MIN_POINTS. So the ring is a speed meter wearing a deadline's
+  // clothes, and it spends its last three seconds pulsing rose about a
+  // consequence that never arrives.
+  //
+  // One timeout armed for the exact moment rather than a poll, and the ring is
+  // retired at the same instant: a clock frozen at zero is a broken clock,
+  // while a line saying what zero cost is an answer.
+  useEffect(() => {
+    setSpeedExpired(false);
+    if (pacing !== "AUDIENCE" || startedAt === null || !timeLimit) return;
+    const left = startedAt + timeLimit * 1000 - Date.now();
+    if (left <= 0) {
+      setSpeedExpired(true);
+      return;
+    }
+    const t = window.setTimeout(() => setSpeedExpired(true), left);
+    return () => window.clearTimeout(t);
+  }, [pacing, startedAt, timeLimit, currentSlide?.id]);
 
   // Tell the retry queue which slide is live, so an answer queued during an
   // outage is abandoned rather than replayed into a finished question.
@@ -455,6 +548,10 @@ export default function Play() {
       setFeedback(res);
       setAnswered(true);
       setMyAnswer(value);
+      // Keep it. In a self-paced deck the player can walk back here, and the
+      // server's `participant:goto` ack does not carry `answered`/`myAnswer`
+      // the way the join ack does — so this tab is the only thing that knows.
+      answeredSlides.current.set(currentSlide.id, { value, feedback: res });
       if (res.isQuiz) playSound(res.correct ? "correct" : "wrong");
     });
   }
@@ -529,7 +626,7 @@ export default function Play() {
   const isQuiz = currentSlide.type === "MULTIPLE_CHOICE" && currentSlide.config?.isQuiz;
   // A countdown is an invitation to answer. Anyone already locked in — this
   // round or before a reconnect — must not be watching one tick down.
-  const showTimer = isQuiz && !feedback && !reveal && !answered;
+  const showTimer = isQuiz && !feedback && !reveal && !answered && !speedExpired;
 
   return (
     <div className={PHONE_SHELL}>
@@ -558,6 +655,11 @@ export default function Play() {
           <p className="font-display font-bold text-body leading-snug text-ink-muted line-clamp-3">
             {currentSlide.question}
           </p>
+          {speedExpired && isQuiz && !feedback && !reveal && !answered && (
+            <p className="text-caption2 font-semibold uppercase track-label text-ink-subtle mt-1.5">
+              Speed bonus used up — your answer still counts
+            </p>
+          )}
         </div>
         {showTimer && (
           <TimerRing

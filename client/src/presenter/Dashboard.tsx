@@ -8,6 +8,8 @@ import { Card } from "../components/ui/Card";
 import { LiveRoomBar } from "../components/LiveRoomBar";
 import { MoreMenu } from "../components/MoreMenu";
 import { exportDeckToFile } from "../lib/deckFile";
+import { useUndoableDelete } from "../lib/undoDelete";
+import { UndoBar } from "../components/UndoBar";
 import { getLastRun, getPresenting } from "../lib/liveSession";
 import { LastRunBar } from "../components/LastRunBar";
 import { useScrollMemory } from "../lib/scrollMemory";
@@ -54,10 +56,32 @@ export default function Dashboard() {
     }
   }
 
-  async function remove(id: string) {
-    if (!confirm("Delete this deck? This cannot be undone.")) return;
-    await api.deletePresentation(id);
-    setItems((items) => items.filter((i) => i.id !== id));
+  // Deleting a deck: gone from the list at once, told to the server in six
+  // seconds unless undone (lib/undoDelete.ts). The dialog this replaces said
+  // "This cannot be undone", which was true and is the reason it was the wrong
+  // design — the fix for an irreversible action is to make it reversible, not
+  // to ask twice.
+  const { pending, scheduleDelete, undo, windowMs } = useUndoableDelete();
+  function remove(p: Presentation) {
+    const removed = p;
+    setItems((items) => items.filter((i) => i.id !== removed.id));
+    scheduleDelete(removed.id, `"${removed.title}"`, () => {
+      void api.deletePresentation(removed.id).catch(() => {
+        // The destroy failed after the row already left the screen, so put it
+        // back rather than letting the list quietly disagree with the server.
+        setItems((items) =>
+          items.some((i) => i.id === removed.id) ? items : [removed, ...items]
+        );
+      });
+    });
+  }
+
+  function undoRemove(key: string) {
+    if (!undo(key)) return;
+    // Re-fetch rather than splicing the cached row back in at the top: its
+    // position in the list is the server's to decide, and the list may have
+    // moved on while the window was open.
+    api.listPresentations().then(setItems).catch(() => {});
   }
 
   return (
@@ -195,7 +219,7 @@ export default function Dashboard() {
                       { label: "Session history", onSelect: () => navigate(`/history/${p.id}`) },
                       { label: "Duplicate", onSelect: () => duplicate(p.id) },
                       { label: "Export as file", onSelect: () => exportDeck(p) },
-                      { label: "Delete deck", onSelect: () => remove(p.id), danger: true },
+                      { label: "Delete deck", onSelect: () => remove(p), danger: true },
                     ]}
                   />
                 </div>
@@ -204,6 +228,8 @@ export default function Dashboard() {
           ))}
         </div>
       </main>
+
+      <UndoBar pending={pending} windowMs={windowMs} onUndo={undoRemove} />
     </div>
   );
 }

@@ -16,6 +16,8 @@ import { ThemePicker } from "../components/ThemePicker";
 import { LiveRoomBar } from "../components/LiveRoomBar";
 import { getPresenting } from "../lib/liveSession";
 import { usePaneScrollMemory } from "../lib/scrollMemory";
+import { useUndoableDelete } from "../lib/undoDelete";
+import { UndoBar } from "../components/UndoBar";
 import { SlideTypePicker } from "../components/SlideTypePicker";
 import { AnimatePresence } from "motion/react";
 
@@ -161,12 +163,37 @@ export default function Editor() {
     select(created.id);
   }
 
-  async function deleteSlide(slideId: string) {
-    if (!id) return;
-    if (!confirm("Delete this slide?")) return;
-    await api.deleteSlide(id, slideId);
-    if (selectedId === slideId) select(null);
-    await load();
+  // Same bargain as the deck list: the slide leaves the rail now, the server
+  // hears about it in six seconds, and undo inside that window means it is
+  // never told (lib/undoDelete.ts).
+  const { pending, scheduleDelete, undo, windowMs } = useUndoableDelete();
+
+  function deleteSlide(slideId: string) {
+    if (!id || !pres) return;
+    const at = pres.slides.findIndex((s) => s.id === slideId);
+    if (at === -1) return;
+    const slide = pres.slides[at];
+    const remaining = pres.slides.filter((s) => s.id !== slideId);
+    setPres({ ...pres, slides: remaining });
+    // Land on the neighbour that took its place, or the new last slide. Being
+    // dropped to "nothing selected" after a delete is a second small loss on
+    // top of the first, and the host has to go and pick a slide again.
+    if (selectedId === slideId) {
+      select(remaining[Math.min(at, remaining.length - 1)]?.id ?? null);
+    }
+    scheduleDelete(slideId, slide.question?.trim() || "an untitled slide", () => {
+      // `load()` either way: on success it reconciles order, and on failure it
+      // is what puts the slide back rather than leaving the rail lying.
+      void api.deleteSlide(id, slideId).finally(() => void load());
+    });
+  }
+
+  function undoDeleteSlide(key: string) {
+    if (!undo(key)) return;
+    // It was never deleted, so the server still has it — and re-selecting it
+    // before the refetch means undo returns you to the slide you rescued.
+    select(key);
+    void load();
   }
 
   // Reorder is a swap with the neighbour, persisted as a full id order. The
@@ -367,6 +394,8 @@ export default function Editor() {
           )}
         </main>
       </div>
+
+      <UndoBar pending={pending} windowMs={windowMs} onUndo={undoDeleteSlide} />
 
       <AnimatePresence>
         {pickerOpen && (
