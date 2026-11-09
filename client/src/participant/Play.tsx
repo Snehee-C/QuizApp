@@ -488,11 +488,19 @@ export default function Play() {
   //
   // The same ring renders in both pacings and means two different things. With
   // a host driving, zero is a deadline: the server auto-reveals and the
-  // question closes. Self-paced there is no auto-reveal — measured, the phone
-  // receives no event at all, the tiles stay live, and a correct answer still
-  // scores MIN_POINTS. So the ring is a speed meter wearing a deadline's
-  // clothes, and it spends its last three seconds pulsing rose about a
-  // consequence that never arrives.
+  // question closes. In AUDIENCE pacing it never does — that is a server
+  // GUARANTEE, not an observed quirk: `armRevealTimer` returns early for
+  // self-paced decks, because a reveal is one room-wide frame and a deck where
+  // everyone is on a different slide has no shared moment to fire it at. (It
+  // used to fire anyway, landing on whoever was still reading and closing the
+  // question against them.) So the tiles stay live, and a correct answer still
+  // scores MIN_POINTS.
+  //
+  // Which makes the ring a speed meter wearing a deadline's clothes: it would
+  // spend its last three seconds pulsing rose about a consequence that never
+  // arrives. Keyed on PACING rather than on how the player reached the slide —
+  // the deck's mode is what decides whether zero closes anything, so the slide
+  // the host seated everyone on is no different from one they walked to.
   //
   // One timeout armed for the exact moment rather than a poll, and the ring is
   // retired at the same instant: a clock frozen at zero is a broken clock,

@@ -667,16 +667,31 @@ not unblock these:
    put a per-deck answer. A host running a trivia night and a staff all-hands
    from one account gets one setting for both.
 
-A third is a **server design question rather than a client gap**, raised by
-this batch's measurements:
+A third was a **server design question rather than a client gap**. It has
+since been answered, and is recorded here because the reasoning outlived it:
 
-3. **A self-paced countdown means two different things.** On the slide the host
-   seats everyone on, the shared auto-reveal is armed and zero closes the
-   question. On a slide the player walked to themselves, nothing is armed and
-   the question stays answerable for half marks. The client now says which one
-   it is, but the asymmetry is in the model: either audience pacing should arm
-   a per-player reveal at zero, or it should not arm one on the seated slide
-   either. Worth a decision rather than a patch.
+3. **A self-paced countdown meant two different things — RESOLVED.** On the
+   slide the host seated everyone on, the shared auto-reveal was armed and zero
+   closed the question; on a slide the player walked to themselves nothing was
+   armed and the question stayed answerable for half marks. The asymmetry was
+   in the model, so it was decided there rather than patched here: **audience
+   pacing no longer auto-reveals at all** (`armRevealTimer` returns early for
+   self-paced decks). A reveal is one room-wide frame, and a deck where
+   everyone is on a different slide has no shared moment to fire it at — it was
+   landing on whoever happened to still be reading, closing the question
+   against them and pre-spoiling it for anyone who had not arrived yet. That
+   punished the slowest reader, which is the axis relaxed timing exists to
+   protect.
+
+   The client consequence: the honest zero-state copy keys on the deck's
+   PACING, not on how the player reached the slide, because the deck's mode is
+   what decides whether zero closes anything. Host-paced decks are unchanged
+   and still genuinely close.
+
+   Known follow-up, deliberately not bundled: a self-paced player who runs out
+   of time now gets no answer-key feedback until the host ends the session.
+   Showing a player their own result when their own clock expires is additive
+   and breaks nothing.
 
 What is left that is ours, in the order it costs a person something.
 
