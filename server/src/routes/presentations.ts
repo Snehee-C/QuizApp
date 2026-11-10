@@ -1,7 +1,8 @@
 import { Router } from "express";
 import { prisma } from "../db.js";
 import { requireAuth, type AuthedRequest } from "../auth.js";
-import { VALID_SLIDE_TYPES } from "../slides/registry.js";
+import { VALID_SLIDE_TYPES, configIssues } from "../slides/registry.js";
+import { clampTimeScale } from "../timeScale.js";
 
 export const presentationsRouter = Router();
 
@@ -65,9 +66,14 @@ presentationsRouter.patch("/:id", async (req: AuthedRequest, res) => {
       pacing: pacing === "AUDIENCE" || pacing === "PRESENTER" ? pacing : owned.pacing,
       isTemplate: typeof isTemplate === "boolean" ? isTemplate : owned.isTemplate,
       filterMode: ["off", "mask", "block"].includes(filterMode) ? filterMode : owned.filterMode,
+      // Only a real number is treated as an edit at all — anything else (a
+      // PATCH that simply doesn't mention timeScale, which is most of them)
+      // leaves the deck's existing setting alone rather than resetting it to
+      // the default. The bounds themselves come from ../timeScale.js, the one
+      // place that owns them.
       timeScale:
         typeof timeScale === "number" && Number.isFinite(timeScale)
-          ? Math.max(1, Math.min(3, timeScale))
+          ? clampTimeScale(timeScale)
           : owned.timeScale,
     },
   });
@@ -90,6 +96,25 @@ async function assertOwnedPresentation(userId: string, presentationId: string) {
   return prisma.presentation.findFirst({
     where: { id: presentationId, ownerId: userId },
   });
+}
+
+
+// Config faults, reported but NEVER refused on this path.
+//
+// `POST /api/transfer/import` hard-rejects a broken config, because a deck
+// FILE is a finished artifact. The editor is not: it autosaves the slide on
+// every single keystroke and config change (client Editor.tsx `save()`), and
+// it does so fire-and-forget — the client's `request()` helper throws on any
+// non-2xx and nothing on that path catches it. A 400 here would therefore
+// NOT surface as an error the author could act on; it would silently drop the
+// edit on the server while the editor went on rendering it as saved. That is
+// strictly worse than storing a half-finished slide.
+//
+// So the rules run, and the result rides along in the response for a client
+// that wants to show it. Changing this to a refusal needs the editor to
+// handle the rejection first.
+function configAdvice(type: string, config: unknown): string[] {
+  return configIssues(type, config).map((i) => i.message);
 }
 
 // Add a slide
@@ -125,7 +150,7 @@ presentationsRouter.post("/:id/slides", async (req: AuthedRequest, res) => {
     where: { id: req.params.id },
     data: { updatedAt: new Date() },
   });
-  res.json(slide);
+  res.json({ ...slide, configIssues: configAdvice(slide.type, safeParseConfig(slide.config)) });
 });
 
 // Update a slide
@@ -153,7 +178,11 @@ presentationsRouter.patch("/:id/slides/:slideId", async (req: AuthedRequest, res
   });
   if (result.count === 0) return res.status(404).json({ error: "Not found" });
   const slide = await prisma.slide.findUnique({ where: { id: req.params.slideId } });
-  res.json(slide);
+  res.json(
+    slide
+      ? { ...slide, configIssues: configAdvice(slide.type, safeParseConfig(slide.config)) }
+      : slide
+  );
 });
 
 // Delete a slide — a tombstone, not a row delete.
@@ -198,6 +227,15 @@ presentationsRouter.post("/:id/slides/reorder", async (req: AuthedRequest, res) 
   );
   res.json({ ok: true });
 });
+
+/** Config is stored as a JSON string; a corrupt one is treated as empty. */
+function safeParseConfig(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
 
 function defaultConfig(type: string) {
   switch (type) {

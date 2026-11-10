@@ -148,6 +148,16 @@ export default function Play() {
   const [feedback, setFeedback] = useState<SubmitFeedback | null>(null);
   const [ended, setEnded] = useState(false);
   const [finalEntries, setFinalEntries] = useState<LeaderboardEntry[]>([]);
+  // This player's OWN final standing, told to this socket alone.
+  //
+  // It cannot be derived from `finalEntries`: that list is the public top ten
+  // and it is capped there for a security reason, not a layout one — every row
+  // carries a `participantId`, and a `participantId` is the whole of what
+  // `participant:join` needs to take someone's seat. So the board stays ten
+  // rows and the server sends each phone two scalars about itself instead.
+  // Before this, everyone who finished 11th or below reached their own podium
+  // and was told nothing at all about how they had done.
+  const [myFinal, setMyFinal] = useState<{ rank: number; score: number } | null>(null);
   // Set only while the presenter has the leaderboard "on screen" — mirrors
   // the big-screen moment onto every phone at the same instant.
   const [leaderboardView, setLeaderboardView] = useState<LeaderboardEntry[] | null>(null);
@@ -334,10 +344,55 @@ export default function Play() {
       // M7: lock on the server's record, not on what this tab remembers.
       setAnswered(!!res.answered);
       setMyAnswer(res.answered ? (res.myAnswer ?? null) : null);
-      // Keep any feedback we already earned on this very slide — the ack has
-      // no points or rank, so clearing it would downgrade "Correct +992" to a
-      // bare lock. On any other slide it is stale and must go.
-      if (!sameSlide) setFeedback(null);
+      // Their graded result, restored from the server rather than from
+      // whatever this tab happens to remember.
+      //
+      // `myResult` is the submit ack's own shape — `{ isQuiz, correct,
+      // points, totalScore, rank }` — so a reconnecting phone comes back
+      // through the same path a fresh submission takes. Before this the only
+      // copy lived in component state, so a reload after answering returned a
+      // card with no "Correct", no "+1000" and no rank: strictly less than
+      // the phone had held a second earlier, and for a self-paced player
+      // (above) that card is now their ONLY result, so losing it loses the
+      // moment outright.
+      //
+      // Safe against the rank embargo, and safe by the same mechanism that
+      // has always made the submit ack's rank safe: nothing renders
+      // `feedback.rank` directly. `visibleRank` is the single reader, and for
+      // PRESENTER it still returns null until `standingsSeen` — which only
+      // `roomSawStandings` sets, from the broadcast or from a non-null
+      // `leaderboardView` on this very ack. Restoring a result therefore
+      // cannot hand a host-paced player a rank the room has not been shown.
+      //
+      // Three cases, and the distinction between the last two matters:
+      //   • an object — the server has a graded row; take it, it is fresher
+      //     than ours (its totalScore and rank are computed now).
+      //   • `null` — the server says this phone has no scored result on the
+      //     slide in front of it. Falls through to the pre-existing rule.
+      //   • `undefined` — a server that predates the field. Also falls
+      //     through, so this is a pure addition for old servers.
+      //
+      // The fall-through rule is the original one: keep any feedback we
+      // already earned on this very slide, because clearing it would
+      // downgrade "Correct +992" to a bare lock. On any other slide it is
+      // stale and must go.
+      if (res.myResult) {
+        setFeedback(res.myResult);
+        // And bank it for the self-paced walk-back. `participant:goto` acks
+        // with no `answered`/`myAnswer`/`myResult` at all, so this map is the
+        // ONLY thing that can answer "did I already do that one" for a slide
+        // the player steps back to. Until now the join ack never wrote to it,
+        // so a reloaded phone that stepped away and back got four live tiles
+        // over a scored answer — and `participant:submit` upserts (M7).
+        if (res.currentSlide?.id) {
+          answeredSlides.current.set(res.currentSlide.id, {
+            value: res.myAnswer ?? null,
+            feedback: res.myResult,
+          });
+        }
+      } else if (!sameSlide) {
+        setFeedback(null);
+      }
       setSubmitError("");
       // Release anything the outage left queued, but only when we came back to
       // the slide it belongs to. `setRetryQueueSlide` does not run until the
@@ -458,6 +513,14 @@ export default function Play() {
     const onEnded = (payload: any) => {
       setEnded(true);
       setFinalEntries(payload?.entries ?? []);
+      // `null` is a real answer here — a presenter socket, or a participant who
+      // never submitted anything and so has no position to hold. Only an older
+      // server leaves the fields off entirely, and that falls back below.
+      setMyFinal(
+        typeof payload?.myRank === "number"
+          ? { rank: payload.myRank, score: payload.myScore ?? 0 }
+          : null
+      );
     };
 
     socket.on("slide:changed", onSlideChanged);
@@ -644,12 +707,17 @@ export default function Play() {
   // a late connection error must never overwrite the podium with a dead end.
   if (ended) {
     const mine = finalEntries.find((e) => e.participantId === participantId.current);
-    const myRank = mine ? finalEntries.indexOf(mine) + 1 : null;
+    // The server's own figure first. Falling back to a position in the public
+    // board keeps this working against a server that predates the field — but
+    // that fallback is exactly the thing that could only ever answer for the
+    // top ten, so it is the fallback and not the source.
+    const myPlace =
+      myFinal ??
+      (mine ? { rank: finalEntries.indexOf(mine) + 1, score: mine.score } : null);
     return (
       <SessionEnded
         entries={finalEntries}
-        mine={mine}
-        myRank={myRank}
+        myPlace={myPlace}
         onLeave={() => {
           // The seat is what makes a reload land back in the room (B4). This
           // room is over, so holding the seat would send them straight back to
@@ -683,7 +751,30 @@ export default function Play() {
 
   if (leaderboardView) {
     return (
-      <PlayerLeaderboard entries={leaderboardView} meId={participantId.current} />
+      <PlayerLeaderboard
+        entries={leaderboardView}
+        meId={participantId.current}
+        // Scoped to the ROOM, not to the surface.
+        //
+        // `BarRaceLeaderboard` remembers the last board each `raceKey`
+        // rendered, in a module-scoped Map that outlives this component — by
+        // design, since the component only exists while the standings are up,
+        // which is what makes "the last board I drew" equal to "the board the
+        // room last saw". A constant key broke that equality across GAMES: a
+        // player who finishes one session and joins another in the same tab
+        // raced the new room's first standings out of the dead game's scores,
+        // which is a bar interpolating from a number that has nothing to do
+        // with this room (bars measured running hundreds of px off-screen).
+        //
+        // The join code is the most session-specific identifier this
+        // component has — a session id would be better, but neither the
+        // `participant:join` ack nor any participant broadcast carries one.
+        // Codes are minted per session (`genJoinCode`, random six digits,
+        // retried against the live table), so a second game is a second key
+        // in practice. The presenter surface has to agree on the scheme for
+        // the fix to be whole; its half is `BarRaceLeaderboard`'s own.
+        raceKey={`phone:${code ?? ""}`}
+      />
     );
   }
 
@@ -775,7 +866,17 @@ export default function Play() {
                 rank={visibleRank}
               />
             ) : feedback ? (
-              <FeedbackCard key="feedback" feedback={feedback} />
+              // `pacing` and `rank` are what let this card be a RESULT rather
+              // than a holding pattern in a self-paced deck, where no reveal
+              // is ever coming (R3 — see the note above `SelfPacedQuizResult`).
+              // `visibleRank`, never `feedback.rank`: the embargo is the
+              // shell's decision, exactly as it is for `RevealCard`.
+              <FeedbackCard
+                key="feedback"
+                feedback={feedback}
+                pacing={pacing}
+                rank={visibleRank}
+              />
             ) : answered ? (
               // Resumed onto a slide the server already has our answer for.
               // Deliberately ahead of AnswerInput: a tappable question here is
@@ -961,7 +1062,19 @@ function Lobby({
   );
 }
 
-function PlayerLeaderboard({ entries, meId }: { entries: LeaderboardEntry[]; meId: string }) {
+function PlayerLeaderboard({
+  entries,
+  meId,
+  raceKey,
+}: {
+  entries: LeaderboardEntry[];
+  meId: string;
+  /**
+   * Scopes the remembered board to the SESSION, not just to this surface —
+   * see the call site.
+   */
+  raceKey: string;
+}) {
   const mine = entries.find((e) => e.participantId === meId);
   const myRank = mine ? entries.indexOf(mine) + 1 : null;
   // The phone runs the same race the stage does, so it can spoil it the same
@@ -989,7 +1102,7 @@ function PlayerLeaderboard({ entries, meId }: { entries: LeaderboardEntry[]; meI
       <div className="relative z-10 flex-1 min-h-0 overflow-y-auto py-5">
         <BarRaceLeaderboard
           entries={entries}
-          raceKey="phone"
+          raceKey={raceKey}
           celebrateLeader
           onSettled={() => setRaceSettled(true)}
         />
@@ -1028,13 +1141,12 @@ function PlayerLeaderboard({ entries, meId }: { entries: LeaderboardEntry[]; meI
 
 function SessionEnded({
   entries,
-  mine,
-  myRank,
+  myPlace,
   onLeave,
 }: {
   entries: LeaderboardEntry[];
-  mine?: LeaderboardEntry;
-  myRank: number | null;
+  /** This player's own finish. `null` only for someone who never answered. */
+  myPlace: { rank: number; score: number } | null;
   onLeave: () => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
@@ -1057,16 +1169,19 @@ function SessionEnded({
           <Podium entries={entries} />
         </div>
       )}
-      {mine && (
+      {/* Gated on the player's own result, NOT on finding themselves in the
+       * board above — which is how 11th place used to end a whole game with a
+       * podium of strangers and no line of their own. */}
+      {myPlace && (
         <div className="relative z-10 flex flex-col items-center gap-1">
           <p className="text-ink-subtle text-footnote font-semibold uppercase track-label">
             You finished
           </p>
           <p className="nums font-display text-display font-bold text-accent leading-none">
-            #{myRank}
+            #{myPlace.rank}
           </p>
           <p className="text-ink-muted text-subhead">
-            <span className="nums font-bold text-ink">{mine.score}</span> points
+            <span className="nums font-bold text-ink">{myPlace.score.toLocaleString()}</span> points
           </p>
         </div>
       )}
@@ -1085,7 +1200,26 @@ function SessionEnded({
   );
 }
 
-function FeedbackCard({ feedback }: { feedback: SubmitFeedback }) {
+function FeedbackCard({
+  feedback,
+  pacing,
+  rank,
+}: {
+  feedback: SubmitFeedback;
+  /**
+   * Which kind of deck this is. The holding card at the bottom of this
+   * function is correct for PRESENTER and was never right for AUDIENCE — see
+   * the note above `SelfPacedQuizResult`.
+   */
+  pacing: "PRESENTER" | "AUDIENCE";
+  /**
+   * This player's place in the room, or null while it is still embargoed.
+   * The shell's `visibleRank`, and deliberately NOT read off `feedback.rank`
+   * — same reason `RevealCard` takes it as a prop: the shell is the only
+   * thing that knows whether the room has had its standings moment yet.
+   */
+  rank: number | null;
+}) {
   if (!feedback.isQuiz) {
     return (
       <motion.div
@@ -1104,6 +1238,13 @@ function FeedbackCard({ feedback }: { feedback: SubmitFeedback }) {
     );
   }
 
+  // A self-paced deck has no shared screen moment to protect, so the whole
+  // reason for the withholding below does not apply to it. Everything after
+  // this line is the PRESENTER card, unchanged.
+  if (pacing === "AUDIENCE") {
+    return <SelfPacedQuizResult feedback={feedback} rank={rank} />;
+  }
+
   // Before the reveal we deliberately do NOT say whether they were right —
   // that moment belongs to the shared screen, all at once.
   return (
@@ -1119,6 +1260,116 @@ function FeedbackCard({ feedback }: { feedback: SubmitFeedback }) {
       </span>
       <p className="font-display text-title2 font-bold">Locked in</p>
       <p className="text-ink-subtle text-subhead">Hold tight — answer coming up.</p>
+    </motion.div>
+  );
+}
+
+// R3 — the self-paced player's result, on their own phone, at the moment they
+// earn it.
+//
+// `FeedbackCard` withholds the outcome until the reveal, and for a
+// presenter-paced deck that is exactly right: the result belongs to the shared
+// screen, delivered to the whole room on one frame, and a phone that says it
+// first spends that frame. A SELF-PACED deck has no such frame.
+// `armRevealTimer` returns early for AUDIENCE pacing by design and with a
+// comment saying why — a room whose premise is that everyone is on a different
+// slide has no instant a reveal could land on — and the "everyone present has
+// answered" early reveal cannot be relied on for the same reason. So the card
+// that was written to hold for a few seconds held forever.
+//
+// Measured before this existed, on an AUDIENCE deck with three players: Ana
+// answered Q1 correctly, the server scored her 1000 and `get-leaderboard` put
+// her at #1, and her phone read "Locked in / Hold tight — answer coming up."
+// at t=2s, 10s, 25s and 45s. Nothing in the deck would ever have changed it.
+// The only thing that patched it was the host calling up the standings, and
+// the moment the board came down the card reverted.
+//
+// This is the same exception `visibleRank` already makes one level down,
+// applied at the level that decides whether anything is said at all.
+//
+// WHAT IT DOES NOT SHOW: the answer key. It draws no options, no correct
+// slot, nothing from the slide — only the four numbers this player's own
+// submit ack handed back about themselves. `RevealCard` is still the only
+// thing that renders the key, and it still mounts only when the server has
+// actually revealed the slide to this phone.
+function SelfPacedQuizResult({
+  feedback,
+  rank,
+}: {
+  feedback: SubmitFeedback;
+  rank: number | null;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const wasRight = !!feedback.correct;
+  // Read once, the way the rest of the file does. Under reduced motion the
+  // card still arrives and still says everything it says — only the travel
+  // goes (DESIGN.md §6), so the scale is pinned and the entrance becomes the
+  // opacity-only spring. `burstFrom` already no-ops for these readers.
+  const reduced = useRef<boolean | null>(null);
+  if (reduced.current === null) reduced.current = prefersReducedMotion();
+
+  useEffect(() => {
+    if (!wasRight) return;
+    const id = window.setTimeout(() => burstFrom(rootRef.current, 70), 260);
+    return () => window.clearTimeout(id);
+  }, [wasRight]);
+
+  return (
+    <motion.div
+      ref={rootRef}
+      initial={{ opacity: 0, scale: reduced.current ? 1 : 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0 }}
+      transition={reduced.current ? spring.effect : spring.default}
+      className="flex flex-col items-center gap-4 text-center py-10"
+    >
+      {/* DESIGN.md §5: correct is accent + ✓ + glow, incorrect is desaturate
+       * + dim + ✕ + scale down. Never red/green. The disc is `FeedbackCard`'s
+       * own shape — the same 80px pill the "Answer locked in" card uses — so
+       * this reads as that card having resolved rather than as a new screen. */}
+      <span
+        className={cn(
+          "grid place-items-center w-20 h-20 rounded-pill",
+          wasRight
+            ? "bg-accent text-accent-ink text-large-title font-bold shadow-glow"
+            : "bg-surface-2 shadow-line text-ink-subtle text-title1"
+        )}
+      >
+        <span className="leading-none">{wasRight ? "✓" : "✕"}</span>
+      </span>
+
+      {/* Deliberately `RevealCard`'s ledger, line for line and class for
+       * class, rather than a third vocabulary for the same four facts: the
+       * verdict, the points this question was worth, the running total, and
+       * the rank. A player who meets both cards in one session — a self-paced
+       * deck whose host does reveal a slide by hand — should not have to
+       * learn the result twice. */}
+      <div>
+        <p
+          className={cn(
+            "font-display text-title1 font-bold",
+            wasRight ? "text-accent" : "text-ink-muted"
+          )}
+        >
+          {wasRight ? "Correct" : "Not this time"}
+        </p>
+        {wasRight && (
+          <p className="nums text-accent text-title3 font-bold mt-0.5">+{feedback.points}</p>
+        )}
+        <p className="text-ink-subtle text-subhead mt-2">
+          <span className="nums font-bold text-ink-muted">{feedback.totalScore}</span> pts
+          {rank !== null && (
+            <>
+              {" · "}rank <span className="nums font-bold text-ink-muted">#{rank}</span>
+            </>
+          )}
+        </p>
+      </div>
+
+      {/* No "tap Next" line. The self-paced nav bar is rendered 40px below
+       * this card with the live slide counter in it, and two spellings of one
+       * fact is the defect P1 exists to prevent — the same reason the header
+       * drops its "3 of 12" in this pacing. */}
     </motion.div>
   );
 }

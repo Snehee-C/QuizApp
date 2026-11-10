@@ -1,4 +1,5 @@
-import type { SlideServerDef, RawResponse } from "./types.js";
+import type { SlideServerDef, RawResponse, ConfigIssue } from "./types.js";
+import { checkStringList } from "./types.js";
 
 // Ranking — each player submits a permutation of the item indices, best first.
 //
@@ -23,6 +24,11 @@ export const ranking: SlideServerDef = {
     }
     return true;
   },
+
+  // A ballot must be a permutation of `items`, so the item list IS the slide:
+  // with fewer than two entries there is nothing to order.
+  validateConfig: (config): ConfigIssue[] =>
+    checkStringList(config, "items", { min: 2, label: "the items to rank" }),
 
   aggregate(config, responses: RawResponse[]) {
     const items: string[] = config?.items ?? [];

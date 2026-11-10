@@ -1,4 +1,5 @@
-import type { SlideServerDef } from "./types.js";
+import type { SlideServerDef, ConfigIssue } from "./types.js";
+import { checkStringList } from "./types.js";
 
 // Spin the wheel (server half).
 //
@@ -17,6 +18,11 @@ import type { SlideServerDef } from "./types.js";
 export const spinWheel: SlideServerDef = {
   type: "SPIN_WHEEL",
   interactive: false,
+
+  // The entries ARE the wheel; with fewer than two there is nothing to draw
+  // between.
+  validateConfig: (config): ConfigIssue[] =>
+    checkStringList(config, "entries", { min: 2, label: "the names on the wheel" }),
 
   // Required by the contract but unreachable: a non-interactive slide never
   // accumulates responses. Returning the empty shape rather than throwing

@@ -1,4 +1,5 @@
-import type { SlideServerDef, RawResponse } from "./types.js";
+import type { SlideServerDef, RawResponse, ConfigIssue } from "./types.js";
+import { checkImageUrl, checkOptionalString } from "./types.js";
 
 // Pin on image. One tap per participant, sent as { x, y } normalised to 0..1
 // against the image's own box, so the server never needs to know — or trust —
@@ -16,6 +17,14 @@ export const pinOnImage: SlideServerDef = {
   interactive: true,
 
   validate: (_config, value) => isUnitPoint(value),
+
+  // The image is the whole slide: every submitted pin is a coordinate
+  // normalised against it, so without one there is nothing to pin on and
+  // nothing the coordinates mean.
+  validateConfig: (config): ConfigIssue[] => [
+    ...checkImageUrl(config, "imageUrl", "there is nothing to pin on without it"),
+    ...checkOptionalString(config, "caption"),
+  ],
 
   aggregate(_config, responses: RawResponse[]) {
     const points: Pt[] = [];

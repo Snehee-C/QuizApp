@@ -96,7 +96,7 @@ const KNOWN_KEYS = {
 /** Answer-key keys. On a type that cannot score, their presence is a mismodel. */
 const ANSWER_KEYS = ["correctIndices", "correctIndex", "acceptedAnswers", "correctValue", "tolerance"];
 
-const ENVELOPE_KEYS = ["formatVersion", "title", "theme", "pacing", "filterMode", "slides"];
+const ENVELOPE_KEYS = ["formatVersion", "title", "theme", "pacing", "filterMode", "timeScale", "slides"];
 const SLIDE_KEYS = ["order", "type", "question", "config", "notes"];
 
 /* ───────────────────────────── Findings ───────────────────────────── */

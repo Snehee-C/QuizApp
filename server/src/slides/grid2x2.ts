@@ -1,4 +1,5 @@
-import type { SlideServerDef, RawResponse } from "./types.js";
+import type { SlideServerDef, RawResponse, ConfigIssue } from "./types.js";
+import { checkOptionalString } from "./types.js";
 
 // 2x2 grid / matrix. One dot per participant on a two-axis plane, sent as
 // { x, y } with both axes normalised to 0..1 and y running BOTTOM->TOP.
@@ -22,6 +23,13 @@ export const grid2x2: SlideServerDef = {
   interactive: true,
 
   validate: (_config, value) => isUnitPoint(value),
+
+  // Nothing here is required — an unlabelled grid still works — but a label
+  // that is not text renders as "[object Object]" on the projector.
+  validateConfig: (config): ConfigIssue[] =>
+    ["xLabelLow", "xLabelHigh", "yLabelLow", "yLabelHigh"].flatMap((k) =>
+      checkOptionalString(config, k)
+    ),
 
   aggregate(_config, responses: RawResponse[]) {
     const points: Pt[] = [];

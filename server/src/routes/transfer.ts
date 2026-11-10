@@ -8,7 +8,8 @@
 import { Router } from "express";
 import { prisma } from "../db.js";
 import { requireAuth, type AuthedRequest } from "../auth.js";
-import { VALID_SLIDE_TYPES } from "../slides/registry.js";
+import { VALID_SLIDE_TYPES, configIssues } from "../slides/registry.js";
+import { clampTimeScale, DEFAULT_TIME_SCALE } from "../timeScale.js";
 
 export const transferRouter = Router();
 
@@ -45,6 +46,18 @@ interface DeckDoc {
   theme: string;
   pacing: string;
   filterMode: string;
+  /**
+   * The relaxed-timing accommodation (DESIGN.md §6) — a deck-level multiplier
+   * on every countdown. Added after the format shipped, so OLDER FILES DO NOT
+   * HAVE IT and the import side falls back to the default rather than
+   * refusing. `formatVersion` is deliberately NOT bumped: an optional field is
+   * compatible in both directions. An old server reading a new file ignores an
+   * unknown key (validateDeck never enumerated the envelope), and this server
+   * reading an old file defaults it — so bumping would have broken every
+   * exchange that currently works in order to describe a change that breaks
+   * none of them.
+   */
+  timeScale: number;
   slides: DeckSlide[];
 }
 
@@ -54,6 +67,7 @@ interface ImportDeck {
   theme: string;
   pacing: string;
   filterMode: string;
+  timeScale: number;
   slides: { order: number; type: string; question: string; config: string; notes: string }[];
 }
 
@@ -102,6 +116,9 @@ transferRouter.get("/:id/export", async (req: AuthedRequest, res) => {
     theme: deck.theme,
     pacing: deck.pacing,
     filterMode: deck.filterMode,
+    // Clamped on the way OUT as well as in, so a row that predates the bounds
+    // cannot put an out-of-range value into a file other people will import.
+    timeScale: clampTimeScale(deck.timeScale),
     // config is parsed, not passed through as a string: the file should be
     // readable and hand-editable, and a double-encoded blob is neither.
     slides: deck.slides.map((s) => ({
@@ -122,7 +139,7 @@ transferRouter.get("/:id/export", async (req: AuthedRequest, res) => {
 
 type Validation =
   | { ok: true; deck: ImportDeck }
-  | { ok: false; error: string; rejectedTypes?: string[] };
+  | { ok: false; error: string; rejectedTypes?: string[]; slideErrors?: string[] };
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -178,6 +195,19 @@ function validateDeck(raw: unknown): Validation {
     return { ok: false, error: `filterMode must be one of ${VALID_FILTER_MODES.join(", ")}.` };
   }
 
+  // Absent on every file exported before this field existed, which is the
+  // common case and must not be a refusal — fall back to the same default the
+  // database column has. Present but not a number IS a refusal, in keeping
+  // with the rest of the envelope: silently rewriting a timing accommodation
+  // to 1 is the exact failure this field was added to stop.
+  let timeScale = DEFAULT_TIME_SCALE;
+  if (raw.timeScale !== undefined) {
+    if (typeof raw.timeScale !== "number" || !Number.isFinite(raw.timeScale)) {
+      return { ok: false, error: "timeScale must be a number." };
+    }
+    timeScale = clampTimeScale(raw.timeScale);
+  }
+
   const rawSlides = raw.slides === undefined ? [] : raw.slides;
   if (!Array.isArray(rawSlides)) return { ok: false, error: "slides must be a list." };
   if (rawSlides.length > MAX_SLIDES) {
@@ -209,6 +239,8 @@ function validateDeck(raw: unknown): Validation {
   }
 
   const slides: ImportDeck["slides"] = [];
+  /** Per-slide config faults, collected across the whole file. */
+  const configProblems: string[] = [];
   for (let i = 0; i < rawSlides.length; i++) {
     const entry = rawSlides[i];
     const at = `Slide ${i + 1}`;
@@ -248,14 +280,43 @@ function validateDeck(raw: unknown): Validation {
       };
     }
 
+    // Ask the slide's own module whether this config is playable. Everything
+    // above this line is the ENVELOPE — version, types, lengths, byte sizes —
+    // and for a long time it was the whole of the import check: a deck whose
+    // answer key pointed past the end of its option list, whose scale had no
+    // steps, or whose quiz had no answer at all imported with a 200 and failed
+    // in front of a room.
+    //
+    // A deck FILE is a finished artifact, not a slide someone is still
+    // writing, so BOTH kinds of issue are refused here — an unfilled required
+    // field in an uploaded deck is not "not yet", it is "never". (The editor's
+    // save path cannot take that line; see presentations.ts.)
+    for (const issue of configIssues(entry.type as string, config)) {
+      configProblems.push(`${at} (${entry.type}): ${issue.message}`);
+    }
+
     // Order comes from position in the file, not from the file's own `order`
     // field, which can be duplicated, negative or sparse.
     slides.push({ order: i, type: entry.type as string, question, config: serialised, notes });
   }
 
+  // Reported together, like the unknown-type pass above: a host fixing one
+  // broken slide per upload is the experience this whole function exists to
+  // avoid.
+  if (configProblems.length > 0) {
+    return {
+      ok: false,
+      error:
+        configProblems.length === 1
+          ? "One slide in this deck is not playable as configured."
+          : `${configProblems.length} problems in this deck would make slides unplayable.`,
+      slideErrors: configProblems,
+    };
+  }
+
   return {
     ok: true,
-    deck: { title: title.trim() || "Imported deck", theme, pacing, filterMode, slides },
+    deck: { title: title.trim() || "Imported deck", theme, pacing, filterMode, timeScale, slides },
   };
 }
 
@@ -265,6 +326,8 @@ transferRouter.post("/import", async (req: AuthedRequest, res) => {
     return res.status(400).json({
       error: result.error,
       ...(result.rejectedTypes ? { rejectedTypes: result.rejectedTypes } : {}),
+      // One line per broken slide, already prefixed with which slide it is.
+      ...(result.slideErrors ? { slideErrors: result.slideErrors } : {}),
     });
   }
 
@@ -277,6 +340,7 @@ transferRouter.post("/import", async (req: AuthedRequest, res) => {
       theme: deck.theme,
       pacing: deck.pacing,
       filterMode: deck.filterMode,
+      timeScale: deck.timeScale,
       // An import is a deck of your own, never a template — publishing is a
       // separate, deliberate act.
       isTemplate: false,

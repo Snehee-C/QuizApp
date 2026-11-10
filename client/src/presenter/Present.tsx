@@ -711,7 +711,14 @@ export default function Present() {
               <BarRaceLeaderboard
                 entries={leaderboard}
                 visibleRows={5}
-                raceKey="stage"
+                // Scoped to the SESSION, not the surface. A constant key here
+                // meant the component's remembered board outlived the game it
+                // came from: end a session, start another on the same deck in
+                // the same tab, and the new game's first standings opened in
+                // the dead game's scores with the bars off the side of the
+                // screen. `sessionId` is the right grain — a join code can in
+                // principle come round again, a session id cannot.
+                raceKey={`stage:${sessionId ?? joinCode ?? ""}`}
                 celebrateLeader
                 stage
               />

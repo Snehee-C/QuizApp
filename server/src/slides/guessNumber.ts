@@ -1,5 +1,14 @@
 import type { SlideServerDef, RawResponse } from "./types.js";
-import { speedPoints, stripAnswerKey } from "./types.js";
+import type { ConfigIssue } from "./types.js";
+import {
+  speedPoints,
+  stripAnswerKey,
+  broken,
+  incomplete,
+  checkOptionalBool,
+  checkOptionalString,
+  checkOptionalFiniteNumber,
+} from "./types.js";
 
 // Guess the number — players submit a number, the closest wins. Always
 // quiz-scored: a "closest guess" round with no scoreboard has no point, so
@@ -22,6 +31,32 @@ export const guessNumber: SlideServerDef = {
   // NaN and Infinity are rejected here rather than in aggregate() because a
   // single Infinity would stretch the stage's number line into uselessness.
   validate: (_config, value) => typeof value === "number" && Number.isFinite(value),
+
+  // `correctValue` is the number being guessed and the only thing grade() can
+  // measure a guess against: without it grade() returns 0 for everyone, on a
+  // type that is always scored.
+  validateConfig(config): ConfigIssue[] {
+    const issues: ConfigIssue[] = [
+      ...checkOptionalString(config, "unit"),
+      ...checkOptionalBool(config, "isQuiz"),
+      ...checkOptionalFiniteNumber(config, "tolerance"),
+      ...checkOptionalFiniteNumber(config, "timeLimitSec"),
+    ];
+    if (config?.correctValue === undefined) {
+      issues.push(
+        incomplete(
+          "config.correctValue is missing — it is the number being guessed, and without it every guess scores 0."
+        )
+      );
+    } else if (typeof config.correctValue !== "number" || !Number.isFinite(config.correctValue)) {
+      issues.push(
+        broken(
+          `config.correctValue must be a finite number, got ${JSON.stringify(config.correctValue) ?? "nothing"}.`
+        )
+      );
+    }
+    return issues;
+  },
 
   aggregate(config, responses: RawResponse[]) {
     const guesses: number[] = [];

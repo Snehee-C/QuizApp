@@ -13,6 +13,7 @@ import {
 } from "../slides/registry.js";
 import { registerQaHandlers } from "./qa.js";
 import { filterNickname, filterText, type FilterMode } from "../services/contentFilter.js";
+import { clampTimeScale } from "../timeScale.js";
 
 // In-memory live state per active session (keyed by joinCode).
 interface LiveSession {
@@ -594,6 +595,57 @@ interface LeaderboardEntryRow {
   avatar: number;
 }
 
+/**
+ * End the room — per socket, because the podium owes each phone one fact the
+ * shared payload cannot carry.
+ *
+ * `entries` is capped at the public top ten, and that cap is not editorial:
+ * every row carries a `participantId`, which is the whole of what
+ * `participant:join` needs to assume somebody's identity and overwrite their
+ * answers. So the board a phone receives must stay exactly as small as it is.
+ *
+ * But the client derived "where did I come?" by finding ITSELF in that board —
+ * so everyone who finished 11th or below was shown a podium with no final
+ * standing at all. The fix is not more rows; it is two scalars about the
+ * receiving socket itself, which leak nothing about anybody else.
+ *
+ * Stamped per socket in the same way `qa:updated` is (qa.ts `broadcast`),
+ * reading each socket's own `socket.data` rather than trusting anything in the
+ * payload. Walking the room rather than `participantSockets` keeps the set of
+ * recipients byte-identical to the `io.to(joinCode)` broadcast this replaced:
+ * host windows are in the room too, and still get the event — with both
+ * scalars null, since a presenter has no standing in its own quiz.
+ */
+async function emitSessionEnded(
+  io: Server,
+  joinCode: string,
+  entries: LeaderboardEntryRow[],
+  fullEntries: LeaderboardEntryRow[]
+) {
+  // Rank is positional over EVERYONE, 1-based — the same arithmetic
+  // `participant:join`'s `myResult.rank` already uses, so a phone cannot be
+  // told one position on reconnect and a different one on the podium.
+  const standing = new Map<string, { rank: number; score: number }>();
+  fullEntries.forEach((e, i) => standing.set(e.participantId, { rank: i + 1, score: e.score }));
+
+  const sockets = await io.in(joinCode).fetchSockets();
+  for (const sock of sockets) {
+    const pid =
+      sock.data?.role === "participant"
+        ? (sock.data.participantId as string | undefined)
+        : undefined;
+    // Absent from the board means this person submitted nothing all session,
+    // so there is no standing to report — null rather than an invented last
+    // place among everyone else who also never played.
+    const mine = pid ? standing.get(pid) : undefined;
+    sock.emit("session:ended", {
+      entries,
+      myRank: mine?.rank ?? null,
+      myScore: mine?.score ?? null,
+    });
+  }
+}
+
 // Reveal a quiz slide to the whole room: broadcast the correct answer(s) and the
 // current aggregate, then refresh the presenter's leaderboard. One-shot per slide
 // (tracked via revealedSlides) — happens on time-up or once everyone has answered.
@@ -880,7 +932,7 @@ function parseIdList(raw: string): string[] {
  * this fixes.
  */
 function arrivalKey(participantId: string, slideId: string) {
-  return `${participantId} ${slideId}`;
+  return `${participantId}\u0000${slideId}`;
 }
 
 function markArrival(s: LiveSession, participantId: string, slideId: string | null) {
@@ -1315,7 +1367,17 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   // key they happened to press.
   function sessionVanished(joinCode: string, cb?: Function) {
     live.delete(joinCode);
-    io.to(joinCode).emit("session:ended", { entries: [] });
+    // No board and no standings: the session row is gone, so there is nothing
+    // to rank anyone against. Same event, same shape, both scalars null.
+    //
+    // Not awaited — both callers are telling the HOST its deck has vanished and
+    // that refusal must not wait on a room walk. The two land on different
+    // sockets, so nothing observes the order. Failures are swallowed loudly
+    // rather than left to the process-level handler: a room we could not reach
+    // is already gone.
+    emitSessionEnded(io, joinCode, [], []).catch((err) =>
+      console.error("[session:ended] failed to notify room", joinCode, err)
+    );
     reject(cb, "SESSION_GONE", "This session no longer exists");
   }
 
@@ -1605,10 +1667,11 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       data: { status: "ENDED", endedAt: new Date() },
     });
     cancelLeaderboardPush(s);
-    const { entries, stageEntries } = await computeLeaderboard(s);
-    // The broadcast is the room's — participant-scoped. The ack is the
-    // presenter's, and the podium it draws is the whole room's final board.
-    io.to(joinCode).emit("session:ended", { entries });
+    const { entries, stageEntries, fullEntries } = await computeLeaderboard(s);
+    // The broadcast is the room's — participant-scoped, and stamped per socket
+    // with that phone's own final standing. The ack is the presenter's, and the
+    // podium it draws is the whole room's final board.
+    await emitSessionEnded(io, joinCode, entries, fullEntries);
     cb?.({ ok: true, entries: stageEntries });
   });
 
@@ -2090,12 +2153,6 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       s.revealTimer = null;
     }
   });
-}
-
-/** A host can stretch every countdown, but not to the point of absurdity. */
-function clampTimeScale(v: unknown): number {
-  const n = typeof v === "number" && Number.isFinite(v) ? v : 1;
-  return Math.max(1, Math.min(3, n));
 }
 
 /** The countdown this session actually runs for a slide. */

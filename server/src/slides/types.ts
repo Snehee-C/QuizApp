@@ -25,6 +25,129 @@ export interface Graded {
   points: number;
 }
 
+/**
+ * Something wrong with an authored config, and how wrong.
+ *
+ *   "broken"     — the value contradicts itself or the rest of the config, and
+ *                  is not a state an author passes THROUGH on the way to a
+ *                  finished slide: a correct index past the end of the option
+ *                  list, a scale whose max is below its min, two correct
+ *                  answers on a single-select. These can only ever be refused.
+ *
+ *   "incomplete" — a required field that has not been filled in yet. Blank is
+ *                  exactly what a half-authored slide looks like, so this is
+ *                  only a refusal where the deck is a FINISHED artifact (an
+ *                  uploaded file). The editor must stay able to save a slide
+ *                  the author is still writing.
+ *
+ * The split is load-bearing, not cosmetic: the server's own `defaultConfig()`
+ * creates RANKING and PIN_ON_IMAGE slides with an empty config, so treating
+ * "incomplete" as a hard error everywhere would make those types impossible
+ * to create.
+ */
+export type ConfigIssueKind = "broken" | "incomplete";
+
+export interface ConfigIssue {
+  kind: ConfigIssueKind;
+  /** Written for the host who has to fix the deck, not for a log. */
+  message: string;
+}
+
+export const broken = (message: string): ConfigIssue => ({ kind: "broken", message });
+export const incomplete = (message: string): ConfigIssue => ({ kind: "incomplete", message });
+
+/** How a wrong value is described back to the author. */
+export function describe(v: unknown): string {
+  if (v === null) return "null";
+  if (v === undefined) return "nothing";
+  if (Array.isArray(v)) return "an array";
+  if (typeof v === "object") return "an object";
+  return JSON.stringify(v);
+}
+
+/**
+ * The shared shape behind `options` / `items` / `entries` / `bullets`: a list
+ * of non-blank strings that the slide renders verbatim.
+ */
+export function checkStringList(
+  config: any,
+  key: string,
+  opts: { min: number; label: string }
+): ConfigIssue[] {
+  const v = config?.[key];
+  if (v === undefined) {
+    return [incomplete(`config.${key} is missing — ${opts.label} is what this slide renders.`)];
+  }
+  if (!Array.isArray(v)) {
+    return [broken(`config.${key} must be an array of strings, got ${describe(v)}.`)];
+  }
+  const issues: ConfigIssue[] = [];
+  for (let i = 0; i < v.length; i++) {
+    if (typeof v[i] !== "string") {
+      issues.push(broken(`config.${key}[${i}] must be a string, got ${describe(v[i])}.`));
+    } else if (v[i].trim() === "") {
+      issues.push(incomplete(`config.${key}[${i}] is blank — it renders as an empty slot.`));
+    }
+  }
+  if (v.length < opts.min) {
+    issues.push(
+      incomplete(
+        `config.${key} has ${v.length} entr${v.length === 1 ? "y" : "ies"}; this type needs at least ${opts.min}.`
+      )
+    );
+  }
+  return issues;
+}
+
+/** A field that may be absent, but must be text when present. */
+export function checkOptionalString(config: any, key: string): ConfigIssue[] {
+  const v = config?.[key];
+  if (v === undefined || typeof v === "string") return [];
+  return [broken(`config.${key} must be a string, got ${describe(v)}.`)];
+}
+
+/** A field that may be absent, but must be a real boolean when present. */
+export function checkOptionalBool(config: any, key: string): ConfigIssue[] {
+  const v = config?.[key];
+  if (v === undefined || typeof v === "boolean") return [];
+  return [broken(`config.${key} must be true or false, got ${describe(v)}.`)];
+}
+
+/** A field that may be absent, but must be a finite number when present. */
+export function checkOptionalFiniteNumber(config: any, key: string): ConfigIssue[] {
+  const v = config?.[key];
+  if (v === undefined) return [];
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    return [broken(`config.${key} must be a finite number, got ${describe(v)}.`)];
+  }
+  return [];
+}
+
+/**
+ * An image the slide cannot render is the same as no image at all, and the
+ * failure only shows up on the projector. Accepts what a browser will actually
+ * fetch from this app: absolute http(s), an inline data image, or a
+ * same-origin path.
+ */
+export function checkImageUrl(config: any, key: string, why: string): ConfigIssue[] {
+  const v = config?.[key];
+  if (v === undefined || (typeof v === "string" && v.trim() === "")) {
+    return [incomplete(`config.${key} is missing — ${why}.`)];
+  }
+  if (typeof v !== "string") {
+    return [broken(`config.${key} must be a string URL, got ${describe(v)}.`)];
+  }
+  const url = v.trim();
+  if (!/^(https?:\/\/|data:image\/|\/)/i.test(url)) {
+    return [
+      broken(
+        `config.${key} will not load: it must start with http(s)://, data:image/ or "/" (same-origin).`
+      ),
+    ];
+  }
+  return [];
+}
+
 export interface SlideServerDef {
   /** Wire value, e.g. "RANKING". Must match the client module's `type`. */
   type: string;
@@ -45,6 +168,22 @@ export interface SlideServerDef {
 
   /** Reject malformed values before they reach the database. */
   validate?: (config: any, value: unknown) => boolean;
+
+  /**
+   * Reject a malformed CONFIG before it reaches the database — the authoring
+   * half of `validate()`, which only ever sees a player's submitted value.
+   *
+   * Everything above assumes the config is sane and a deck that is already
+   * stored is already too late: `validate()` rejecting every submission, or
+   * `grade()` marking the wrong pick correct, is discovered in front of a
+   * room. Each type owns this next to its own `validate()`/`grade()` so the
+   * rule and the thing it protects cannot drift apart.
+   *
+   * Returns every problem found, not the first — an author fixing one at a
+   * time and re-uploading is the behaviour this is meant to replace. An empty
+   * array means the config is playable.
+   */
+  validateConfig?: (config: any) => ConfigIssue[];
 
   /** Turn raw responses into the compact payload the stage renders. */
   aggregate: (config: any, responses: RawResponse[]) => any;

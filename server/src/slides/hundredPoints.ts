@@ -1,4 +1,5 @@
-import type { SlideServerDef, RawResponse } from "./types.js";
+import type { SlideServerDef, RawResponse, ConfigIssue } from "./types.js";
+import { broken, checkStringList, describe } from "./types.js";
 
 // 100 points — each player splits a fixed budget across the options and
 // submits the per-option allocation, in config order.
@@ -22,6 +23,24 @@ export const hundredPoints: SlideServerDef = {
     // The budget must balance exactly. A partial allocation would silently
     // weigh that player less than everyone else in the averages.
     return sum === budget;
+  },
+
+  // `total` is the budget validate() requires every ballot to spend EXACTLY,
+  // and each entry must be a non-negative integer — so a budget of 0 or less
+  // is either unreachable or forces an all-zero allocation.
+  validateConfig(config): ConfigIssue[] {
+    const issues: ConfigIssue[] = [
+      ...checkStringList(config, "options", { min: 2, label: "the options to split points across" }),
+    ];
+    const total = config?.total;
+    if (total !== undefined && (!Number.isInteger(total) || (total as number) <= 0)) {
+      issues.push(
+        broken(
+          `config.total must be a whole number above 0, got ${describe(total)}. It is the budget every player has to spend exactly.`
+        )
+      );
+    }
+    return issues;
   },
 
   aggregate(config, responses: RawResponse[]) {

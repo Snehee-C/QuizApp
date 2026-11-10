@@ -60,6 +60,55 @@ assumption usually announces itself.
 
 ## Known gaps
 
+### Config validation stops at the importer
+Server-side per-slide config validation now rejects a broken deck on import
+(12 of 13 adversarial cases, was 0 of 13). Two places it deliberately does not
+reach yet:
+
+- **The editor never refuses.** `presentations.ts` returns `configIssues:
+  string[]` in a **200** body rather than a 400, because the editor autosaves
+  on every keystroke fire-and-forget: a 400 would drop the edit server-side
+  while the editor rendered it as saved, which is worse than storing a
+  half-finished slide. Surfacing those advisories in the editor is the missing
+  client half; only after that can the route refuse.
+- **A 400-character option label still imports.** A cap needs a number agreed
+  with whoever owns the stage fitter (it binary-searches down to the 26px
+  `ANSWER_FLOOR` and then stops, so a long label is free to exceed
+  `MAX_LINES`), not one invented at the validator.
+
+### The authoring skill and the app disagree about a new slide
+`.claude/skills/quiz-deck/validate-deck.mjs` flags the server's own
+`defaultConfig()` output as an ERROR: a new `MULTIPLE_CHOICE` ships
+`{correctIndices:[0], isQuiz:false}`, and new `RANKING`/`PIN_ON_IMAGE` slides
+ship `{}`. The documented authoring tool rejects what the product creates.
+The server's rule set deliberately omits those checks (porting them wholesale
+would make three slide types impossible to create); the skill should be
+reconciled to match rather than the other way round.
+
+### `myResult.rank` has a sentinel where it wants a null
+`participant:join`'s `myResult.rank` is `fullEntries.findIndex(...) + 1`, which
+yields **0** — not a rank, not `null` — for a participant with no responses.
+`session:ended`'s newer `myRank` uses `null` for the same condition. Two
+spellings of "no position", and the wrong one is the older and more-used of the
+two. Not changed because a client may key off it.
+
+### The self-paced early reveal is not pacing-gated
+`armRevealTimer` returns early for AUDIENCE decks by design, but the
+"everyone present has answered" early reveal in `participant:submit` is not
+gated and *does* fire on self-paced decks — measured, with a single present
+participant tripping it. It is harmless today (the phone's own result card
+already covers the case, and `RevealCard` taking over is strictly more
+informative), but "a self-paced deck never reveals" is stated in several
+comments and is not true.
+
+### A slide with an empty question is presentable
+Accepted by the editor, by import and by the skill's validator; the stage
+renders a blank question. `question` is a slide field rather than config, and
+the create route explicitly writes `question || ""`, so every newly created
+slide would fail a non-empty rule — it needs to fire on present/import, not on
+save.
+
+
 ### A reloading player loses their own result
 Pre-existing, surfaced while building the rank embargo. `feedback` is
 component state, and the join ack carries `answered`/`myAnswer` but no graded
@@ -78,6 +127,15 @@ still chooses when the room's half of it is shown.
 stage remembers. The bar race now runs over the whole board it receives and
 slices only the render, so this is purely a wire limit — a larger board (or a
 dedicated "previous standings" frame) gets it for free.
+
+The wire limit is deliberate and is **not** a candidate for simply raising:
+every row carries a `participantId`, which is the whole of what
+`participant:join` needs to take that seat (see Security, above). Presenter-only
+frames widen to 200 because the host already holds the roster; participant
+frames stay at ten. The player-facing half of this is now answered separately —
+`session:ended` carries a per-socket `myRank`/`myScore`, so finishing 11th or
+below gives a real result on the podium even though the board above it cannot
+name you.
 
 Status: **done** — a larger board, scoped. Presenter-facing frames carry up to
 `STAGE_LEADERBOARD_LIMIT` (200) rows; every participant-facing board stays at
@@ -106,12 +164,31 @@ runtime rather than at import, so `0` is accepted and silently rewritten; an
 unknown `theme` falls back silently; `timeScale` is missing from the envelope
 so it does not round-trip.
 
+Status: **done.** Each slide type now carries a `validateConfig()` next to its
+own `validate()`/`grade()` in `server/src/slides/*`, dispatched through the
+registry, and import runs it per slide — 12 of 13 adversarial decks now
+rejected with a per-slide reason, where 0 of 13 were before, and the known-good
+10-slide deck still imports. `timeScale` round-trips (export carries it,
+import clamps it, absence defaults — `formatVersion` deliberately not bumped,
+since an additive optional key is compatible in both directions). Surveyed
+against the live DB: of 539 decks, the 40 that would now fail re-import are all
+QA probe decks. What this does **not** cover is in "Config validation stops at
+the importer" above.
+
 ### Self-paced players get no answer feedback
 `3271aff` stopped AUDIENCE decks auto-revealing (it was closing questions
 against the slowest reader). Correct, but it leaves a hole: a self-paced
 player who runs out of time now sees nothing until the host ends the session.
 The fix is additive and breaks nothing — show a player their own result when
 *their own* clock expires. Deliberately not bundled into the removal.
+
+Status: **done**, and it was worse than written — the player saw nothing *ever*,
+not merely until their clock expired, because every result on the phone was
+gated on a room-wide `reveal` that a self-paced deck has no reliable source
+for. `FeedbackCard` now resolves into the player's own result under AUDIENCE
+pacing, built from the submit ack it already held. The PRESENTER path is
+byte-for-byte unchanged, and the card shows the player's result only — never
+the answer key, which is still the reveal's to give.
 
 ### `slideTitles` is never re-pushed
 The presenter's slide navigator reads `slideTitles` from the session ack. Edit

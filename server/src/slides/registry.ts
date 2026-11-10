@@ -4,8 +4,8 @@
 // here, and add it to the array. Nothing else on the server should branch on
 // slide.type.
 
-import type { SlideServerDef, GradeContext, Graded, RawResponse } from "./types.js";
-import { clampTimeLimitSec, DEFAULT_TIME_LIMIT_SEC, stripAnswerKey } from "./types.js";
+import type { SlideServerDef, GradeContext, Graded, RawResponse, ConfigIssue } from "./types.js";
+import { broken, clampTimeLimitSec, DEFAULT_TIME_LIMIT_SEC, stripAnswerKey } from "./types.js";
 
 import { multipleChoice } from "./multipleChoice.js";
 import { wordCloud } from "./wordCloud.js";
@@ -79,6 +79,31 @@ export function validateValue(type: string, config: any, value: unknown): boolea
   if (!def) return false;
   if (!def.interactive) return false;
   return def.validate ? def.validate(config, value) : true;
+}
+
+/**
+ * Everything wrong with an authored config, asked of the type that owns it.
+ *
+ * This is the authoring-time counterpart to `validateValue` — that one guards
+ * a player's submission, this one guards the slide the submission is made
+ * against. Until it existed the only config checking anywhere was a standalone
+ * script outside the app, so a deck built in the editor or posted straight to
+ * the API never met it: a quiz nobody could answer, a scale with no steps and
+ * an answer key pointing past the end of the options all stored happily and
+ * failed in front of a room.
+ *
+ * An unknown type returns nothing rather than throwing — the type allow-list
+ * is a separate check that has already run by the time anything calls this.
+ */
+export function configIssues(type: string, config: any): ConfigIssue[] {
+  const def = slideDef(type);
+  if (!def?.validateConfig) return [];
+  // Each module may assume it was handed an object, so the shape check lives
+  // here once rather than at the top of seventeen rule sets.
+  if (config === null || typeof config !== "object" || Array.isArray(config)) {
+    return [broken(`config must be a JSON object, got ${config === null ? "null" : Array.isArray(config) ? "an array" : typeof config}.`)];
+  }
+  return def.validateConfig(config);
 }
 
 export function computeAggregate(type: string, config: any, responses: RawResponse[]): any {

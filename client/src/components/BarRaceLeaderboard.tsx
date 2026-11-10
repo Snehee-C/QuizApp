@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useRef, useState } from "react";
 import {
   motion,
   AnimatePresence,
   animate,
+  useIsPresent,
   useMotionValue,
   useTransform,
   type MotionValue,
@@ -31,7 +32,13 @@ interface BarRaceLeaderboardProps {
    * which is the point: see "RACING MORE THAN YOU DRAW" below. Default: all.
    */
   visibleRows?: number;
-  /** Scopes the remembered board. One key per surface. */
+  /**
+   * Scopes the remembered board (see `remembered` below). Must identify the
+   * SESSION, not just the surface — `"stage"` is a bug, `"stage:<sessionId>"`
+   * is correct. A surface-only key let a host who ended a game and started
+   * another on the same deck race the new game's first board up out of the
+   * dead game's scores; see the staleness guard in `resolveBaseline`.
+   */
   raceKey?: string;
   /**
    * Fired the frame the race resolves — the same beat the +Δ chips arrive on.
@@ -137,24 +144,61 @@ function resolveBaseline(
   const prior = explicit ?? remembered.get(key) ?? null;
   const ids = new Set(entries.map((e) => e.participantId));
 
-  // A remembered board that shares nobody with this one is a DIFFERENT room —
-  // the host ended a session and started another in the same tab. Racing the
-  // new game's first board up out of the old game's order would be a lie, and
-  // a very confident-looking one.
+  // Cold: no order to withhold, so everyone races up from zero instead.
+  // Still a race — just one with no overtakes in it.
+  const cold: Baseline = { mode: "cold", prev: new Map(), leader: null };
+
+  // A remembered board that shares nobody with this one is a DIFFERENT room.
+  // Racing the new game's first board up out of the old game's order would be
+  // a lie, and a very confident-looking one.
   const overlap = prior?.filter((e) => ids.has(e.participantId)) ?? [];
-  if (overlap.length === 0) {
-    // Cold: no order to withhold, so everyone races up from zero instead.
-    // Still a race — just one with no overtakes in it.
-    return { mode: "cold", prev: new Map(), leader: null };
-  }
+  if (overlap.length === 0) return cold;
 
   const prev = new Map<string, { score: number; rank: number }>();
   prior!.forEach((e, i) => prev.set(e.participantId, { score: e.score, rank: i }));
 
+  // ── The staleness guard ───────────────────────────────────────────────
+  // A score inside one session only ever goes UP. So a remembered score that
+  // is HIGHER than the same player's score right now is proof the remembered
+  // board belongs to a different game — and, unlike the overlap test above,
+  // it still holds when the two games have the same audience.
+  //
+  // That case is not exotic; it is the most ordinary thing a host does with a
+  // quiz deck, which is run it twice. Measured before this existed, with a
+  // surface-scoped `raceKey` and the same four phones: game two's first
+  // standings opened holding the ENDED game's scores (1,959 / 1,927 / 1,893
+  // / 1,860), which against the new game's maximum put the widest bar at 1.82x
+  // its track — 521px off the right edge of a 1920px stage, names and avatars
+  // off-screen entirely — held there for the full 900ms arm before every bar
+  // raced DOWNWARD. The overlap heuristic could never catch it: a replay with
+  // the same audience has TOTAL overlap, so it read as the same room.
+  //
+  // The keys are now session-scoped at both call sites, which is the real fix.
+  // This is the guard that makes the component unable to do it anyway.
+  const stale = entries.some((e) => {
+    const k = prev.get(e.participantId);
+    return k !== undefined && k.score > e.score;
+  });
+  if (stale) return cold;
+
   // Nothing changed — the host toggled the standings off and back on, or the
   // last slide scored nobody. Replaying a race with no movement in it is a
   // 2-second pause that resolves into the same picture.
-  const moved = entries.some((e) => (prev.get(e.participantId)?.score ?? 0) !== e.score);
+  //
+  // "Changed" has to mean the same thing here as it does in `prevScoreOf`, or
+  // the component arms a race it cannot run. It did not: this test read an
+  // unremembered player's previous score as 0 and said "race", while
+  // `prevScoreOf` read it as their FINAL score and seated them where they
+  // already are. Measured — four players, one of whom skipped a question and
+  // so had no remembered row, then scored alone on the next one: mode WARM,
+  // the full 2,050ms played, ZERO order changes, and the first and last frames
+  // byte-identical. The room was held on a board that was already final.
+  //
+  // So only a player we actually remember can carry evidence of movement.
+  const moved = entries.some((e) => {
+    const k = prev.get(e.participantId);
+    return k !== undefined && k.score !== e.score;
+  });
   if (!moved) return empty;
 
   return { mode: "warm", prev, leader: prior![0]?.participantId ?? null };
@@ -267,6 +311,27 @@ export function BarRaceLeaderboard({
     return was + (will - was) * v;
   }
 
+  // Where every row SITS ON THE FIRST FRAME — the board the room is actually
+  // shown during the hold, which is not always the board we remember.
+  //
+  // A ↑/↓ chip is a claim about a journey the room just watched, so it has to
+  // be measured from the frame the journey started on. Measuring it from the
+  // remembered board instead was wrong whenever the two differed, and they
+  // differ for exactly one reason: a player with no remembered score is
+  // seated at their final score (see prevScoreOf), so they are drawn from
+  // frame one in a position the remembered board never showed. Measured —
+  // a player who sat out a question and then scored alone on the next one
+  // entered the board above two others, and those two were handed a "↓1"
+  // each for a demotion that happened before the race began and that nobody
+  // in the room ever saw. Off the start order they are both ↓0, which is the
+  // truth: on screen, neither moved.
+  //
+  // It also makes the unremembered player honest in the other direction. He
+  // starts where he ends, so he is ↓0 too — the component says nothing about
+  // him rather than something false, which is the same rule prevScoreOf keeps.
+  const startRank = new Map(liveOrder(0).map((id, i) => [id, i]));
+  const startLeader = liveOrder(0)[0] ?? null;
+
   /** The rows actually on screen: the top `drawn` of the live order. */
   const [order, setOrder] = useState<string[]>(() => liveOrder(p.get()).slice(0, drawn));
   // Captured once: the stagger delay has to come from where a row STARTS, or
@@ -351,7 +416,7 @@ export function BarRaceLeaderboard({
   useEffect(() => {
     if (!celebrateLeader || phase !== "settled" || base.mode !== "warm") return;
     const winner = order[0];
-    if (!winner || winner === base.leader) return;
+    if (!winner || winner === startLeader) return;
     burstFrom(leaderRefs.current.get(winner) ?? null, 110);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
@@ -403,7 +468,22 @@ export function BarRaceLeaderboard({
         </motion.div>
       )}
 
-      <AnimatePresence initial={false}>
+      {/* `popLayout`, not the default sync mode. A row leaving the visible
+       * window and the row replacing it overlap in time by design — that IS
+       * the overtake — but in sync mode the outgoing row holds its place in
+       * the layout flow for the whole of its exit, so the list grows to hold
+       * both. Measured on ten players where the bottom five overtook the top
+       * five in one race: TEN rows mounted against a `visibleRows` of five,
+       * ranks reading 1,2,3,4,5 then 1,2,3,4,5 again, two different players'
+       * rows drawn legibly on top of one another, the list box 356px -> 553px
+       * -> 356px and every row jolting 18px up and back (the section is
+       * `justify-center`). It held for 416ms of a 2-second moment. A plain
+       * two-row swap in a 28-player room mounted seven.
+       *
+       * `popLayout` takes the exiting row out of flow, so the five slots stay
+       * five slots and the row it is handing over to can slide into the place
+       * it just left. */}
+      <AnimatePresence initial={false} mode="popLayout">
         {order.map((id, idx) => {
           const entry = byId.get(id);
           if (!entry) return null;
@@ -414,7 +494,7 @@ export function BarRaceLeaderboard({
               rank={idx + 1}
               isLeader={idx === 0}
               prevScore={prevScoreOf(id)}
-              prevRank={base.prev.get(id)?.rank ?? null}
+              prevRank={startRank.get(id) ?? null}
               maxScore={maxScore}
               p={p}
               stage={stage}
@@ -457,7 +537,15 @@ interface RaceRowProps {
   onBallRef: (el: HTMLElement | null) => void;
 }
 
-function RaceRow({
+// forwardRef, and it is load-bearing rather than tidiness: `AnimatePresence`
+// in `popLayout` mode lifts an exiting child out of the layout flow by cloning
+// it with a ref and positioning the real node absolutely. A plain function
+// component cannot be given a ref, so the clone silently fails and popLayout
+// degrades to the sync behaviour it was chosen to replace — measured, and it
+// measured as no change at all: still ten rows in a five-row list, still a
+// 356px box growing to 553px. There is no error and no warning; the only
+// symptom is that the mode does nothing.
+const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
   entry,
   rank,
   isLeader,
@@ -471,7 +559,11 @@ function RaceRow({
   showDelta,
   entranceDelay,
   onBallRef,
-}: RaceRowProps) {
+}: RaceRowProps, ref) {
+  // False once this row has fallen out of the visible window and is playing
+  // its exit. See the rank digit below.
+  const isPresent = useIsPresent();
+
   const a = avatarFor(entry.avatar ?? 0);
   const tile = TILE_COLORS[a.tile % TILE_COLORS.length];
   // `.solid`, NOT `.bubble`: a bar sits on a track with neighbours above and
@@ -485,7 +577,16 @@ function RaceRow({
   // Everything positional reads from ONE interpolation, which is why the bar,
   // the number and the row's rank can never disagree with each other.
   const live = useTransform(p, (v) => prevScore + (entry.score - prevScore) * v);
-  const pct = useTransform(live, (s) => 18 + (s / maxScore) * 82);
+  // Clamped at the track. `maxScore` is the FINAL maximum and a score inside
+  // one session only goes up, so a bar can only exceed its track if the
+  // baseline came from somewhere it should not have — which `resolveBaseline`
+  // now refuses, and the session-scoped `raceKey` now prevents. This is the
+  // third and last line of that defence, and the only one that is purely
+  // local: whatever a caller remembers, the picture stays on the stage. The
+  // track is `overflow: visible` by necessity (the avatar ball rides the
+  // bar's leading edge and must not be clipped), so nothing else would stop
+  // it — measured at 2,441px on a 1,920px screen before this.
+  const pct = useTransform(live, (s) => Math.min(100, 18 + (s / maxScore) * 82));
   const width = useTransform(pct, (w) => `${w}%`);
   const left = useTransform(pct, (w) => `${w}%`);
 
@@ -494,6 +595,7 @@ function RaceRow({
 
   return (
     <motion.div
+      ref={ref}
       data-race-row
       // "position" only: the row never changes size, and a size-aware layout
       // animation would try to animate the bar's width too, fighting the
@@ -501,7 +603,20 @@ function RaceRow({
       layout="position"
       initial={{ opacity: 0, y: reduced ? 0 : 12 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: reduced ? 0 : -12 }}
+      // DOWN, not up. A row only ever leaves this list by being overtaken, so
+      // it sinks past the cut line while the row that passed it rises into the
+      // slot — one gesture, two halves, read in the direction it happened.
+      // (It used to leave upward, which is the gesture for being promoted off
+      // the top of a list and says the opposite of what occurred.)
+      //
+      // Its own transition, because `entranceDelay` must not apply here: the
+      // stagger is the ENTRANCE's rhythm, and a row five slots down was
+      // holding its place for 175ms before it would begin to fade.
+      exit={{
+        opacity: 0,
+        y: reduced ? 0 : 12,
+        transition: { duration: reduced ? 0.12 : 0.2, ease: ease.exit },
+      }}
       transition={{
         layout: spring.default,
         opacity: { duration: reduced ? 0.12 : 0.28, delay: entranceDelay },
@@ -509,11 +624,21 @@ function RaceRow({
       }}
       className="relative flex items-center gap-3"
     >
+      {/* The rank goes the instant the row starts leaving. `rank` is this
+       * row's index in the DRAWN five, and an exiting row keeps the props it
+       * had when it was still one of them — so for the length of its exit the
+       * board carries two rows numbered the same, which on a projector reads
+       * as two people tied for a place neither of them holds. The row itself
+       * is still worth watching out (it is the losing half of the overtake);
+       * its number is the one part of it that has already stopped being true.
+       * Kept in flow, never unmounted, so the row does not reflow as it goes. */}
       <div
         className={cn(
           "nums shrink-0 text-center font-bold text-ink-subtle",
           stage ? "w-10 text-stage-label" : "w-5 text-footnote"
         )}
+        style={{ opacity: isPresent ? 1 : 0 }}
+        aria-hidden={!isPresent}
       >
         {rank}
       </div>
@@ -625,7 +750,7 @@ function RaceRow({
       )}
     </motion.div>
   );
-}
+});
 
 /**
  * The score, written straight to the DOM from the interpolation.
