@@ -1698,6 +1698,37 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // A real room at the wrong moment. Charged to this device only — a whole
       // venue re-joining a finished session must not lock out the building.
       recordJoinFailure(ip, participantId, false);
+      // A refusal that still answers the question. The client turns this
+      // particular code into the PODIUM rather than an error, so it is the
+      // reload path for every player sitting on their result — and it used to
+      // carry nothing, which meant a phone that reloaded on its own podium came
+      // back to the words "That's a wrap" over an empty screen: no board, no
+      // rank, no score. Measured before this: a player who finished 4th on 955
+      // read `#2 Bot1 / Bot0 WINNER / #3 Bot2 / YOU FINISHED #4 955 points`,
+      // reloaded, and read `That's a wrap`.
+      //
+      // Same two fields `session:ended` stamps per socket, and the same public
+      // board — deliberately `entries`, never `fullEntries`: every row carries a
+      // `participantId`, which is the whole of what this very handler needs to
+      // take that seat, so a refusal is the last place to widen it.
+      if (typeof participantId === "string" && participantId) {
+        try {
+          const { entries, fullEntries } = await computeLeaderboard(s);
+          const i = fullEntries.findIndex((e) => e.participantId === participantId);
+          return cb?.({
+            error: "Session has ended",
+            code: "SESSION_ENDED",
+            entries,
+            // Absent from the board means they submitted nothing all session:
+            // null, not an invented last place (matching `emitSessionEnded`).
+            myRank: i >= 0 ? i + 1 : null,
+            myScore: i >= 0 ? fullEntries[i].score : null,
+          });
+        } catch {
+          // The board is a courtesy on a refusal path. If it cannot be built,
+          // the refusal itself still has to land.
+        }
+      }
       return reject(cb, "SESSION_ENDED", "Session has ended");
     }
     if (typeof participantId !== "string" || !participantId) {

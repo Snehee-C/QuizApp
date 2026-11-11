@@ -269,6 +269,16 @@ export default function Play() {
         // for a server that predates `code`, and is consulted only when the
         // ack carries none — a code that is present is authoritative.
         if (res.code ? res.code === "SESSION_ENDED" : res.error === "Session has ended") {
+          // The refusal carries the result it is refusing on behalf of, so a
+          // reload on the podium comes back to the podium. Without these two
+          // lines `ended` was set with nothing behind it and the screen read
+          // "That's a wrap" over blank space — F3: a place you return to looks
+          // the way you left it. Guarded so an older server, which sends the
+          // refusal bare, still reaches the ending rather than an error.
+          if (Array.isArray(res.entries)) setFinalEntries(res.entries);
+          if (typeof res.myRank === "number") {
+            setMyFinal({ rank: res.myRank, score: res.myScore ?? 0 });
+          }
           setEnded(true);
           return;
         }

@@ -636,6 +636,7 @@ question and navigator-open.
 | Moving the live-session breadcrumb to localStorage | It would let a host see the live band in a *second tab*, and it would cost correctness to do it. Two tabs presenting two different decks share one localStorage, so the editor in tab one would offer "Back to the room" pointing at tab two's room. Measured, the current failure is benign: a second tab shows no band, no marker, a fully usable editor and zero errors — it degrades to exactly the behaviour that existed before any of this was built. **Silent absence is an acceptable failure; confident wrongness in front of an audience is not.** A durable fix wants the server to answer "is anything live for me", which it has no endpoint for. |
 | Stepping to a jumped slide, or confirming a jump | The press is reversible — `Back` returns, and a jump is one broadcast either way. A confirmation on a reversible navigation is the trap F2 warns about pointed the other way. |
 | Undo instead of confirm for deck/slide deletion | The right answer, and NN/g prefer it. It needs a server-side tombstone, and `server/` is out of scope for this pass. Recorded in §6 rather than half-built. |
+| Pushing the successor session's code onto the previous room's phones | Investigated after a QA blocker whose reporter wrote the line "the most ordinary thing a host does with a quiz deck is run it twice", on the hypothesis that the player's half of a replay was a wall. **It is not, and the hypothesis was wrong in both of its parts.** The nickname is stored separately from the seat (`menti_nickname`, read back as the `name` default), so `Join another game` clears the seat and keeps the name — nobody retypes who they are. And the moment a host presses `Present again` the stage returns to the LOBBY, which is the one view that renders the join code at `text-stage-code` — so the code a player needs is on the wall, at full size, at exactly the moment they need it. What remained was a push that would save reading six digits off a screen already showing them, at the cost of a new socket event, a cross-session link between a dead room and a live one, and a decision about what to do when the host's second deck is a different deck. Recognition already beats recall here without the product doing anything. |
 
 ---
 
@@ -651,9 +652,10 @@ setting for navigator masking, `/transfer` as a sheet, and the sheet-shaped
 half of that page. All four are in §5 with their reasoning, one of them a
 correction to what this document previously claimed.
 
-Two items are **blocked on `server/` and were checked this batch rather than
-assumed** — the server work that landed unblocked `confirm()` → undo, and did
-not unblock these:
+Two items are **blocked on `server/`, and were re-checked against the code
+this batch rather than carried forward on trust** — `server/` changed
+substantially (config validation, `timeScale` transfer, a per-socket
+`session:ended`), and neither of these moved:
 
 1. **`slideTitles` is still issued once and never re-pushed.** Confirmed by
    reading the handler: it is emitted on `create-session` and `resume-session`
@@ -688,37 +690,72 @@ since been answered, and is recorded here because the reasoning outlived it:
    what decides whether zero closes anything. Host-paced decks are unchanged
    and still genuinely close.
 
-   Known follow-up, deliberately not bundled: a self-paced player who runs out
-   of time now gets no answer-key feedback until the host ends the session.
-   Showing a player their own result when their own clock expires is additive
-   and breaks nothing.
+   Known follow-up — **now closed, and it was worse than this paragraph
+   claimed.** The follow-up was written as "no feedback until the host ends the
+   session". Measured, it was no feedback *ever*: every result on the phone was
+   gated on a room-wide `reveal`, and a self-paced deck has no reliable source
+   for one, so the card sat on "Hold tight — answer coming up." for the rest of
+   the session. `FeedbackCard` now resolves into the player's own result under
+   AUDIENCE pacing, built from the submit ack the phone already held. The
+   PRESENTER path is byte-for-byte unchanged. Measured after: self-paced reads
+   `Correct +976 · rank #1` at t=2.5s and survives a reload; host-paced still
+   reads "Hold tight" at t=10s and resolves only when the server reveals.
+
+   It shows the player's own result and never the answer key — that is still
+   the reveal's to give, in both pacings.
+
+A fourth was found by applying F3's own test to a screen that had never been
+given it, and is **fixed in this batch**:
+
+4. **A reload on your own podium erased it — RESOLVED.** F3's test is "open a
+   screen, change its state, navigate away, come back, diff." Nobody had run it
+   on the ending, because the ending did not look like a place you could leave
+   and return to. It is: the seat survives, and a phone reloads for a hundred
+   reasons. Measured — a player who finished 4th on 955 read
+   `#2 Bot1 / Bot0 WINNER / #3 Bot2 / YOU FINISHED #4 955 points`, reloaded,
+   and read **`That's a wrap`** over an empty screen. The whole result was
+   gone: board, rank and score.
+
+   The cause is a seam, not a bug in either half. The podium is normally built
+   by the `session:ended` event, but a reload does not replay events — it
+   re-joins, and the server *refuses* that join with `SESSION_ENDED`. The
+   client already turned that refusal into the ending rather than an error
+   (which is why the screen said "That's a wrap" at all); the refusal simply
+   carried nothing to put under the words.
+
+   It now carries the same public board and the same two per-socket scalars
+   `session:ended` stamps. Deliberately the public board and not the full one:
+   every row carries a `participantId`, and a `participantId` is the whole of
+   what `participant:join` needs to take that seat — a refusal from that very
+   handler is the last place to widen it. Measured after: the screen is
+   byte-identical across the reload.
 
 What is left that is ours, in the order it costs a person something.
 
-4. **`LastRunBar` only knows about runs that ended in this tab.** Close the
+5. **`LastRunBar` only knows about runs that ended in this tab.** Close the
    browser and the pointer to your last session is gone — the results are still
    in `Session history`, two presses away. A durable answer needs a "recent
    sessions" endpoint that does not exist.
-5. **Walking past a slide silently spends its clock.** Measured: a player who
+6. **Walking past a slide silently spends its clock.** Measured: a player who
    arrives at a slide, moves on, browses for seven seconds and comes back
    scores 562 where someone who answered on arrival scored 1000 — the clock ran
    the whole time, because first arrival wins. The ring is now honest about it
    *on return*, but nothing warns you on the way past. Arguably correct
    (stepping away must not reopen the window) and arguably a trap; it needs a
    decision about what audience pacing is for.
-6. **The deck title is still an unlabelled drill-in.** Now redundant rather
+7. **The deck title is still an unlabelled drill-in.** Now redundant rather
    than load-bearing — `Edit` sits beside it — so a consistency wrinkle rather
    than a trap. It stays listed because the original defect in this product was
    exactly this affordance being the *only* way in, and a system that forgets
    its own near-misses re-earns them.
-7. **The type picker has no "recently used".** The filter pays back most of
+8. **The type picker has no "recently used".** The filter pays back most of
    what progressive disclosure costs an expert, but an author building a
    twelve-question quiz types the same three letters twelve times.
-8. **There is no shared `Sheet`.** Two modal surfaces each own a scrim, a panel
+9. **There is no shared `Sheet`.** Two modal surfaces each own a scrim, a panel
    and a dismiss. `lib/arrowFocus.ts` took the keyboard half out; the
    presentation half is still duplicated, and it is the prerequisite for the
    `/transfer` decision in §5 rather than a separate task.
-9. **`MoreMenu` has no typeahead.** Arrows, `Home`, `End` and `Escape` all work,
+10. **`MoreMenu` has no typeahead.** Arrows, `Home`, `End` and `Escape` all work,
    but ARIA's menu pattern also specifies jumping to an item by first letter.
    Low cost on a three-row menu; worth it if a menu ever gets long.
 
