@@ -115,14 +115,39 @@ key requires the player's picks to equal the key exactly — there is no partial
 credit — so with `allowMultiple` off the player physically cannot submit a
 winning answer.
 
-## What the importer does **not** check
+## What the importer checks, and what it still does not
 
-The server validates the envelope, the slide types and the config *shape*
-(object, under 20KB, no `__proto__`). It does **not** look inside a config:
-a `MULTIPLE_CHOICE` with zero options, a `PIN_ON_IMAGE` with no image and a
-quiz with an out-of-range answer key all import successfully and then fail in
-front of a room. That gap is exactly what `validate-deck.mjs` fills, which is
-why running it is not optional.
+The server used to validate only the envelope, the slide types and the config
+*shape* — a `MULTIPLE_CHOICE` with zero options, a `PIN_ON_IMAGE` with no
+image and a quiz with an out-of-range answer key all imported cleanly and then
+failed in front of a room. **That is no longer true.** Every slide type now
+owns a `validateConfig()` on the server, and `POST /api/transfer/import`
+refuses the WHOLE file, listing every bad slide at once, when any of them is
+unplayable *or* has a required field still empty. A deck file is treated as a
+finished artifact, so "not filled in yet" is a refusal there even though the
+editor is allowed to save it.
+
+So the importer now catches: an answer key pointing past the end of the
+options, two correct indices without `allowMultiple`, a duplicated index, two
+options that paint the same pixels (zero-width spaces included), more than six
+options, an option label over 120 characters, a scale whose max is not above
+its min, a missing image, a missing `correctValue`, an answer nobody could
+type, a deck with no slides at all.
+
+`validate-deck.mjs` is still not optional, for three reasons — it is the only
+thing that catches these:
+
+1. **The slide would import and then render blank or unplayable.** The
+   `question` field carries the whole of a `CONTENT_HEADING`, a
+   `CONTENT_QUOTE` and a `SPIN_WHEEL`, and the server's config rules never see
+   it. An empty one imports with a 200 and shows the room nothing.
+2. **The value you wrote is silently replaced.** `timeLimitSec` outside
+   5-600 is clamped, not refused, so a deck that says 2 plays at 5.
+3. **The slide is modelled as the wrong type.** An answer key on a
+   `WORD_CLOUD`, or a config key the app never reads, imports happily and
+   quietly does nothing.
+
+Run it before you hand over a file. Exit 0 means the importer will take it.
 
 ## Writing good quiz content
 

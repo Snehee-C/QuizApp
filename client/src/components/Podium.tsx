@@ -4,9 +4,13 @@ import { TILE_COLORS, ballBg } from "../lib/palette";
 import { NumberTicker } from "./ui/NumberTicker";
 import { cn } from "../lib/cn";
 import { spring } from "../lib/motion";
+import { pkeyOf, type RowIdentity } from "./participantKey";
 
-export interface LeaderboardEntry {
-  participantId: string;
+// `participantId` is PRESENTER-ONLY from the server change on — it is a bearer
+// token and the phone must not be handed one — and this board is drawn on both
+// surfaces. Identity therefore comes from `pkeyOf`, never from the field.
+// See components/participantKey.ts.
+export interface LeaderboardEntry extends RowIdentity {
   name: string;
   score: number;
   avatar?: number;
@@ -150,7 +154,7 @@ export function LeaderboardList({ entries }: { entries: LeaderboardEntry[] }) {
     <div className="flex flex-col gap-2 w-full">
       {entries.map((e, i) => (
         <motion.div
-          key={e.participantId}
+          key={pkeyOf(e)}
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: i * 0.035, duration: 0.24 }}

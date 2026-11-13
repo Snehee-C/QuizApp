@@ -27,7 +27,9 @@ import {
   flushQueue,
   setCurrentSlide as setRetryQueueSlide,
   submitWithRetry,
+  useConnection,
 } from "../lib/connection";
+import { noteServerNow, serverNow } from "../lib/serverClock";
 import { initSound, playSound, unlockAudio } from "../lib/sound";
 import { burstFrom } from "../lib/confetti";
 import { cn } from "../lib/cn";
@@ -53,6 +55,16 @@ interface Reveal {
   raw: Record<string, any>;
   aggregate: any;
 }
+
+/**
+ * A leaderboard row as it reaches a PHONE.
+ *
+ * `LeaderboardEntry` is the shape the board components render; `pkey` is the
+ * opaque self-identifier the server stamps alongside it, and is declared here
+ * rather than there because only this surface asks "which row is mine?".
+ * Optional on purpose — a server that predates it simply falls back.
+ */
+type BoardRow = LeaderboardEntry & { pkey?: string };
 
 interface LobbyParticipant {
   participantId: string;
@@ -80,6 +92,26 @@ const PHONE_SHELL =
 // someone in a session they never agreed to join.
 const SEAT_KEY = "menti_seat";
 const SEAT_TTL_MS = 12 * 60 * 60 * 1000;
+
+// One spelling of a score, on every surface that puts one on a screen.
+//
+// The podium printed `11,987 points` while the result card the player had been
+// looking at two seconds earlier printed `11987 pts` — one number, two
+// spellings, which is exactly the synonym DESIGN.md P1 exists to delete. Four
+// digits is where it shows, and a twelve-question deck is there by question
+// two. `toLocaleString` is what `Podium` and `BarRaceLeaderboard` already use,
+// so this joins that spelling rather than inventing a third.
+//
+// Undefined renders as nothing, which is what interpolating it bare did: the
+// embargoed submit ack carries no points at all until the reveal.
+function fmt(n: number | undefined): string {
+  return typeof n === "number" ? n.toLocaleString() : "";
+}
+
+// How often an unconfirmed submission is re-driven while the link is up (N7).
+// Comfortably longer than the queue's own 6s ack deadline would need, and
+// short enough that the phone resolves well inside a 20-second question.
+const RESETTLE_MS = 2500;
 
 function hasSeat(code: string | undefined): boolean {
   if (!code) return false;
@@ -131,6 +163,17 @@ export default function Play() {
   const { code } = useParams<{ code: string }>();
   const navigate = useNavigate();
   const participantId = useRef(getParticipantId());
+  // This phone's own opaque key for THIS session, from the join ack.
+  //
+  // A board row used to be found by matching `participantId`, which meant
+  // every row on every board a phone receives had to carry one — and a
+  // `participantId` is a bearer token: it is the whole of what
+  // `participant:join` needs to take someone's seat and overwrite their
+  // answers. Ten rows on the standings was ten stealable seats handed to
+  // every phone in the room. `pkey` is an HMAC of the id under a per-session
+  // secret: it answers "is this row mine?" and nothing else, and it cannot be
+  // turned back into an identity to join as.
+  const myPkey = useRef<string | null>(null);
   const [name, setName] = useState(getNickname());
   // Restored from the persisted seat, so a reload re-enters the room instead
   // of rendering the join gate over a live question (B4). A seat without a
@@ -147,7 +190,7 @@ export default function Play() {
   const [error, setError] = useState("");
   const [feedback, setFeedback] = useState<SubmitFeedback | null>(null);
   const [ended, setEnded] = useState(false);
-  const [finalEntries, setFinalEntries] = useState<LeaderboardEntry[]>([]);
+  const [finalEntries, setFinalEntries] = useState<BoardRow[]>([]);
   // This player's OWN final standing, told to this socket alone.
   //
   // It cannot be derived from `finalEntries`: that list is the public top ten
@@ -160,7 +203,7 @@ export default function Play() {
   const [myFinal, setMyFinal] = useState<{ rank: number; score: number } | null>(null);
   // Set only while the presenter has the leaderboard "on screen" — mirrors
   // the big-screen moment onto every phone at the same instant.
-  const [leaderboardView, setLeaderboardView] = useState<LeaderboardEntry[] | null>(null);
+  const [leaderboardView, setLeaderboardView] = useState<BoardRow[] | null>(null);
   // ── THE RANK EMBARGO ──────────────────────────────────────────────────
   //
   // Has the ROOM been shown the standings since this player's last answer?
@@ -237,6 +280,23 @@ export default function Play() {
   // redundant participant:count to every phone in the room.
   const pacingRef = useRef<"PRESENTER" | "AUDIENCE">("PRESENTER");
 
+  // Is this board row this player's own?
+  //
+  // By `pkey` wherever both ends have one, and by `participantId` otherwise —
+  // which is only ever a server that predates `myPkey`, or a board whose rows
+  // predate `pkey`. Keeping the fallback is what lets the id leave the wire
+  // independently of this file shipping.
+  const isMyRow = (row: BoardRow): boolean => {
+    if (myPkey.current && row.pkey) return row.pkey === myPkey.current;
+    return row.participantId === participantId.current;
+  };
+
+  // Live connection status and the number of submissions the server has not
+  // confirmed. Read here, not only inside `ConnectionBanner`, because an
+  // unconfirmed submission is a state this screen has to RESOLVE and not just
+  // describe — see the watchdog below.
+  const { status: connectionStatus, queued } = useConnection();
+
   useEffect(() => {
     if (!joined) return;
     const socket = getSocket();
@@ -245,15 +305,23 @@ export default function Play() {
     // lifts the rank embargo in a presenter-paced deck, and it is lifted by
     // the broadcast rather than by anything this phone did — which is the
     // whole point: the number becomes public when it becomes public.
-    const roomSawStandings = (entries: LeaderboardEntry[]) => {
+    const roomSawStandings = (entries: BoardRow[]) => {
       setStandingsSeen(true);
-      const i = entries.findIndex((e) => e.participantId === participantId.current);
+      const i = entries.findIndex(isMyRow);
       setPublicRank(i >= 0 ? i + 1 : null);
     };
 
     // Runs for the first join AND for every reconnect re-join — the ack is
     // specified to be correct for both, so one handler serves both.
-    const applyJoinAck = (res: any, isRejoin: boolean) => {
+    //
+    // `rttMs` is how long this ack took to come back, when the caller timed
+    // it; the clock sample inside is stamped at the far end of that trip.
+    const applyJoinAck = (res: any, isRejoin: boolean, rttMs = 0) => {
+      // FIRST, ahead of every setState below: `startedAt` is only meaningful
+      // next to the server's own "now", and the effects that arm the
+      // countdown run after this handler returns, so the offset has to be
+      // recorded before the state that depends on it (lib/serverClock.ts).
+      noteServerNow(res?.serverNow, rttMs);
       if (res?.error) {
         // Drop the seat: a stale one would otherwise brick this phone on the
         // dead-end error screen on every single reload.
@@ -286,6 +354,9 @@ export default function Play() {
         return;
       }
       setError("");
+      // Before any board is applied below: `roomSawStandings` runs off this.
+      // A server that predates it leaves us on the id comparison (`isMyRow`).
+      myPkey.current = typeof res.myPkey === "string" ? res.myPkey : null;
       setStatus(res.status);
       setTotalSlides(res.totalSlides ?? 0);
       const nextPacing = res.pacing === "AUDIENCE" ? "AUDIENCE" : "PRESENTER";
@@ -412,6 +483,9 @@ export default function Play() {
     };
 
     const emitJoin = (isRejoin: boolean) => {
+      // Timed purely so the clock sample in the ack can be placed in the
+      // middle of the round trip rather than at its start.
+      const sentAt = Date.now();
       socket.emit(
         "participant:join",
         {
@@ -420,7 +494,7 @@ export default function Play() {
           name,
           avatar: getAvatarIndex(),
         },
-        (res: any) => applyJoinAck(res, isRejoin)
+        (res: any) => applyJoinAck(res, isRejoin, Date.now() - sentAt)
       );
     };
 
@@ -449,6 +523,8 @@ export default function Play() {
     socket.on("connect", onConnect);
 
     const onSlideChanged = (payload: any) => {
+      // Before the state it belongs to, for the reason in `applyJoinAck`.
+      noteServerNow(payload?.serverNow);
       setStatus(payload.status);
       setTotalSlides(payload.totalSlides ?? 0);
 
@@ -498,7 +574,14 @@ export default function Play() {
     };
 
     const onReveal = (payload: any) => {
-      setCurrentSlide((slide) => {
+      noteServerNow(payload?.serverNow);
+      // Read from the ref, not from inside a `setCurrentSlide` updater. An
+      // updater is called for its RETURN VALUE and React may run it twice —
+      // it does, in development — so everything below, the sound included,
+      // used to happen twice per reveal. The ref is written in every place
+      // the state is, one line apart, so it answers the same question.
+      {
+        const slide = currentSlideRef.current;
         if (slide && payload.slideId === slide.id) {
           const next = { raw: payload ?? {}, aggregate: payload?.aggregate };
           setReveal(next);
@@ -507,15 +590,59 @@ export default function Play() {
           // would otherwise say "answer coming up" about an answer this player
           // already watched arrive.
           revealedSlides.current.set(payload.slideId, next);
-          playSound("reveal");
+
+          // ── THE RESULT ARRIVES WITH THE REVEAL ───────────────────────────
+          //
+          // Under host pacing the submit ack no longer carries the outcome —
+          // it was an answer-key oracle, returning `correct` to anyone who
+          // asked, before the room had been told anything (N3). The embargo
+          // used to live entirely in `FeedbackCard`, one layer ABOVE the data,
+          // so a scripted client simply read the ack.
+          //
+          // The result now rides the reveal instead: the frame that already
+          // delivers the answer key to the room, stamped per socket with this
+          // player's own `{ isQuiz, correct, points, totalScore, rank }` —
+          // the same shape `participant:join` has always acked with. What the
+          // player SEES is unchanged: "Locked in / Hold tight" until the
+          // reveal, the full result after it. Only the layer it arrives on
+          // has moved, and that layer is one the server controls.
+          //
+          // Only ever read when it is an object. `null` means the server has
+          // no scored row for this phone — they did not answer — and
+          // `undefined` means a server that predates the field, whose ack
+          // already carried the result. Neither may CLEAR feedback we hold:
+          // doing so would downgrade a real result to "You didn't answer".
+          const mine = payload?.myResult;
+          if (mine) {
+            setFeedback(mine);
+            // The server has a graded row for us, so the M7 lock is true even
+            // if this tab never saw its own ack land (N7).
+            setAnswered(true);
+            setSubmitError("");
+            const prior = answeredSlides.current.get(payload.slideId);
+            answeredSlides.current.set(payload.slideId, {
+              value: prior?.value ?? null,
+              feedback: mine,
+            });
+          }
+          // The verdict sting, at the only moment the player is entitled to
+          // the verdict. It used to fire on the submit ack, which under host
+          // pacing meant the phone said "right" out loud a whole question
+          // before the room was told — the same breach as N3, in audio. One
+          // sound per reveal either way: a player with a result of their own
+          // hears that, and everyone else hears the generic reveal.
+          if (mine?.isQuiz && typeof mine.correct === "boolean") {
+            playSound(mine.correct ? "correct" : "wrong");
+          } else {
+            playSound("reveal");
+          }
         }
-        return slide;
-      });
+      }
     };
 
     const onCount = (payload: any) => setParticipants(payload?.participants ?? []);
     const onLeaderboardShow = (payload: any) => {
-      const entries: LeaderboardEntry[] = payload.entries ?? [];
+      const entries: BoardRow[] = payload.entries ?? [];
       setLeaderboardView(entries);
       roomSawStandings(entries);
     };
@@ -557,10 +684,15 @@ export default function Play() {
 
   // Self-navigation. Only this socket is updated, by design.
   function goto(next: number) {
+    const sentAt = Date.now();
     getSocket().emit(
       "participant:goto",
       { joinCode: code, participantId: participantId.current, index: next },
       (res: any) => {
+        // This ack carries a `startedAt` of its own (a self-paced player's
+        // arrival on the slide), so it carries the clock it must be read
+        // against. Before the state, as everywhere else.
+        noteServerNow(res?.serverNow, Date.now() - sentAt);
         if (res?.error) return;
         setCurrentSlide(res.currentSlide);
         currentSlideRef.current = res.currentSlide ?? null;
@@ -641,7 +773,11 @@ export default function Play() {
   useEffect(() => {
     setSpeedExpired(false);
     if (pacing !== "AUDIENCE" || startedAt === null || !timeLimit) return;
-    const left = startedAt + timeLimit * 1000 - Date.now();
+    // The server's clock on both sides of the subtraction, exactly as the ring
+    // does it. With the phone's own clock here, a device set 90s fast armed
+    // this on mount and told a self-paced player their speed bonus was gone
+    // 58 seconds before it was (N10).
+    const left = startedAt + timeLimit * 1000 - serverNow();
     if (left <= 0) {
       setSpeedExpired(true);
       return;
@@ -655,6 +791,44 @@ export default function Play() {
   useEffect(() => {
     setRetryQueueSlide(currentSlide?.id ?? null);
   }, [currentSlide?.id]);
+
+  // ── N7: THE PHONE HAS TO SETTLE ON ITS OWN ────────────────────────────────
+  //
+  // Measured: a 12-second question, the phone taken offline, an answer tapped,
+  // the network back 9.5s later. The server received the answer and scored it
+  // 531 — the stage showed it — while the phone read "Sending your answer… 1
+  // waiting" for 33 seconds and then, at the reveal, "You didn't answer in
+  // time". Both strings on screen at once. It recovered only at t=35s, when
+  // socket.io's heartbeat finally declared the dead transport dead and the
+  // reconnect flushed the queue; with the outage in a different part of the
+  // ping cycle that is up to ~45s, and a reload was the only sure fix.
+  //
+  // The mechanism is narrow. `socket.timeout(6000).emit()` registers an ack
+  // handler and DELETES it when it fires, so the submit that was delivered
+  // late — by a TCP retransmit, or by socket.io's own disconnect buffer —
+  // gets a perfectly good ack from the server that the client has no handler
+  // for any more. The queue settles only on an ack body, which is correct;
+  // the body simply never reaches it. Nothing else was watching, because the
+  // socket never disconnected and so `connect` never fired the flush.
+  //
+  // So: while something is unconfirmed and the link is up, re-drive it. The
+  // re-send is the same bytes, and the server answers identical bytes from
+  // the row it already holds — ahead of its own "Time's up" guard, with
+  // `duplicate: true` and the real points — so this settles the phone with
+  // the TRUE result and cannot re-grade, double-score, or cost the player the
+  // outage. If the answer genuinely never arrived, the re-send either lands
+  // (and scores) or is refused, and either way the queue drains and the
+  // player is told something true instead of two contradictory things.
+  //
+  // Cheap by construction: the interval exists only while `queued > 0` AND
+  // the connection is up, which is close to never. `flushQueue` skips
+  // anything already in flight, so the first re-drive lands one tick after
+  // the 6-second ack deadline rather than piling emits on top of each other.
+  useEffect(() => {
+    if (!joined || queued === 0 || connectionStatus !== "online") return;
+    const id = window.setInterval(flushQueue, RESETTLE_MS);
+    return () => window.clearInterval(id);
+  }, [joined, queued, connectionStatus]);
 
   function submit(value: unknown) {
     // `answered` is the reconnect lock (M7). The server upserts responses, so
@@ -686,6 +860,14 @@ export default function Play() {
         setSubmitError(res.error);
         return;
       }
+      // Under host pacing, before the reveal, this ack is now `{ ok, isQuiz }`
+      // and nothing else — the verdict is embargoed on the WIRE rather than
+      // in the card (N3). `FeedbackCard` renders exactly what it rendered
+      // before from it: "Locked in / Hold tight" for a quiz slide, "Answer
+      // locked in" for anything else. The rest of the result arrives on
+      // `slide:reveal`, and arrives in full on this ack in every case where
+      // the embargo does not apply: a self-paced deck, or a slide already
+      // revealed (which is how a queued answer delivered late settles).
       setFeedback(res);
       setAnswered(true);
       setMyAnswer(value);
@@ -693,7 +875,12 @@ export default function Play() {
       // server's `participant:goto` ack does not carry `answered`/`myAnswer`
       // the way the join ack does — so this tab is the only thing that knows.
       answeredSlides.current.set(currentSlide.id, { value, feedback: res });
-      if (res.isQuiz) playSound(res.correct ? "correct" : "wrong");
+      // Only when the ack actually carried a verdict. Firing on a bare
+      // `isQuiz` would play the "wrong" sting at every embargoed submit —
+      // telling the player, in audio, the opposite of what they scored.
+      if (res.isQuiz && typeof res.correct === "boolean") {
+        playSound(res.correct ? "correct" : "wrong");
+      }
     });
   }
 
@@ -716,7 +903,7 @@ export default function Play() {
   // Ahead of the error gate on purpose: a game that finished is a result, and
   // a late connection error must never overwrite the podium with a dead end.
   if (ended) {
-    const mine = finalEntries.find((e) => e.participantId === participantId.current);
+    const mine = finalEntries.find(isMyRow);
     // The server's own figure first. Falling back to a position in the public
     // board keeps this working against a server that predates the field — but
     // that fallback is exactly the thing that could only ever answer for the
@@ -763,7 +950,7 @@ export default function Play() {
     return (
       <PlayerLeaderboard
         entries={leaderboardView}
-        meId={participantId.current}
+        isMine={isMyRow}
         // Scoped to the ROOM, not to the surface.
         //
         // `BarRaceLeaderboard` remembers the last board each `raceKey`
@@ -1074,18 +1261,19 @@ function Lobby({
 
 function PlayerLeaderboard({
   entries,
-  meId,
+  isMine,
   raceKey,
 }: {
-  entries: LeaderboardEntry[];
-  meId: string;
+  entries: BoardRow[];
+  /** Which row is this player's own — by `pkey`, see `isMyRow`. */
+  isMine: (row: BoardRow) => boolean;
   /**
    * Scopes the remembered board to the SESSION, not just to this surface —
    * see the call site.
    */
   raceKey: string;
 }) {
-  const mine = entries.find((e) => e.participantId === meId);
+  const mine = entries.find(isMine);
   const myRank = mine ? entries.indexOf(mine) + 1 : null;
   // The phone runs the same race the stage does, so it can spoil it the same
   // way — and it did, from its own pinned row, one surface below the leak
@@ -1140,7 +1328,7 @@ function PlayerLeaderboard({
             >
               #{myRank}
             </motion.span>
-            <span className="nums text-ink text-title3 font-bold">{mine.score}</span>
+            <span className="nums text-ink text-title3 font-bold">{mine.score.toLocaleString()}</span>
             <span className="text-ink-subtle text-footnote">pts</span>
           </span>
         </div>
@@ -1364,10 +1552,10 @@ function SelfPacedQuizResult({
           {wasRight ? "Correct" : "Not this time"}
         </p>
         {wasRight && (
-          <p className="nums text-accent text-title3 font-bold mt-0.5">+{feedback.points}</p>
+          <p className="nums text-accent text-title3 font-bold mt-0.5">+{fmt(feedback.points)}</p>
         )}
         <p className="text-ink-subtle text-subhead mt-2">
-          <span className="nums font-bold text-ink-muted">{feedback.totalScore}</span> pts
+          <span className="nums font-bold text-ink-muted">{fmt(feedback.totalScore)}</span> pts
           {rank !== null && (
             <>
               {" · "}rank <span className="nums font-bold text-ink-muted">#{rank}</span>
@@ -1525,7 +1713,7 @@ function RevealCard({
             </p>
             {wasRight && (
               <p className="nums text-accent text-title3 font-bold mt-0.5">
-                +{feedback.points}
+                +{fmt(feedback.points)}
               </p>
             )}
             {/* Their own ledger. The score is theirs and goes out whole; the
@@ -1537,7 +1725,7 @@ function RevealCard({
              * number, which also happens to be the hook the whole moment
              * runs on: it is about to happen over there. */}
             <p className="text-ink-subtle text-subhead mt-2">
-              <span className="nums font-bold text-ink-muted">{feedback.totalScore}</span> pts
+              <span className="nums font-bold text-ink-muted">{fmt(feedback.totalScore)}</span> pts
               {rank !== null && (
                 <>
                   {" · "}rank <span className="nums font-bold text-ink-muted">#{rank}</span>

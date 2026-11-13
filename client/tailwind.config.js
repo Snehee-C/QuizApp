@@ -107,12 +107,40 @@ export default {
         // ── The stage ladder. Deliberately NOT the UI ladder scaled up: the
         // stage is read at six metres, so it is viewport-anchored (designed at
         // 1920x1080) and floored at 24px (DESIGN.md §5).
-        "stage-code": ["clamp(64px, 11vw, 220px)", { lineHeight: "0.9" }],
-        "stage-q": ["clamp(40px, 5.2vw, 104px)", { lineHeight: "1.06", letterSpacing: "-0.028em" }],
-        "stage-q-sm": ["clamp(34px, 4.2vw, 84px)", { lineHeight: "1.08", letterSpacing: "-0.026em" }],
-        "stage-answer": ["clamp(26px, 2.6vw, 54px)", { lineHeight: "1.15", letterSpacing: "-0.018em" }],
-        "stage-name": ["clamp(22px, 2vw, 42px)", { lineHeight: "1.2", letterSpacing: "-0.015em" }],
-        "stage-label": ["clamp(18px, 1.35vw, 28px)", { lineHeight: "1.3", letterSpacing: "-0.005em" }],
+        //
+        // THE ANCHOR IS `min(Xvw, Yvh)`, AND IT HAS NO CEILING.
+        //
+        // Every step here used to be `clamp(floor, Xvw, cap)`, and the caps all
+        // landed within 80px of each other: stage-q stopped at 2000px wide,
+        // stage-answer at 2077, stage-label at 2074. Past roughly 2080x1555 CSS
+        // px the whole stage stopped scaling at once. Measured on a 4K
+        // projector at its native mode (3840x2160, deviceScaleFactor 1), which
+        // is exactly the deployment this product is for: question 104px =
+        // 4.81vh against 1080p's 9.63vh, answer label 54px = 2.50vh against
+        // 4.62vh, the answer block 19% of the screen against 42%. Nothing
+        // clipped, nothing scrolled — the room's screen was simply drawn at a
+        // little over half size, in a band through the middle, with ~30% of the
+        // projection empty above and below. A person fifteen feet back reads an
+        // ANGULAR size, which is the fraction of the screen a glyph occupies,
+        // so a cap on that fraction is a cap on legibility.
+        //
+        // The caps existed for one real reason: `vw` alone on a 32:9 display
+        // puts a 230px headline on a 1440px-tall stage. `min(Xvw, Yvh)` answers
+        // that directly — type follows whichever dimension is scarcer — so the
+        // ceiling has nothing left to do and is gone. Above the floor, the
+        // stage now occupies the same fraction of the screen at every size.
+        //
+        // The two numbers are ONE number: Yvh is Xvw converted at the design
+        // aspect, X * 16/9. On any 16:9 viewport the two sides of the `min()`
+        // are equal to the last decimal, so 1920x1080 — and every other 16:9
+        // size eight rounds of QA measured — renders byte-identically to the
+        // old `clamp()`. Only non-16:9 and post-cap sizes move.
+        "stage-code": ["max(64px, min(11vw, 19.5556vh))", { lineHeight: "0.9" }],
+        "stage-q": ["max(40px, min(5.2vw, 9.2444vh))", { lineHeight: "1.06", letterSpacing: "-0.028em" }],
+        "stage-q-sm": ["max(34px, min(4.2vw, 7.4667vh))", { lineHeight: "1.08", letterSpacing: "-0.026em" }],
+        "stage-answer": ["max(26px, min(2.6vw, 4.6222vh))", { lineHeight: "1.15", letterSpacing: "-0.018em" }],
+        "stage-name": ["max(22px, min(2vw, 3.5556vh))", { lineHeight: "1.2", letterSpacing: "-0.015em" }],
+        "stage-label": ["max(18px, min(1.35vw, 2.4vh))", { lineHeight: "1.3", letterSpacing: "-0.005em" }],
       },
       keyframes: {
         popIn: {

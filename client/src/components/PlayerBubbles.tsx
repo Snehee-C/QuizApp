@@ -3,9 +3,15 @@ import { avatarFor } from "../lib/avatars";
 import { TILE_COLORS, ballBg } from "../lib/palette";
 import { prefersReducedMotion } from "../lib/motion";
 import { cn } from "../lib/cn";
+import { pkeyOf, type RowIdentity } from "./participantKey";
+import { stageScale } from "./stageScale";
 
-interface Participant {
-  participantId: string;
+// `participantId` is no longer sent to phones and this list is drawn on the
+// stage from a presenter frame — but the identity it keys off must be one both
+// audiences have, or the next surface to reuse this draws one bubble for the
+// whole room. Measured: three phones in, counter reading "3 players ready",
+// exactly ONE bubble, because every row collapsed onto the same `undefined`.
+interface Participant extends RowIdentity {
   name: string;
   avatar: number;
 }
@@ -86,7 +92,16 @@ function baseRadius(w: number, h: number, n: number): number {
   // small but it is not a touch target, and a readable name beats a big disc.
   // The stage never reaches the floor (60 players in 1449x583 still sizes to
   // r 33), so this only ever trades disc size for legibility where it must.
-  return Math.max(20, Math.min(62, Math.min(byField, byCrowd)));
+  //
+  // The CEILING, by contrast, binds on the stage the moment the lobby is a
+  // small one — and it was an absolute 62px, so it was the lobby's share of
+  // the scale ceiling the stage type had everywhere else: on a 4K projector
+  // the join code drew at 422px beside 62px discs carrying 30px names, on the
+  // same slide. It is design-size px now, on the same anchor as the ladder
+  // (components/stageScale.ts), so it is exactly 62 at 1920x1080 and the
+  // lobby is one picture at every resolution. The floor does NOT scale: it is
+  // a legibility bound on a phone-sized field, not a proportion.
+  return Math.max(20, Math.min(62 * stageScale(), Math.min(byField, byCrowd)));
 }
 
 function labelFontPx(r: number): number {
@@ -269,7 +284,7 @@ export function PlayerBubbles({ participants, className }: PlayerBubblesProps) {
     const h = field.clientHeight || 360;
     const bubbles = bubblesRef.current;
 
-    const incoming = new Set(shown.map((p) => p.participantId));
+    const incoming = new Set(shown.map(pkeyOf));
     let changed = false;
 
     // Remove bubbles whose participant has left.
@@ -289,7 +304,8 @@ export function PlayerBubbles({ participants, className }: PlayerBubblesProps) {
     const base = baseRadius(w, h, shown.length);
     const fresh: Bubble[] = [];
     for (const p of shown) {
-      if (existing.has(p.participantId)) continue;
+      const key = pkeyOf(p);
+      if (existing.has(key)) continue;
       changed = true;
       const k = 1 + Math.random() * 0.18;
       const r = base * k;
@@ -373,7 +389,7 @@ export function PlayerBubbles({ participants, className }: PlayerBubblesProps) {
       field.appendChild(el);
 
       const b: Bubble = {
-        id: p.participantId,
+        id: key,
         name: p.name,
         avatar: p.avatar,
         x,

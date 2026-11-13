@@ -1,5 +1,5 @@
 import type { SlideServerDef, RawResponse, ConfigIssue } from "./types.js";
-import { broken, checkStringList, describe } from "./types.js";
+import { broken, checkStringList, describe, MAX_ANSWER_SLOTS, ANSWER_SLOT_WHY } from "./types.js";
 
 // 100 points — each player splits a fixed budget across the options and
 // submits the per-option allocation, in config order.
@@ -30,7 +30,14 @@ export const hundredPoints: SlideServerDef = {
   // is either unreachable or forces an all-zero allocation.
   validateConfig(config): ConfigIssue[] {
     const issues: ConfigIssue[] = [
-      ...checkStringList(config, "options", { min: 2, label: "the options to split points across" }),
+      // Same stage ceiling as MULTIPLE_CHOICE and RANKING: hundredPoints.tsx
+      // draws each option in a `slotFor` slot, which wraps at six.
+      ...checkStringList(config, "options", {
+        min: 2,
+        label: "the options to split points across",
+        max: MAX_ANSWER_SLOTS,
+        maxWhy: ANSWER_SLOT_WHY,
+      }),
     ];
     const total = config?.total;
     if (total !== undefined && (!Number.isInteger(total) || (total as number) <= 0)) {

@@ -82,7 +82,7 @@ something else. Write a value in range so the deck says what it does.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `options` | `string[]` | — | 2–6. Each must be non-empty. |
+| `options` | `string[]` | — | 2–6, enforced by the importer. Each non-empty, each ≤120 chars, no two alike. |
 | `isQuiz` | `boolean` | `false` | Scoring + countdown switch. |
 | `allowMultiple` | `boolean` | `false` | Lets a player pick more than one. |
 | `correctIndices` | `number[]` | — | **0-based indexes into `options`.** |
@@ -101,8 +101,18 @@ partial credit, so nobody can select everything and always win). With
 `allowMultiple` off the player can only ever submit one pick, so a two-answer
 key makes the question unwinnable.
 
-Beyond 6 options the answer-slot ladder (colour + shape A–F) wraps and two
-options start looking identical on the stage. The editor caps it at 6.
+Beyond 6 options the answer-slot ladder wraps — all four redundant channels at
+once (colour, shape, letter A–F and screen position), so option 7 is drawn as
+a second "A". The editor caps it at 6 and **the importer now refuses past 6**,
+on `RANKING.items` and `HUNDRED_POINTS.options` too.
+
+An option label is capped at **120 characters**, also refused. The stage fits
+every label to the largest size at which none of them exceeds three lines and
+stops at 26px; 120 is the measured three-line capacity of a tile at 1920×1080.
+Longer labels do not shrink, they take a fourth line and a fifth, and at 400
+characters six options push the grid off the bottom of the screen. Two options
+that paint the same pixels are refused as well — a zero-width space between
+them does not make them different answers.
 
 ### WORD_CLOUD
 
@@ -124,12 +134,12 @@ cards. Never scored. Use `filterMode` on the envelope to mask profanity.
 
 ### RANKING
 
-`config.items` (`string[]`, 2–6). Players drag the items into order; the stage
+`config.items` (`string[]`, 2–6, enforced by the importer). Players drag the items into order; the stage
 aggregates with a Borda count. There is no "correct" order — never scored.
 
 ### HUNDRED_POINTS
 
-`config.options` (`string[]`, 2–6) and `config.total` (whole number, default
+`config.options` (`string[]`, 2–6, enforced by the importer) and `config.total` (whole number, default
 100). Players split the budget across the options and it must balance exactly —
 that forced trade-off is the point of the format. Never scored.
 

@@ -1,5 +1,5 @@
 import type { SlideServerDef, RawResponse, ConfigIssue } from "./types.js";
-import { checkStringList } from "./types.js";
+import { checkStringList, MAX_ANSWER_SLOTS, ANSWER_SLOT_WHY } from "./types.js";
 
 // Ranking — each player submits a permutation of the item indices, best first.
 //
@@ -26,9 +26,16 @@ export const ranking: SlideServerDef = {
   },
 
   // A ballot must be a permutation of `items`, so the item list IS the slide:
-  // with fewer than two entries there is nothing to order.
+  // with fewer than two entries there is nothing to order. The ceiling is the
+  // stage's, not this type's — ranking.tsx draws every item in a `slotFor`
+  // slot, so a seventh item wears the first one's colour, shape and letter.
   validateConfig: (config): ConfigIssue[] =>
-    checkStringList(config, "items", { min: 2, label: "the items to rank" }),
+    checkStringList(config, "items", {
+      min: 2,
+      label: "the items to rank",
+      max: MAX_ANSWER_SLOTS,
+      maxWhy: ANSWER_SLOT_WHY,
+    }),
 
   aggregate(config, responses: RawResponse[]) {
     const items: string[] = config?.items ?? [];

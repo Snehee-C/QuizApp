@@ -2,6 +2,7 @@ import { Router } from "express";
 import { prisma } from "../db.js";
 import { requireAuth, type AuthedRequest } from "../auth.js";
 import { VALID_SLIDE_TYPES, configIssues } from "../slides/registry.js";
+import type { ConfigIssue } from "../slides/types.js";
 import { clampTimeScale } from "../timeScale.js";
 
 export const presentationsRouter = Router();
@@ -42,13 +43,28 @@ presentationsRouter.post("/", async (req: AuthedRequest, res) => {
 });
 
 // Get one presentation with slides
+//
+// Every slide carries its own `configIssues`, not just the one being saved.
+// The editor's rail has to be able to mark a slide the host is NOT looking at
+// — a deck broken on slide 3 while you are editing slide 17 is the case where
+// a silent fault survives to the projector — and the alternative, re-deriving
+// the rules in the client, would be a second copy of them that drifts from
+// this one the first time either moves (DESIGN.md P1). The rules are pure
+// in-memory functions over a config that has already been read, so this adds
+// no query.
 presentationsRouter.get("/:id", async (req: AuthedRequest, res) => {
   const item = await prisma.presentation.findFirst({
     where: { id: req.params.id, ownerId: req.auth!.userId },
     include: { slides: { where: LIVE_SLIDES, orderBy: { order: "asc" } } },
   });
   if (!item) return res.status(404).json({ error: "Not found" });
-  res.json(item);
+  res.json({
+    ...item,
+    slides: item.slides.map((s) => ({
+      ...s,
+      configIssues: configAdvice(s.type, safeParseConfig(s.config)),
+    })),
+  });
 });
 
 // Update presentation title
@@ -110,11 +126,20 @@ async function assertOwnedPresentation(userId: string, presentationId: string) {
 // edit on the server while the editor went on rendering it as saved. That is
 // strictly worse than storing a half-finished slide.
 //
-// So the rules run, and the result rides along in the response for a client
-// that wants to show it. Changing this to a refusal needs the editor to
-// handle the rejection first.
-function configAdvice(type: string, config: unknown): string[] {
-  return configIssues(type, config).map((i) => i.message);
+// So the rules run, and the result rides along in the response.
+//
+// THE KIND RIDES WITH IT. This used to be `.map(i => i.message)`, which threw
+// away the one thing the editor needs in order to show any of this without
+// becoming wallpaper. `broken` and `incomplete` are not two severities of the
+// same thing (../slides/types.ts): `incomplete` is what a slide someone is
+// still writing looks like — every brand-new RANKING, PIN_ON_IMAGE and
+// content slide is born with one, because `defaultConfig()` gives them an
+// empty config — while `broken` is a contradiction no amount of further
+// typing resolves. An editor told only "here are N strings" has to treat
+// those identically, and the only two options it then has are to nag on every
+// new slide or to say nothing at all. Which is exactly what it did.
+function configAdvice(type: string, config: unknown): ConfigIssue[] {
+  return configIssues(type, config);
 }
 
 // Add a slide

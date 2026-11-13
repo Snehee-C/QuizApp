@@ -7,12 +7,23 @@
 //
 // Two classes of finding:
 //
-//   ERROR   The importer will refuse the file, OR the slide will import and
+//   ERROR   The importer will refuse the file; OR the slide will import and
 //           then be broken/unplayable (a quiz that can never score, a pin
-//           slide with no image, options a player cannot pick).
+//           slide with no image, options a player cannot pick); OR the value
+//           written here is silently REPLACED at run time, so the deck plays
+//           as something other than what the file says. (Only `timeLimitSec`
+//           is in that third group — the server clamps every countdown to
+//           5-600s rather than refusing it.)
 //   WARN    Imports and works, but is probably not what the author meant
 //           (an unknown theme that silently falls back, a config key the app
 //           never reads — usually a typo).
+//
+// A rule may NOT be an ERROR merely because a config is unusual. The test is
+// the three clauses above, and it is checkable: the app's OWN `defaultConfig()`
+// output — what every "+ Add slide" in the editor stores — must pass this file
+// with exit 0. A validator that fails the product's own new-slide state is one
+// authors learn to run with `|| true`. One rule used to fail exactly that test
+// and has been moved to WARN; see `checkQuizSwitch`.
 //
 // Stock Node, no dependencies.
 
@@ -36,6 +47,19 @@ const KNOWN_THEMES = ["floodlight", "ember", "tide", "paper"];
 // server/src/slides/types.ts
 const MIN_TIME_LIMIT_SEC = 5;
 const MAX_TIME_LIMIT_SEC = 600;
+/**
+ * server/src/slides/types.ts MAX_ANSWER_SLOTS. The stage has six answer slots
+ * and `slotFor` resolves them with `index % 6`, so a seventh option is drawn
+ * in the first one's colour, shape AND letter. The importer refuses past this
+ * on MULTIPLE_CHOICE.options, RANKING.items and HUNDRED_POINTS.options.
+ */
+const MAX_ANSWER_SLOTS = 6;
+/**
+ * server/src/slides/types.ts MAX_OPTION_LABEL. The stage fitter shrinks every
+ * option label until none exceeds three lines and stops at 26px; 120 is the
+ * measured three-line capacity of a tile at 1920x1080, rounded down.
+ */
+const MAX_OPTION_LABEL = 120;
 
 // server/src/slides/registry.ts — VALID_SLIDE_TYPES, in registry order.
 const VALID_SLIDE_TYPES = [
@@ -122,7 +146,7 @@ function hasUnsafeKey(value, depth = 0) {
 }
 
 /** A non-empty string list, e.g. options / items / entries / bullets. */
-function checkStringList(where, cfg, key, { min, softMax, required = true, label = key }) {
+function checkStringList(where, cfg, key, { min, max, maxWhy, maxEntry, maxEntryWhy, softMax, required = true, label = key }) {
   const v = cfg[key];
   if (v === undefined) {
     if (required) err(where, `config.${key} is missing. ${label} is what the slide renders — without it the slide is blank.`);
@@ -139,15 +163,36 @@ function checkStringList(where, cfg, key, { min, softMax, required = true, label
     }
     if (v[i].trim() === "") {
       err(where, `config.${key}[${i}] is empty. A blank ${label.replace(/s$/, "")} renders as an empty slot the room cannot read.`);
+    } else if (maxEntry !== undefined && v[i].length > maxEntry) {
+      err(where, `config.${key}[${i}] is ${v[i].length} characters; the most the stage can set is ${maxEntry}${maxEntryWhy ? ` — ${maxEntryWhy}` : ""}. The importer refuses the file.`);
     }
   }
   if (min !== undefined && v.length < min) {
     err(where, `config.${key} has ${v.length} entr${v.length === 1 ? "y" : "ies"}; this type needs at least ${min}.`);
   }
+  if (max !== undefined && v.length > max) {
+    err(where, `config.${key} has ${v.length} entries; this type renders at most ${max}${maxWhy ? ` — ${maxWhy}` : ""}. The importer refuses the file.`);
+  }
   if (softMax !== undefined && v.length > softMax) {
     warn(where, `config.${key} has ${v.length} entries; the editor caps this type at ${softMax}. It will import, but the stage is designed for ${softMax}.`);
   }
   return v;
+}
+
+/** The explanation that goes with MAX_ANSWER_SLOTS, in the author's terms. */
+const SLOT_WHY = `the stage has ${MAX_ANSWER_SLOTS} answer slots and reuses them from the top, so entry ${MAX_ANSWER_SLOTS + 1} is drawn in slot A's colour, shape and letter and the room sees two tiles marked "A"`;
+
+/**
+ * Mirrors `sameOnScreen()` in server/src/slides/multipleChoice.ts.
+ *
+ * Two option labels collide when they are the same PIXELS, not the same
+ * string: a zero-width space, a joiner, a left-to-right mark or a BOM paints
+ * nothing, and `["Paris", "Paris\u200b"]` used to walk past both this file and
+ * the importer and put two tiles reading "Paris" on the wall, one of them
+ * marked wrong.
+ */
+function sameOnScreen(label) {
+  return label.normalize("NFC").replace(/\p{Cf}/gu, "").replace(/\s+/gu, " ").trim().toLocaleLowerCase();
 }
 
 function typeOf(v) {
@@ -190,9 +235,24 @@ function checkQuizSwitch(where, type, cfg, hasKey) {
   checkOptionalBool(where, cfg, "isQuiz");
   const on = cfg.isQuiz === true;
   if (hasKey && !on) {
-    err(
+    // WARN, not ERROR, and this is the one reclassification in the file.
+    //
+    // `{options, isQuiz: false, correctIndices: [0], timeLimitSec: 20}` is not
+    // a corrupt deck — it is the EXACT config the app stores for every slide
+    // created with "+ Add slide" (server/src/routes/presentations.ts
+    // defaultConfig, and the same object in client/src/slides/
+    // multipleChoice.tsx). The importer accepts it, the slide plays as a
+    // perfectly good poll, and the key is simply vestigial. Calling that an
+    // ERROR failed all three clauses of the severity contract at the top of
+    // this file, and it failed them on the product's own output — so the
+    // server's `multipleChoice.ts` says in as many words that it declines to
+    // check it: "the normal state of an unfinished poll, not a defect".
+    //
+    // It stays loud, because it IS the most common way to ship a quiz that
+    // scores zero. It just no longer exits 1 on a file the app wrote.
+    warn(
       where,
-      `an answer key is set but config.isQuiz is ${cfg.isQuiz === undefined ? "missing" : quote(cfg.isQuiz)}. ${type} only scores — and only runs a countdown — when isQuiz is exactly true. As written this slide awards 0 points to everyone. Set "isQuiz": true, or drop the answer key if the slide is meant to be an unscored poll.`
+      `an answer key is set but config.isQuiz is ${cfg.isQuiz === undefined ? "missing" : quote(cfg.isQuiz)}. ${type} only scores — and only runs a countdown — when isQuiz is exactly true, so as written this slide is an unscored POLL and awards 0 points to everyone. That is a valid slide and the importer accepts it (it is also what a brand-new slide looks like before anyone ticks "Quiz mode"), so this is a warning — but if you meant a quiz, set "isQuiz": true.`
     );
   }
   if (on && !hasKey) {
@@ -205,9 +265,35 @@ function checkQuizSwitch(where, type, cfg, hasKey) {
 
 const RULES = {
   MULTIPLE_CHOICE(where, cfg) {
-    const options = checkStringList(where, cfg, "options", { min: 2, softMax: 6, label: "options" });
+    const options = checkStringList(where, cfg, "options", {
+      min: 2,
+      max: MAX_ANSWER_SLOTS,
+      maxWhy: SLOT_WHY,
+      maxEntry: MAX_OPTION_LABEL,
+      maxEntryWhy: "the stage shrinks every option to the biggest size that keeps all of them inside three lines, and stops at 26px",
+      label: "options",
+    });
     checkOptionalBool(where, cfg, "allowMultiple");
     checkTimeLimit(where, cfg);
+
+    // Two options that paint the same pixels. On a quiz only one of them can
+    // be the correct index, so the room sees two identical tiles and whoever
+    // taps the wrong twin is marked wrong in front of everyone.
+    if (Array.isArray(options)) {
+      const seenLabels = new Map();
+      for (const o of options) {
+        if (typeof o !== "string") continue;
+        const k = sameOnScreen(o);
+        if (k === "") continue;
+        if (seenLabels.has(k)) {
+          const first = seenLabels.get(k);
+          const pair = first === o ? quote(o) : `${quote(first)} and ${quote(o)} — different strings, the same pixels on the wall`;
+          err(where, `config.options lists the same answer twice (${pair}). The importer refuses the file.`);
+          break;
+        }
+        seenLabels.set(k, o);
+      }
+    }
 
     let key = null;
     if (cfg.correctIndices !== undefined) {
@@ -276,11 +362,11 @@ const RULES = {
   OPEN_ENDED() {},
 
   RANKING(where, cfg) {
-    checkStringList(where, cfg, "items", { min: 2, softMax: 6, label: "items" });
+    checkStringList(where, cfg, "items", { min: 2, max: MAX_ANSWER_SLOTS, maxWhy: SLOT_WHY, label: "items" });
   },
 
   HUNDRED_POINTS(where, cfg) {
-    checkStringList(where, cfg, "options", { min: 2, softMax: 6, label: "options" });
+    checkStringList(where, cfg, "options", { min: 2, max: MAX_ANSWER_SLOTS, maxWhy: SLOT_WHY, label: "options" });
     if (cfg.total !== undefined) {
       if (!isInt(cfg.total) || cfg.total <= 0) {
         err(where, `config.total must be a whole number above 0, got ${quote(cfg.total)}. It is the budget every player must spend exactly.`);
@@ -466,14 +552,14 @@ function validateDeck(doc, rawBytes) {
 
   const slides = doc.slides;
   if (slides === undefined) {
-    warn("envelope", `slides is missing; this imports an empty deck.`);
+    err("envelope", `slides is missing. A deck with nothing in it cannot be presented at all — the session handler refuses it with EMPTY_DECK — so the importer now refuses the file rather than letting the failure wait until a room is watching.`);
     return;
   }
   if (!Array.isArray(slides)) {
     err("envelope", `slides must be a list, got ${typeOf(slides)}.`);
     return;
   }
-  if (slides.length === 0) warn("envelope", `slides is empty; this imports a deck with nothing in it.`);
+  if (slides.length === 0) err("envelope", `slides is empty. A deck with nothing in it cannot be presented — the session handler refuses it with EMPTY_DECK — so the importer refuses the file.`);
   if (slides.length > MAX_SLIDES) err("envelope", `the deck has ${slides.length} slides; the limit is ${MAX_SLIDES}.`);
 
   slides.forEach((slide, i) => validateSlide(slide, i));

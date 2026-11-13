@@ -7,7 +7,33 @@ import {
   checkStringList,
   checkOptionalBool,
   checkOptionalFiniteNumber,
+  MAX_ANSWER_SLOTS,
+  ANSWER_SLOT_WHY,
+  MAX_OPTION_LABEL,
 } from "./types.js";
+
+/**
+ * Two labels are "the same answer" when they are the same PIXELS on the wall,
+ * which is not the same test as being the same string.
+ *
+ * `trim()` + lowercase — what this check used to be — compares what the JSON
+ * holds. A projector compares what it paints, and a zero-width space, a
+ * joiner, a left-to-right mark or a BOM paints nothing at all. `["Paris",
+ * "Paris\u200b"]` walked straight past the duplicate check and put two tiles
+ * on the wall both reading "Paris", one of them marked wrong. So: fold away
+ * the characters with no glyph (`\p{Cf}` — the Unicode format category, which
+ * is exactly that set), collapse every run of whitespace (`\s` already covers
+ * NBSP, the narrow NBSP and the ideographic space) to one ordinary space, and
+ * normalise composed vs decomposed accents to one spelling before comparing.
+ */
+function sameOnScreen(label: string): string {
+  return label
+    .normalize("NFC")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .toLocaleLowerCase();
+}
 
 // Multiple choice. Doubles as "Quiz: select answer" when config.isQuiz is set,
 // which is how Mentimeter models it too.
@@ -42,7 +68,15 @@ export const multipleChoice: SlideServerDef = {
   // slide, so it is the normal state of an unfinished poll, not a defect.
   validateConfig(config): ConfigIssue[] {
     const issues: ConfigIssue[] = [
-      ...checkStringList(config, "options", { min: 2, label: "the options" }),
+      ...checkStringList(config, "options", {
+        min: 2,
+        label: "the options",
+        max: MAX_ANSWER_SLOTS,
+        maxWhy: ANSWER_SLOT_WHY,
+        maxEntry: MAX_OPTION_LABEL,
+        maxEntryWhy:
+          "the stage shrinks every option to the biggest size that keeps all of them inside three lines, and stops at 26px",
+      }),
       ...checkOptionalBool(config, "allowMultiple"),
       ...checkOptionalBool(config, "isQuiz"),
       ...checkOptionalFiniteNumber(config, "timeLimitSec"),
@@ -51,13 +85,21 @@ export const multipleChoice: SlideServerDef = {
     const options: unknown[] = Array.isArray(config?.options) ? config.options : [];
     const labels = options
       .filter((o): o is string => typeof o === "string")
-      .map((o) => o.trim().toLocaleLowerCase())
-      .filter((o) => o !== "");
-    const dupLabel = labels.find((l, i) => labels.indexOf(l) !== i);
-    if (dupLabel !== undefined) {
+      .map((o) => ({ shown: o, key: sameOnScreen(o) }))
+      .filter((o) => o.key !== "");
+    const dup = labels.find((l, i) => labels.findIndex((x) => x.key === l.key) !== i);
+    if (dup !== undefined) {
       const quizzed = config?.isQuiz === true;
+      const twin = labels.find((x) => x.key === dup.key)!;
+      // Both ORIGINAL spellings, not the folded key: when the difference is a
+      // character with no glyph, the host needs to see that the two strings
+      // they are looking at really are the two the server is objecting to.
+      const pair =
+        twin.shown === dup.shown
+          ? JSON.stringify(dup.shown)
+          : `${JSON.stringify(twin.shown)} and ${JSON.stringify(dup.shown)} — different strings, the same pixels on the wall`;
       const msg =
-        `config.options lists the same answer twice (${JSON.stringify(dupLabel)}). ` +
+        `config.options lists the same answer twice (${pair}). ` +
         (quizzed
           ? "Only one of the two can be the correct index, so a player tapping the other identical option is marked wrong."
           : "The room's votes split across two identical bars.");

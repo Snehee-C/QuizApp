@@ -315,8 +315,16 @@ export function StageAnswers({
             {/* h-full so a short option sits on the tile's optical centre.
                 Equal-height tiles without it leave "C" hanging at the top of
                 its own block, which is the lopsidedness one layer down. */}
+            {/* The tile's padding and gutter are `em`, not px. They were
+              * 28/24/20px fixed, which is right at the design size and wrong
+              * everywhere else: on a 4K stage the type beside them doubles and
+              * a tile that is mostly padding at 1366 becomes a tile that is
+              * barely any at 2160. In `em` the tile is one shape at every
+              * resolution, and at 1920x1080 the three values compute to
+              * 27.95 / 23.96 / 19.97px against the 28 / 24 / 20 they replace —
+              * the same tile, to a third of a pixel. */}
             <div
-              className="relative h-full flex items-center gap-5 px-7 py-6"
+              className="relative h-full flex items-center gap-[0.4em] px-[0.56em] py-[0.48em] text-stage-answer"
               style={{ color: bare ? "var(--ink)" : slot.ink }}
             >
               <span

@@ -15,6 +15,7 @@ import { RACE, STAGGER, ease, prefersReducedMotion, spring } from "../lib/motion
 import { burstFrom } from "../lib/confetti";
 import { playSound } from "../lib/sound";
 import { cn } from "../lib/cn";
+import { pkeyOf } from "./participantKey";
 
 interface BarRaceLeaderboardProps {
   entries: LeaderboardEntry[];
@@ -118,11 +119,23 @@ interface BarRaceLeaderboardProps {
 /** The last board each surface rendered. See the note above. */
 const remembered = new Map<string, LeaderboardEntry[]>();
 
-type RaceMode = "none" | "cold" | "warm";
+// "entry" is the fourth reading of a new board, and the one the other three
+// could not express: nobody we remember moved, but somebody we do NOT remember
+// has taken a place from somebody we do. See `resolveBaseline`.
+type RaceMode = "none" | "cold" | "warm" | "entry";
 
 interface Baseline {
   mode: RaceMode;
-  /** participantId -> the score and rank the room last saw. */
+  /**
+   * pkey -> the score and rank the room last saw.
+   *
+   * Keyed by `pkeyOf`, not by `participantId`: this component is the stage's
+   * standings AND the phone's scoreboard, and `participantId` is no longer
+   * sent to phones (it is a bearer token — components/participantKey.ts). The
+   * key has to be one both audiences receive or the phone board crashes on the
+   * first `undefined`. `pkey` is stable for the length of a session, which is
+   * the only span this map or `raceKey` has to span.
+   */
   prev: Map<string, { score: number; rank: number }>;
   leader: string | null;
 }
@@ -136,13 +149,15 @@ interface Baseline {
 function resolveBaseline(
   entries: LeaderboardEntry[],
   explicit: LeaderboardEntry[] | null | undefined,
-  key: string
+  key: string,
+  /** How many rows reach the screen — see the `entry` test at the bottom. */
+  drawn: number
 ): Baseline {
   const empty: Baseline = { mode: "none", prev: new Map(), leader: null };
   if (entries.length === 0) return empty;
 
   const prior = explicit ?? remembered.get(key) ?? null;
-  const ids = new Set(entries.map((e) => e.participantId));
+  const ids = new Set(entries.map(pkeyOf));
 
   // Cold: no order to withhold, so everyone races up from zero instead.
   // Still a race — just one with no overtakes in it.
@@ -151,11 +166,11 @@ function resolveBaseline(
   // A remembered board that shares nobody with this one is a DIFFERENT room.
   // Racing the new game's first board up out of the old game's order would be
   // a lie, and a very confident-looking one.
-  const overlap = prior?.filter((e) => ids.has(e.participantId)) ?? [];
+  const overlap = prior?.filter((e) => ids.has(pkeyOf(e))) ?? [];
   if (overlap.length === 0) return cold;
 
   const prev = new Map<string, { score: number; rank: number }>();
-  prior!.forEach((e, i) => prev.set(e.participantId, { score: e.score, rank: i }));
+  prior!.forEach((e, i) => prev.set(pkeyOf(e), { score: e.score, rank: i }));
 
   // ── The staleness guard ───────────────────────────────────────────────
   // A score inside one session only ever goes UP. So a remembered score that
@@ -176,14 +191,13 @@ function resolveBaseline(
   // The keys are now session-scoped at both call sites, which is the real fix.
   // This is the guard that makes the component unable to do it anyway.
   const stale = entries.some((e) => {
-    const k = prev.get(e.participantId);
+    const k = prev.get(pkeyOf(e));
     return k !== undefined && k.score > e.score;
   });
   if (stale) return cold;
 
-  // Nothing changed — the host toggled the standings off and back on, or the
-  // last slide scored nobody. Replaying a race with no movement in it is a
-  // 2-second pause that resolves into the same picture.
+  // Did a score change? Replaying a race with no movement in it is a 2-second
+  // pause that resolves into the same picture.
   //
   // "Changed" has to mean the same thing here as it does in `prevScoreOf`, or
   // the component arms a race it cannot run. It did not: this test read an
@@ -196,12 +210,66 @@ function resolveBaseline(
   //
   // So only a player we actually remember can carry evidence of movement.
   const moved = entries.some((e) => {
-    const k = prev.get(e.participantId);
+    const k = prev.get(pkeyOf(e));
     return k !== undefined && k.score !== e.score;
   });
-  if (!moved) return empty;
+  if (moved) return { mode: "warm", prev, leader: prior![0] ? pkeyOf(prior![0]) : null };
 
-  return { mode: "warm", prev, leader: prior![0]?.participantId ?? null };
+  // ── Nobody we remember moved. That is NOT the same as "nothing happened" ──
+  //
+  // The test above is about scores, and it is right to be: only a player we
+  // actually remember can carry evidence that a NUMBER changed. But a board
+  // has two things in it, and the other one is who is on it. A row the room
+  // has never seen can arrive and take a place from a row it has, and when
+  // that happens the scores of everybody we remember are untouched — so the
+  // score test says "nothing moved" about the single largest turnover a board
+  // can have.
+  //
+  // Measured, on the case this exists for: ten players, five rows drawn. Five
+  // answer Q1 and own the visible board; the other five answer nothing, so
+  // they have no `Response` row and `computeLeaderboard` gives them no row at
+  // all. On Q2 only the second five answer, instantly, and sweep the entire
+  // visible top five. What the room was shown: no arming line, frame-one names
+  // already the final order, frame-one scores already final, bar widths already
+  // final, ZERO order changes over 197 sampled frames, and `[]` chips. Five
+  // people each won ~985 points in front of the room and the board simply
+  // changed between one glance and the next.
+  //
+  // WHAT THE STAGE MAY HONESTLY SAY. Not much, and that is the whole design
+  // here. We do not know what these players scored before, because they were
+  // not on the board — and "not on the board" and "not in the room" are
+  // indistinguishable from here (see the note on `prevScoreOf`). So the two
+  // obvious rescues are both lies: racing them up from zero puts a number on
+  // screen they never had, and seating them at the bottom first claims a
+  // position the remembered board never showed.
+  //
+  // But one thing IS known, exactly and without inference: these rows were not
+  // there, and now they are, and they are above rows that were. That is an
+  // event, it is the event, and `entry` is the stage saying it — the board the
+  // room remembers is held, the arrivals are announced into it one at a time,
+  // each landing at the rank it really holds, and the rows they push down
+  // descend to where they really end. Every number on screen is the player's
+  // own, unmoved, throughout. Nothing is invented; the silence is what goes.
+  //
+  // The test is "took a place", not merely "is new". A newcomer who lands
+  // BELOW everybody we remember has displaced nobody — the board the room saw
+  // is still the board it is looking at, with a name added under it — and
+  // there is no moment to make out of that. (This is also precisely round 7's
+  // R4 case, which must stay silent: Ana/Ben/Cleo answer Q1, Dev skips it and
+  // then answers Q2 alone for fewer points than any of them. Fourth of four,
+  // displacing no one, no race, no chips.)
+  const lastRemembered = entries.reduce(
+    (acc, e, i) => (prev.has(pkeyOf(e)) ? i : acc),
+    -1
+  );
+  const tookAPlace = entries.some(
+    (e, i) => i < drawn && i < lastRemembered && !prev.has(pkeyOf(e))
+  );
+  if (tookAPlace) return { mode: "entry", prev, leader: prior![0] ? pkeyOf(prior![0]) : null };
+
+  // Nothing moved and nothing arrived: the host toggled the standings off and
+  // back on, or the last slide scored nobody.
+  return empty;
 }
 
 export function BarRaceLeaderboard({
@@ -230,10 +298,13 @@ export function BarRaceLeaderboard({
 
   const baseRef = useRef<Baseline | null>(null);
   if (baseRef.current === null) {
-    baseRef.current = resolveBaseline(entries, previousEntries, raceKey);
+    baseRef.current = resolveBaseline(entries, previousEntries, raceKey, drawn);
   }
   const base = baseRef.current;
-  const armMs = base.mode === "warm" ? RACE.arm : RACE.armCold;
+  // `entry` holds on the remembered board exactly as `warm` does — it is the
+  // same withholding, and the thing being withheld (who is about to appear) is
+  // if anything the bigger reveal of the two.
+  const armMs = base.mode === "warm" || base.mode === "entry" ? RACE.arm : RACE.armCold;
 
   // Whether the race RUNS. Reduced motion is the one case where the board has
   // a story to tell and tells it in text instead: rows that travel up and
@@ -267,11 +338,18 @@ export function BarRaceLeaderboard({
   //           never showed. So they do not move, and they carry no +Δ and no
   //           rank arrow — the component says nothing rather than something
   //           false.
+  //
+  //   entry — nobody we remember moved and nobody we do not can be given a
+  //           number, so NO score on this board is interpolated at all. The
+  //           whole of the movement is who is on screen, and that is carried
+  //           by `liveOrder` below, not by a bar.
   const prevScoreOf = (id: string) => {
-    if (base.mode === "none") return entries.find((e) => e.participantId === id)?.score ?? 0;
+    if (base.mode === "none" || base.mode === "entry") {
+      return entries.find((e) => pkeyOf(e) === id)?.score ?? 0;
+    }
     if (base.mode === "cold") return 0;
     const known = base.prev.get(id);
-    return known ? known.score : (entries.find((e) => e.participantId === id)?.score ?? 0);
+    return known ? known.score : (entries.find((e) => pkeyOf(e) === id)?.score ?? 0);
   };
 
   /** 0 = the board the room remembers, 1 = the board it is about to have. */
@@ -280,13 +358,48 @@ export function BarRaceLeaderboard({
 
   // `entries` arrives sorted by the server, so an entry's index in it IS the
   // authoritative final rank — including however the server breaks ties.
-  const finalIndex = new Map(entries.map((e, i) => [e.participantId, i]));
+  const finalIndex = new Map(entries.map((e, i) => [pkeyOf(e), i]));
 
-  const liveOrder = (v: number) =>
-    [...entries]
+  // The rows that were not on the board the room remembers, in the server's
+  // order — which is to say best first. Empty outside `entry`.
+  const arrivals =
+    base.mode === "entry"
+      ? entries.filter((e) => !base.prev.has(pkeyOf(e))).map(pkeyOf)
+      : [];
+  const arrivalIndex = new Map(arrivals.map((id, i) => [id, i]));
+
+  const liveOrder = (v: number) => {
+    if (base.mode === "entry") {
+      // Announced ONE AT A TIME, BEST FIRST, across the run.
+      //
+      // Best first is not a flourish, it is the only order in which every
+      // intermediate frame is true. A row admitted at its final rank lands
+      // where it really belongs and never moves again, and the rows below it
+      // only ever descend, monotonically, to where they really end. Admitting
+      // the weakest arrival first would show it at #1 for 200ms — a rank it
+      // never held — purely as an artifact of the order we chose, which is
+      // exactly the kind of confident-looking invention the rest of this
+      // component refuses.
+      //
+      // `n + 1` rather than `n` so the last arrival lands at v = n/(n+1) and
+      // the board has the tail of the run to settle on, instead of the top row
+      // appearing on the final frame.
+      const admitted = Math.min(arrivals.length, Math.floor(v * (arrivals.length + 1)));
+      return entries
+        .filter(
+          (e) =>
+            base.prev.has(pkeyOf(e)) ||
+            (arrivalIndex.get(pkeyOf(e)) ?? Infinity) < admitted
+        )
+        .map(pkeyOf);
+      // At v = 0 that is the remembered board: `entries` is the server's order
+      // and no remembered score has changed, so the rows we remember stand in
+      // the same order the room last saw them in.
+    }
+    return [...entries]
       .sort((a, b) => {
-        const ai = prevScoreOf(a.participantId) + (a.score - prevScoreOf(a.participantId)) * v;
-        const bi = prevScoreOf(b.participantId) + (b.score - prevScoreOf(b.participantId)) * v;
+        const ai = prevScoreOf(pkeyOf(a)) + (a.score - prevScoreOf(pkeyOf(a))) * v;
+        const bi = prevScoreOf(pkeyOf(b)) + (b.score - prevScoreOf(pkeyOf(b))) * v;
         // The tie-break is INTERPOLATED on the same v, which is the only way
         // it can be right at both ends: at v=0 it is the remembered rank, so
         // the board reproduces what the room saw last time down to the order
@@ -297,11 +410,12 @@ export function BarRaceLeaderboard({
         // wrong order at v=0, because the FINAL scores were deciding it.
         return (
           bi - ai ||
-          tieOf(a.participantId, v) - tieOf(b.participantId, v) ||
-          a.participantId.localeCompare(b.participantId)
+          tieOf(pkeyOf(a), v) - tieOf(pkeyOf(b), v) ||
+          pkeyOf(a).localeCompare(pkeyOf(b))
         );
       })
-      .map((e) => e.participantId);
+      .map(pkeyOf);
+  };
 
   function tieOf(id: string, v: number) {
     const will = finalIndex.get(id) ?? entries.length;
@@ -388,7 +502,15 @@ export function BarRaceLeaderboard({
       // moves from 16ms to ~55ms and is a motion rather than a cut, and the
       // bars still cover ~28% of their distance in the first 150ms, so
       // nothing reads as stalled.
-      ease: ease.standard,
+      //
+      // `entry` is the exception, and for the same reason the arming line is
+      // linear: nothing is being interpolated there, so `p` is not a motion
+      // curve, it is a CLOCK counting arrivals out one at a time. Eased, the
+      // fast middle of the curve bunched the five announcements 49ms apart
+      // while the first and last sat 166ms from their neighbours — measured —
+      // which reads as a stutter rather than a rhythm, and piles each
+      // departing row's 200ms exit on top of the next one's.
+      ease: base.mode === "entry" ? "linear" : ease.standard,
     });
     const toRun = window.setTimeout(() => setPhase("run"), armMs);
     const toSettle = window.setTimeout(() => {
@@ -414,7 +536,10 @@ export function BarRaceLeaderboard({
   // the new leader is confirmed, not the frame the data arrived.
   const leaderRefs = useRef<Map<string, HTMLElement>>(new Map());
   useEffect(() => {
-    if (!celebrateLeader || phase !== "settled" || base.mode !== "warm") return;
+    // `entry` qualifies: the new leader arrived on screen, in front of the
+    // room, out of a board that visibly did not contain them.
+    if (!celebrateLeader || phase !== "settled" || (base.mode !== "warm" && base.mode !== "entry"))
+      return;
     const winner = order[0];
     if (!winner || winner === startLeader) return;
     burstFrom(leaderRefs.current.get(winner) ?? null, 110);
@@ -434,23 +559,39 @@ export function BarRaceLeaderboard({
     );
   }
 
-  const byId = new Map(entries.map((e) => [e.participantId, e]));
+  const byId = new Map(entries.map((e) => [pkeyOf(e), e]));
   const settled = phase === "settled";
   // The ledger is only honest in `warm`. A cold board has no remembered
   // scores, so "+971" there would be a player's SESSION TOTAL wearing a
   // round-delta chip — which, on a host who opens the standings for the first
   // time after question three, is simply a wrong number. The cold race up from
   // zero already says everything that can be said.
-  const showDelta = base.mode === "warm";
+  const showDelta = base.mode === "warm" || base.mode === "entry";
+  // Rows the remembered board did not contain. They get the one chip that is
+  // true of them — see the ledger at the bottom of RaceRow.
+  const isNewRow = (id: string) =>
+    base.mode !== "cold" && base.mode !== "none" && !base.prev.has(id);
 
+  // The stage gutters below — this one, the row gap, the rank column, the
+  // score's indent and the name's — are design-size px on the same anchor as
+  // the type: `max(Npx, Mvh)` with M = N/10.8. They were fixed px, which on a
+  // 4K stage left a 112px avatar ball overlapping a name 24px away from it:
+  // the row's furniture stayed 1080p-sized while everything inside it grew.
+  // Each one computes to its old value exactly at 1920x1080.
   return (
-    <div className={cn("flex flex-col w-full", stage ? "gap-4" : "gap-2.5", className)}>
+    <div
+      className={cn(
+        "flex flex-col w-full",
+        stage ? "gap-[max(16px,1.4815vh)]" : "gap-2.5",
+        className
+      )}
+    >
       {/* The arming line. This is the riser's visual half, and the only thing
        * on screen during the hold — without it a muted room cannot tell a
        * deliberate pause from a stalled projector. Carries real information
        * (how long until the bars move), which is what earns it a place under
        * P2. `linear`, because it is a clock. */}
-      {base.mode === "warm" && animated && (
+      {(base.mode === "warm" || base.mode === "entry") && animated && (
         <motion.div
           className={cn("relative w-full overflow-hidden rounded-pill", stage ? "h-1.5" : "h-1")}
           style={{ background: "color-mix(in oklch, var(--ink), transparent 88%)" }}
@@ -501,6 +642,7 @@ export function BarRaceLeaderboard({
               reduced={reduced.current!}
               settled={settled}
               showDelta={showDelta}
+              isNew={isNewRow(id)}
               // No captured index means this row was not on screen when the
               // board landed — it climbed into the visible window during the
               // run. The stagger is the ENTRANCE's rhythm and this is not the
@@ -533,6 +675,8 @@ interface RaceRowProps {
   reduced: boolean;
   settled: boolean;
   showDelta: boolean;
+  /** This row was not on the board the room remembers. */
+  isNew: boolean;
   entranceDelay: number;
   onBallRef: (el: HTMLElement | null) => void;
 }
@@ -557,6 +701,7 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
   reduced,
   settled,
   showDelta,
+  isNew,
   entranceDelay,
   onBallRef,
 }: RaceRowProps, ref) {
@@ -572,7 +717,11 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
   // against this fill (answers.ts).
   const solid = tile.solid;
   const ink = tile.ink;
-  const h = stage ? "h-[clamp(52px,5.4vh,84px)]" : "h-12";
+  // No ceiling (see tailwind.config.js, the stage ladder). The old `84px`
+  // cap bit from 1555px of height up, so a 4K stage drew 3.89vh rows where
+  // 1080p draws 5.37vh — the standings shrank by 28% of the screen on exactly
+  // the projector this is for.
+  const h = stage ? "h-[max(52px,5.4vh)]" : "h-12";
 
   // Everything positional reads from ONE interpolation, which is why the bar,
   // the number and the row's rank can never disagree with each other.
@@ -622,7 +771,7 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
         opacity: { duration: reduced ? 0.12 : 0.28, delay: entranceDelay },
         y: { ...spring.default, delay: entranceDelay },
       }}
-      className="relative flex items-center gap-3"
+      className={cn("relative flex items-center", stage ? "gap-[max(12px,1.1111vh)]" : "gap-3")}
     >
       {/* The rank goes the instant the row starts leaving. `rank` is this
        * row's index in the DRAWN five, and an exiting row keeps the props it
@@ -635,7 +784,7 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
       <div
         className={cn(
           "nums shrink-0 text-center font-bold text-ink-subtle",
-          stage ? "w-10 text-stage-label" : "w-5 text-footnote"
+          stage ? "w-[max(2.5rem,3.7037vh)] text-stage-label" : "w-5 text-footnote"
         )}
         style={{ opacity: isPresent ? 1 : 0 }}
         aria-hidden={!isPresent}
@@ -658,8 +807,8 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
           <span
             data-race-score
             className={cn(
-              "nums tabular-nums pl-4 font-bold drop-shadow-sm",
-              stage ? "text-stage-label" : "text-subhead"
+              "nums tabular-nums font-bold drop-shadow-sm",
+              stage ? "pl-[max(16px,1.4815vh)] text-stage-label" : "pl-4 text-subhead"
             )}
             style={{ color: ink }}
           >
@@ -672,9 +821,12 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
           className="absolute top-1/2 grid place-items-center rounded-pill z-[3] pointer-events-none"
           style={{
             left,
-            width: stage ? 56 : 38,
-            height: stage ? 56 : 38,
-            fontSize: stage ? 28 : 19,
+            // The ball rides the bar it sits on, so it is anchored the way the
+            // bar is rather than pinned in px: at 56px it was a third of a 4K
+            // row's height and looked like a bullet point.
+            width: stage ? "max(56px, 5.1852vh)" : 38,
+            height: stage ? "max(56px, 5.1852vh)" : 38,
+            fontSize: stage ? "max(28px, 2.5926vh)" : 19,
             x: "-50%",
             y: "-50%",
             background: ballBg(solid),
@@ -690,7 +842,9 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
         data-race-name
         className={cn(
           "shrink-0 font-semibold text-ink truncate",
-          stage ? "w-[clamp(8rem,13vw,16rem)] text-stage-label pl-6" : "w-20 text-subhead pl-4"
+          stage
+            ? "w-[max(8rem,min(13vw,23.1111vh))] text-stage-label pl-[max(24px,2.2222vh)]"
+            : "w-20 text-subhead pl-4"
         )}
         title={entry.name}
       >
@@ -712,7 +866,7 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
           data-race-delta
           className={cn(
             "shrink-0 flex items-center justify-end gap-1.5",
-            stage ? "w-[clamp(5.5rem,8vw,10rem)] text-stage-label" : "w-16 text-caption"
+            stage ? "w-[max(5.5rem,min(8vw,14.2222vh))] text-stage-label" : "w-16 text-caption"
           )}
           initial={{ opacity: 0 }}
           animate={{ opacity: settled ? 1 : 0 }}
@@ -727,6 +881,37 @@ const RaceRow = forwardRef<HTMLDivElement, RaceRowProps>(function RaceRow({
               }}
             >
               +{delta.toLocaleString()}
+            </span>
+          )}
+
+          {/* The only chip that is true of a row the room has never seen.
+            *
+            * It is here INSTEAD of a `+Δ`, not beside one: a player who was
+            * not on the remembered board has no remembered score, so there is
+            * no delta to print and any number we printed would be a guess
+            * wearing a ledger's clothes. "New" is the whole of what is known
+            * — this row was not there, and it is now — and it is enough,
+            * because it is the thing that explains the board. It takes the
+            * accent for the same reason a gain does: arriving on the board is
+            * the good half of the event.
+            *
+            * This is the half of `entry` that survives `prefers-reduced-motion`
+            * (and the half that fires in `warm` too, where a newcomer used to
+            * get nothing at all). With the arrivals suppressed the board simply
+            * lands — so without this a reader who asked for a calmer screen
+            * would be shown five names they have no account of. */}
+          {isNew && delta <= 0 && (
+            <span
+              className={cn(
+                "font-bold uppercase track-label rounded-pill",
+                stage ? "px-3 py-0.5" : "px-1.5"
+              )}
+              style={{
+                color: "var(--accent)",
+                background: "color-mix(in oklch, var(--accent), transparent 86%)",
+              }}
+            >
+              New
             </span>
           )}
           {rankMove !== null && rankMove !== 0 && (

@@ -20,6 +20,8 @@ import { slideType } from "../slides/registry";
 import { Podium, LeaderboardList, type LeaderboardEntry } from "../components/Podium";
 import { BarRaceLeaderboard } from "../components/BarRaceLeaderboard";
 import { PlayerBubbles } from "../components/PlayerBubbles";
+import { useStageScale } from "../components/stageScale";
+import type { RowIdentity } from "../components/participantKey";
 import { NumberTicker } from "../components/ui/NumberTicker";
 import { TimerRing } from "../components/ui/TimerRing";
 import { FitText } from "../components/ui/FitText";
@@ -44,8 +46,12 @@ interface CurrentSlide {
   order: number;
 }
 
-interface Participant {
-  participantId: string;
+// The roster row, as this surface uses it: a name, a hue and an identity to
+// key a bubble by. A presenter socket still receives `participantId` and may,
+// but nothing here reads it — `PlayerBubbles` keys off `pkeyOf`, the one field
+// both audiences get (components/participantKey.ts) — so the shape is written
+// so a frame carrying either one is enough.
+interface Participant extends RowIdentity {
   name: string;
   avatar: number;
 }
@@ -827,6 +833,7 @@ function LobbyStage({
   participants: Participant[];
   participantCount: number;
 }) {
+  const stageK = useStageScale();
   // Show the address phones must type, which is not necessarily this page's.
   const host = `${joinOrigin.replace(/^https?:\/\//, "")}${window.location.pathname}#/join`;
   return (
@@ -871,7 +878,16 @@ function LobbyStage({
       <div className="shrink-0 self-center flex flex-col items-center gap-3">
         <div className="bg-white p-5 rounded-xl" style={{ lineHeight: 0 }}>
           {joinUrl && (
-            <QRCodeSVG value={joinUrl} size={260} level="M" bgColor="#ffffff" fgColor="#000000" />
+            <QRCodeSVG
+              value={joinUrl}
+              // The room contract floors this at 220px because it is a scanner
+              // target, not a graphic; on a bigger stage the people furthest
+              // from it are further away, so it rides the anchor too.
+              size={Math.round(260 * stageK)}
+              level="M"
+              bgColor="#ffffff"
+              fgColor="#000000"
+            />
           )}
         </div>
         <p className="text-stage-label font-semibold uppercase track-label text-ink-subtle">
@@ -901,6 +917,8 @@ function QuestionStage({
   revealPayload: Record<string, any> | null;
   revealBadgeRef: React.RefObject<HTMLDivElement | null>;
 }) {
+  // Before the early return: a hook may not sit behind a condition.
+  const stageK = useStageScale();
   if (!slide) return null;
   const def = slideType(slide.type);
   if (!def) return null;
@@ -913,15 +931,22 @@ function QuestionStage({
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -12 }}
       transition={{ duration: 0.32, ease: [0, 0, 0.2, 1] }}
-      className="flex-1 min-h-0 flex flex-col justify-center gap-[clamp(20px,4vh,52px)] py-2"
+      // No ceiling on either of these (see tailwind.config.js, the stage
+      // ladder): the headline box capped at 280px from 1555px of height up, so
+      // on a 4K stage FitText was searching down into a box barely half the
+      // one 1080p gets while the ladder around it had doubled. Both are plain
+      // vh with a floor now, which is what they always meant.
+      className="flex-1 min-h-0 flex flex-col justify-center gap-[max(20px,4vh)] py-2"
     >
       {/* Content slides render edge to edge: the module draws its own heading,
           so a separate question line above it would just duplicate it. */}
       {!isContent && (
-        <div className="shrink-0 flex items-center gap-stage-gap h-[clamp(120px,24vh,280px)]">
+        <div className="shrink-0 flex items-center gap-stage-gap h-[max(120px,24vh)]">
           <div className="flex-1 min-w-0 h-full">
             {/* Condenses before it shrinks, so a long question stays readable
                 from the back of the room. */}
+            {/* `max`/`min` are design-size px and ride the stage anchor
+                from there (FitText). */}
             <FitText max={104} min={34}>
               {slide.question}
             </FitText>
@@ -931,8 +956,10 @@ function QuestionStage({
               key={slide.id}
               startedAt={startedAt}
               timeLimitSec={timeLimit ?? slide.config?.timeLimitSec ?? 20}
-              size={140}
-              stroke={14}
+              // Design-size px, scaled on the same anchor as the type beside
+              // it. A 140px ring held its size while the question doubled.
+              size={Math.round(140 * stageK)}
+              stroke={Math.round(14 * stageK)}
               className="shrink-0"
             />
           )}

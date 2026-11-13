@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { cn } from "../../lib/cn";
+import { serverNow } from "../../lib/serverClock";
 
 interface TimerRingProps {
   /** Wall-clock ms when the slide went live (server authoritative). */
@@ -17,6 +18,13 @@ interface TimerRingProps {
 // The sweep is driven by requestAnimationFrame against the server's startedAt
 // rather than a CSS transition, so it stays truthful across a tab throttle or a
 // late join. Easing a clock would be lying, so the motion is strictly linear.
+//
+// BOTH ends of the subtraction are the server's clock. `startedAt` always was;
+// `now` used to be `Date.now()`, the phone's, so the ring reported the gap
+// between two unrelated clocks and a phone set 60s slow was shown 78 seconds
+// on a 20-second question. `serverNow()` is `Date.now()` plus the offset the
+// wire has told us, and is exactly `Date.now()` until a frame carrying
+// `serverNow` has ever arrived (lib/serverClock.ts).
 export function TimerRing({
   startedAt,
   timeLimitSec,
@@ -36,7 +44,7 @@ export function TimerRing({
     }
     let raf = 0;
     const tick = () => {
-      const left = Math.max(0, timeLimitSec - (Date.now() - startedAt) / 1000);
+      const left = Math.max(0, timeLimitSec - (serverNow() - startedAt) / 1000);
       setRemaining(left);
       if (left <= 0 && !firedRef.current) {
         firedRef.current = true;

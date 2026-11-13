@@ -6,6 +6,7 @@ import {
   parseConfig,
   type PresentationWithSlides,
   type Slide,
+  type SlideConfigIssue,
   type SlideType,
 } from "../lib/api";
 import { Button } from "../components/ui/Button";
@@ -83,12 +84,78 @@ function noteLiveHonoured(deckId: string, slideId: string): void {
   }
 }
 
+// ── Config advisories ───────────────────────────────────────────────────
+//
+// WHY THIS IS SPLIT BY KIND AND NOT BY COUNT.
+//
+// Every slide write already came back with `configIssues` in a 200 body, and
+// nothing read it, so the editor authored decks `POST /api/transfer/import`
+// would refuse — the same server saying both things about the same deck. The
+// obvious fix, showing all of them, is the wrong one, and it is wrong for a
+// measurable reason: created through the editor's own "+ Add slide", with the
+// editor's own `defaultConfig()`, the seventeen slide types produce **zero**
+// `broken` issues and **sixteen** `incomplete` ones. A brand-new
+// CONTENT_BULLETS is born with three. An indicator that lights up the instant
+// you press a button teaches exactly one lesson, which is to stop looking at
+// it.
+//
+// So the two kinds get the two different moments they actually have:
+//
+//   broken      Shown at once, where the author is: inline under the form
+//               that produced it, and marked in the rail so a slide you are
+//               NOT looking at is still findable. This is the one that ran in
+//               front of a room in round 8 — a question with the answer key
+//               pointing at option 7 of 2, which nobody could get right and
+//               nothing ever mentioned. It cannot become wallpaper, because
+//               creating a slide cannot produce one.
+//
+//   incomplete  Not shown while editing at all. A half-written slide is the
+//               normal state of authoring, not a defect, and the form's live
+//               phone preview already renders it visibly empty. It is counted
+//               at the DECK level, in the deck check, because that is where
+//               the claim "this deck is finished" gets made — and an export
+//               of a deck with one is a file the importer turns down.
+//
+// Both registers are plain text on the existing surfaces. Neither is a toast,
+// a modal, or a thing that interrupts a keystroke (DESIGN.md P2).
+const brokenOf = (s: Slide): SlideConfigIssue[] =>
+  (s.configIssues ?? []).filter((i) => i.kind === "broken");
+const incompleteOf = (s: Slide): SlideConfigIssue[] =>
+  (s.configIssues ?? []).filter((i) => i.kind === "incomplete");
+
+/**
+ * The messages are written once, on the server, next to the rule that raises
+ * them — which is why they speak in `config.<key>` rather than in the labels
+ * this form happens to use. Rewriting them here would be a second copy that
+ * drifts from the first the day either moves (DESIGN.md P1), so they are shown
+ * verbatim and the config key is simply SET as what it is: a literal string
+ * you could type into a file. That is the one job mono is kept for (§3).
+ */
+const CONFIG_KEY = /(\bconfig\.[A-Za-z0-9_]+(?:\[\d+\])?)/g;
+
+function IssueText({ message }: { message: string }) {
+  return (
+    <>
+      {message.split(CONFIG_KEY).map((part, i) =>
+        i % 2 === 1 ? (
+          <code key={i} className="font-mono text-ink">
+            {part}
+          </code>
+        ) : (
+          <span key={i}>{part}</span>
+        )
+      )}
+    </>
+  );
+}
+
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
   const [pres, setPres] = useState<PresentationWithSlides | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [checkOpen, setCheckOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   // Set only once LiveRoomBar has confirmed the room with the server, so the
   // rail's "on screen" marker and the banner can never disagree.
@@ -233,6 +300,13 @@ export default function Editor() {
   }
 
   const selected = pres?.slides.find((s) => s.id === selectedId) ?? null;
+  // Counted over the WHOLE deck, not the open slide: the fault that reached a
+  // projector in round 8 was on a slide nobody was looking at.
+  const slides = pres?.slides ?? [];
+  const brokenSlides = slides.filter((s) => brokenOf(s).length > 0);
+  const unfinishedSlides = slides.filter(
+    (s) => brokenOf(s).length === 0 && incompleteOf(s).length > 0
+  );
   // Which slide the room is looking at. Null unless a session is genuinely
   // open — the editor follows the projector on arrival, and the marker is how
   // the host can see that it did, and see where the room is if they then
@@ -276,11 +350,38 @@ export default function Editor() {
           <Button
             variant={settingsOpen ? "secondary" : "ghost"}
             size="sm"
-            onClick={() => setSettingsOpen((v) => !v)}
+            onClick={() => {
+              setSettingsOpen((v) => !v);
+              setCheckOpen(false);
+            }}
             aria-expanded={settingsOpen}
           >
             Deck settings
           </Button>
+          {/* Nothing to say, nothing on screen. The control only exists when
+              the deck has something in it worth reading before you present,
+              and it names the worst of it rather than carrying two numbers —
+              one count in a header bar is a status, two is a dashboard. */}
+          {(brokenSlides.length > 0 || unfinishedSlides.length > 0) && (
+            <Button
+              variant={checkOpen ? "secondary" : "ghost"}
+              size="sm"
+              onClick={() => {
+                setCheckOpen((v) => !v);
+                setSettingsOpen(false);
+              }}
+              aria-expanded={checkOpen}
+              // The one visual escalation in this whole feature, and it is
+              // spent on the kind that cannot be reached by typing more.
+              // `warn`, not `danger`: nothing here destroys anything, and
+              // `danger` is already the delete verb's colour (P1).
+              className={cn(brokenSlides.length > 0 && "text-warn hover:text-warn")}
+            >
+              {brokenSlides.length > 0
+                ? `${brokenSlides.length} ${brokenSlides.length === 1 ? "slide needs" : "slides need"} fixing`
+                : `${unfinishedSlides.length} ${unfinishedSlides.length === 1 ? "slide" : "slides"} unfinished`}
+            </Button>
+          )}
           <Button
             variant="primary"
             size="md"
@@ -305,6 +406,19 @@ export default function Editor() {
         />
       )}
 
+      {checkOpen && (
+        <DeckCheck
+          slides={pres.slides}
+          broken={brokenSlides}
+          unfinished={unfinishedSlides}
+          onGo={(slideId) => {
+            select(slideId);
+            setCheckOpen(false);
+          }}
+          onClose={() => setCheckOpen(false)}
+        />
+      )}
+
       <div className="flex-1 min-h-0 flex">
         {/* ── slide rail ─────────────────────────────────────────────── */}
         <aside className="w-72 shrink-0 border-r border-hairline overflow-y-auto p-3 flex flex-col gap-2">
@@ -326,12 +440,26 @@ export default function Editor() {
                     a truncating line is the first thing to disappear. Ordered
                     by what must survive — which slide, whether it is the live
                     one, then what kind it is. */}
+                {/* "needs fixing" sits ahead of the type for the same reason
+                    the live marker does: ordered by what must survive the
+                    truncation. Which slide, whether the room is on it, whether
+                    it can be answered at all — then what kind it is. Only
+                    `broken` is marked. An unfinished slide is marked nowhere
+                    in this rail, deliberately: six of the seventeen types are
+                    born unfinished, and a rail where every new row lights up
+                    is a rail nobody reads. */}
                 <p className="nums text-caption2 font-semibold uppercase track-label text-ink-subtle mb-0.5 truncate">
                   {i + 1}
                   {s.id === liveSlideId && (
                     <>
                       {" · "}
                       <span className="text-accent">on screen</span>
+                    </>
+                  )}
+                  {brokenOf(s).length > 0 && (
+                    <>
+                      {" · "}
+                      <span className="text-warn">needs fixing</span>
                     </>
                   )}
                   {" · "}
@@ -472,6 +600,109 @@ function EmptyDeck({
         Browse all {total} slide types
       </Button>
     </div>
+  );
+}
+
+// The deck check.
+//
+// The band under the header rather than a sheet or a popover, because
+// `DeckSettings` is already exactly this shape and a second spelling of "a
+// panel that drops out of the header" is a dialect (DESIGN.md P1). It is
+// closed by default, opened by name, and the two groups are kept apart
+// because they are not two severities of one thing — one is wrong, the other
+// is simply not written yet, and a single list sorted by badness would blur
+// precisely the distinction that makes any of this readable.
+function DeckCheck({
+  slides,
+  broken,
+  unfinished,
+  onGo,
+  onClose,
+}: {
+  slides: Slide[];
+  broken: Slide[];
+  unfinished: Slide[];
+  onGo: (slideId: string) => void;
+  onClose: () => void;
+}) {
+  const numberOf = (slide: Slide) => slides.findIndex((s) => s.id === slide.id) + 1;
+  return (
+    <div className="shrink-0 border-b border-hairline bg-surface-1 px-5 py-5">
+      <div className="max-w-5xl flex flex-wrap items-start gap-10">
+        <CheckGroup
+          kind="broken"
+          title="Can't be answered as written"
+          hint="The room would see these run and nobody score. Typing more does not fix them — the value contradicts the rest of the slide."
+          rows={broken}
+          numberOf={numberOf}
+          onGo={onGo}
+        />
+        <CheckGroup
+          kind="incomplete"
+          title="Not finished yet"
+          hint="Normal while you're building, and nothing stops you presenting. But a deck file is only imported once every one of these is filled in, so this is what an export would be turned down for."
+          rows={unfinished}
+          numberOf={numberOf}
+          onGo={onGo}
+        />
+        <Button variant="ghost" size="sm" className="ml-auto" onClick={onClose}>
+          Done
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function CheckGroup({
+  title,
+  hint,
+  rows,
+  kind,
+  numberOf,
+  onGo,
+}: {
+  title: string;
+  hint: string;
+  rows: Slide[];
+  kind: "broken" | "incomplete";
+  numberOf: (slide: Slide) => number;
+  onGo: (slideId: string) => void;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <section className="min-w-0 flex-1 basis-80">
+      <h2
+        className={cn(
+          "text-caption2 font-semibold uppercase track-label",
+          kind === "broken" ? "text-warn" : "text-ink-subtle"
+        )}
+      >
+        {title}
+      </h2>
+      <p className="text-caption text-ink-subtle mt-1 mb-3 max-w-[46ch]">{hint}</p>
+      <div className="flex flex-col gap-1.5">
+        {rows.map((slide) => (
+          <button
+            key={slide.id}
+            type="button"
+            onClick={() => onGo(slide.id)}
+            className="text-left px-4 py-3 rounded-md bg-surface-2 hover:bg-surface-3 outline-none focus-visible:shadow-focus transition-colors duration-fast"
+          >
+            <p className="nums text-caption2 font-semibold uppercase track-label text-ink-subtle truncate">
+              {numberOf(slide)} · {labelFor(slide.type)}
+            </p>
+            <p className="text-subhead font-medium truncate mt-0.5">
+              {slide.question || <span className="text-ink-subtle">Untitled question</span>}
+            </p>
+            {(kind === "broken" ? brokenOf(slide) : incompleteOf(slide)).map((issue, i) => (
+              <p key={i} className="text-footnote text-ink-muted mt-1.5">
+                <IssueText message={issue.message} />
+              </p>
+            ))}
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -670,6 +901,11 @@ function SlideForm({
   const [question, setQuestion] = useState(slide.question);
   const [config, setConfig] = useState<any>(normalizeConfig(parseConfig(slide)));
   const [notes, setNotes] = useState(slide.notes ?? "");
+  // Straight off the slide prop, which `onChanged` -> `load()` refreshes after
+  // every save — so this is the SERVER's answer about what is now stored, not
+  // a second set of rules running in the browser that could disagree with the
+  // importer. That disagreement is the whole of what N9 was.
+  const broken = brokenOf(slide);
 
   async function save(newQuestion = question, newConfig = config, newNotes = notes) {
     await api.updateSlide(presentationId, slide.id, {
@@ -738,6 +974,24 @@ function SlideForm({
           onReplace={onReplace}
           question={question}
         />
+
+        {/* Immediately under the controls that produced it, which is the only
+            place it is useful, and only for `broken` — see the note at the
+            top of this file for why "all of them" is the wrong answer. Not a
+            toast and not a dialog: the author is mid-keystroke and nothing
+            here is worth taking the caret away for. */}
+        {broken.length > 0 && (
+          <div className="rounded-md bg-surface-2 shadow-line px-5 py-4 flex flex-col gap-2">
+            <p className="text-caption2 font-semibold uppercase track-label text-warn">
+              {broken.length === 1 ? "This can't be answered" : "These can't be answered"}
+            </p>
+            {broken.map((issue, i) => (
+              <p key={i} className="text-footnote text-ink-muted">
+                <IssueText message={issue.message} />
+              </p>
+            ))}
+          </div>
+        )}
 
         <div>
           <Label htmlFor="notes">Speaker notes</Label>

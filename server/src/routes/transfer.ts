@@ -210,6 +210,19 @@ function validateDeck(raw: unknown): Validation {
 
   const rawSlides = raw.slides === undefined ? [] : raw.slides;
   if (!Array.isArray(rawSlides)) return { ok: false, error: "slides must be a list." };
+  // A deck with nothing in it is not importable, it is just deferred: the
+  // session handler refuses to start one (`EMPTY_DECK`, sockets/session.ts),
+  // so the 200 here only moves the failure to the moment the host presses
+  // Present with a room already in front of them. Every other check in this
+  // function exists to pull a failure back to the upload; this is the same
+  // rule applied to the whole file rather than to one slide.
+  if (rawSlides.length === 0) {
+    return {
+      ok: false,
+      error:
+        "This deck has no slides, so there is nothing to present — a session cannot be started from it. Add at least one slide to the file.",
+    };
+  }
   if (rawSlides.length > MAX_SLIDES) {
     return {
       ok: false,

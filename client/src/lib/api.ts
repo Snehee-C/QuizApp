@@ -150,6 +150,22 @@ export interface SessionSummary {
   participants: number;
 }
 
+/**
+ * Something the server's own slide module says is wrong with this config.
+ *
+ * The KIND is the whole of why this is usable in an editor. `broken` is a
+ * contradiction — an answer key pointing past the end of the option list, a
+ * quiz nobody can win — and no amount of further typing resolves it.
+ * `incomplete` is a field that has not been filled in yet, which is what a
+ * slide someone is halfway through writing looks like: measured, six of the
+ * seventeen types are born with one the instant "+ Add slide" is pressed.
+ * Treating the two alike is why this field went unread for a release.
+ */
+export interface SlideConfigIssue {
+  kind: "broken" | "incomplete";
+  message: string;
+}
+
 export interface Slide {
   id: string;
   presentationId: string;
@@ -159,6 +175,11 @@ export interface Slide {
   config: string; // JSON string from API
   /** Speaker notes. Presenter-only — never sent to participants. */
   notes: string;
+  /**
+   * Present on every read of a deck and on every slide write. Optional
+   * because a Slide also arrives from places that don't compute it.
+   */
+  configIssues?: SlideConfigIssue[];
 }
 
 export interface PresentationWithSlides extends Presentation {

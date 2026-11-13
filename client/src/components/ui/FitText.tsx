@@ -1,10 +1,15 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { cn } from "../../lib/cn";
+import { stageScale } from "../stageScale";
 
 interface FitTextProps {
   children: string;
   className?: string;
-  /** Largest size to try, in px. */
+  /**
+   * Largest size to try, in px AT THE DESIGN SIZE (1920x1080) — it rides the
+   * stage anchor from there, exactly like every step of the ladder. See the
+   * note below.
+   */
   max?: number;
   /** Hard floor — never go below this (DESIGN.md §5: 24px on stage). */
   min?: number;
@@ -37,6 +42,16 @@ interface FitTextProps {
 // A 300-character question is a content problem, not a typographic one: the
 // system fits it as large as the box allows and does not pretend an axis is
 // rescuing it. The measured result is reported in the commit, not guessed at.
+//
+// `max` AND `min` ARE DESIGN-SIZE PIXELS, NOT SCREEN PIXELS. This was the one
+// step on the stage that stayed absolute: the ladder around it is anchored to
+// the viewport, so on a 4K projector `text-stage-answer` doubled while a
+// `max={104}` headline sat at 104px and the question quietly became the
+// SMALLEST thing on the slide. Both bounds are now multiplied by `stageScale()`
+// — the same `min(width ratio, height ratio)` the ladder's `min(Xvw, Yvh)`
+// computes — so the search runs over the same span of the ladder at every
+// resolution. The factor is exactly 1 at 1920x1080, which is where every
+// existing call site's number was chosen and measured.
 export function FitText({
   children,
   className,
@@ -46,7 +61,7 @@ export function FitText({
 }: FitTextProps) {
   const boxRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLSpanElement>(null);
-  const [size, setSize] = useState(max);
+  const [size, setSize] = useState(() => max * stageScale());
 
   useLayoutEffect(() => {
     const box = boxRef.current;
@@ -57,6 +72,16 @@ export function FitText({
       const bw = box.clientWidth;
       const bh = box.clientHeight;
       if (!bw || !bh) return;
+
+      // Read per measure, not once: the ResizeObserver below fires on exactly
+      // the changes that move it.
+      const k = stageScale();
+      const ceiling = Math.max(24, max * k);
+      // The 24px room floor is absolute and does NOT scale down — it is a
+      // physical legibility bound, not a proportion (DESIGN.md §5). Scaling
+      // the ceiling without pinning the floor is how a small window would walk
+      // the stage under it.
+      const floor = Math.min(ceiling, Math.max(24, min * k));
 
       // Overflow is "wider than the box, taller than the box, or more lines
       // than we allow" — the line cap is what keeps a long question from
@@ -69,13 +94,13 @@ export function FitText({
         return Math.round(text.scrollHeight / lineHeight) > maxLines;
       };
 
-      if (!overflows(max)) {
-        setSize(max);
+      if (!overflows(ceiling)) {
+        setSize(ceiling);
         return;
       }
 
-      let lo = min;
-      let hi = max;
+      let lo = floor;
+      let hi = ceiling;
       for (let i = 0; i < 10; i++) {
         const mid = (lo + hi) / 2;
         if (overflows(mid)) hi = mid;
@@ -87,7 +112,15 @@ export function FitText({
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(box);
-    return () => ro.disconnect();
+    // The box is viewport-sized, so the observer catches almost everything —
+    // but `stageScale()` reads the WINDOW, and a resize that leaves this box
+    // the same size (a stage whose box has hit a px floor, say) would
+    // otherwise leave the ceiling stale.
+    window.addEventListener("resize", measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
   }, [children, max, min, maxLines]);
 
   return (

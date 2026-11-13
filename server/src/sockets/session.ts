@@ -1,4 +1,5 @@
 import type { Server, Socket } from "socket.io";
+import { createHmac } from "node:crypto";
 import { prisma } from "../db.js";
 import { verifyToken } from "../auth.js";
 import {
@@ -67,6 +68,35 @@ interface LiveSession {
   // penalty falls on reading pace, which is the exact axis `timeScale` exists
   // to protect. participantId -> the slide they are on and when they got there.
   audienceArrivals: Map<string, { slideId: string; mono: number }>;
+  // Who the early reveal has to wait for on the slide currently on screen.
+  //
+  // "Everyone present has answered" used to be measured against `participants`,
+  // which is a set that SHRINKS the moment a phone locks. One player answering
+  // while they are momentarily the only live socket therefore closed the
+  // question for everybody — the exact failure the numerator fix described,
+  // arriving from the denominator. The cohort is everyone who has been
+  // connected at any point while this slide has been on screen, so leaving
+  // cannot shorten the list of people the room is waiting for. Someone who
+  // walks out for good simply means the countdown closes the question instead
+  // of the quorum, which is the safe direction to fail in.
+  slideCohort: { slideId: string | null; ids: Set<string> };
+  // Measured connectivity gaps, per participant: the evidence that justifies
+  // crediting a client-claimed tap time (see `outageCreditFor`). Written when a
+  // phone re-joins on a NEW socket while its old one is still registered —
+  // which is what an ungraceful drop looks like from here — and consumed by the
+  // next submission. Never written on the client's say-so.
+  outageCredits: Map<string, { creditMs: number; expiresAt: number }>;
+  // participantId -> wall-clock ms of the last packet we received from the
+  // socket that owned that identity, written when that socket drops or is
+  // displaced. This is the server's own record of when a phone went quiet, and
+  // it is the only thing that can turn a client's claim about when it tapped
+  // into points — see `measureOutage`.
+  lastHeardFrom: Map<string, number>;
+  // participantId -> the opaque key the ROOM is allowed to know them by.
+  // Memoised rather than stored: the key is an HMAC over (sessionId,
+  // participantId), so it is identical in every process and survives a restart
+  // without a column, and this map only saves recomputing it per frame.
+  publicKeys: Map<string, string>;
   // pending auto-reveal timer for the current quiz slide (fires on time-up)
   revealTimer: ReturnType<typeof setTimeout> | null;
   // slideIds already revealed — revealing is one-shot per slide
@@ -87,7 +117,7 @@ interface LiveSession {
   // reloads while the projector shows the scoreboard comes back rendering the
   // slide and drops out of a moment the whole room is sharing. Holding the
   // exact frame we broadcast lets the join ack put that phone back in it.
-  leaderboardView: { entries: LeaderboardEntryRow[] } | null;
+  leaderboardView: { entries: PublicLeaderboardRow[] } | null;
   // The SAME moment at stage scope. Two fields rather than two keys on one
   // object, deliberately: `leaderboardView` is handed to a participant verbatim
   // on the join ack, so the object a phone receives must be incapable of
@@ -311,19 +341,93 @@ function reject(cb: Function | undefined, code: RejectCode, error: string) {
   cb?.({ error, code });
 }
 
+// The secret the room-facing participant key is derived under. Falls back to
+// the JWT secret so a deployment that sets one gets both, and to the same dev
+// value `auth.ts` uses so a local checkout needs no configuration. It is a
+// derivation key, never sent anywhere.
+const PKEY_SECRET =
+  process.env.PARTICIPANT_KEY_SECRET || process.env.JWT_SECRET || "dev-secret-change-me";
+
+/**
+ * The opaque key a PARTICIPANT may know another participant by.
+ *
+ * A `participantId` is a bearer token with no secret: it is the whole of what
+ * `participant:join` needs to take that seat and overwrite that person's
+ * answers. So it may never appear in a frame a phone receives — and that is
+ * exactly what `participant:count` was doing, room-wide, before the first
+ * question, which is the hole `PUBLIC_LEADERBOARD_LIMIT` was capped to keep
+ * ten ids wide.
+ *
+ * HMAC rather than a random per-session table, for two reasons. It is not
+ * reversible — recovering the id would mean inverting SHA-256 — so a phone
+ * holding a `pkey` holds nothing it can join with. And it is deterministic over
+ * (sessionId, participantId), so it survives a server restart: a room rebuilt
+ * from the database hands back the SAME keys, and a client using them as React
+ * keys or to diff the roster does not see every player replaced by a stranger
+ * the moment the process recycles. Scoped by sessionId so the same person in
+ * two rooms is not correlatable across them.
+ */
+function publicKeyFor(s: LiveSession, participantId: string): string {
+  const hit = s.publicKeys.get(participantId);
+  if (hit) return hit;
+  const key = createHmac("sha256", PKEY_SECRET)
+    .update(s.sessionId)
+    // A separator no id can contain, so (sessionId, participantId) cannot be
+    // re-partitioned into a different pair that hashes the same.
+    .update("\u0000")
+    .update(participantId)
+    .digest("base64url")
+    .slice(0, 22);
+  s.publicKeys.set(participantId, key);
+  return key;
+}
+
 // The one spelling of "who is in the room". The `participant:count` broadcast,
 // its disconnect twin and the presenter's resume ack all describe the same
 // thing, so they ship the same field names and the same element shape and the
 // client can reduce all three through a single code path.
-function participantsPayload(s: LiveSession) {
+//
+// `withIds` is the difference between the two audiences, and it is not a
+// preference. A participant row is `{ pkey, name, avatar }` and carries no
+// `participantId` at all; the presenter's row keeps the real id alongside the
+// key, because moderation needs to name a person to act on them. The two
+// shapes are never merged onto one object that a phone then receives — a field
+// that is not there cannot be forgotten in a projection.
+function participantsPayload(s: LiveSession, withIds: boolean) {
   return {
     count: s.participants.size,
     participants: [...s.participants].map(([participantId, p]) => ({
-      participantId,
+      pkey: publicKeyFor(s, participantId),
+      ...(withIds ? { participantId } : null),
       name: p.name,
       avatar: p.avatar,
     })),
   };
+}
+
+/**
+ * Broadcast the roster, stamped per socket with the shape that socket is
+ * entitled to — the same room walk `emitSessionEnded` performs, for the same
+ * reason: one payload cannot be correct for both audiences at once.
+ *
+ * Replaces `io.to(joinCode).emit("participant:count", …)`, and the recipient
+ * set is deliberately byte-identical to it: host windows are in the room too
+ * and still get the event, with the ids they already receive everywhere else.
+ */
+async function emitParticipants(io: Server, joinCode: string, s: LiveSession) {
+  const forParticipants = participantsPayload(s, false);
+  const forPresenters = participantsPayload(s, true);
+  const sockets = await io.in(joinCode).fetchSockets();
+  for (const sock of sockets) {
+    sock.emit("participant:count", sock.data?.role === "presenter" ? forPresenters : forParticipants);
+  }
+}
+
+/** Fire-and-forget wrapper: a roster frame must never hold up a handler. */
+function pushParticipants(io: Server, joinCode: string, s: LiveSession) {
+  emitParticipants(io, joinCode, s).catch((err) =>
+    console.error("[participant:count] failed to notify room", joinCode, err)
+  );
 }
 
 // Socket.IO JSON-encodes every payload, so `NaN` and `Infinity` arrive here as
@@ -500,14 +604,38 @@ async function computeLeaderboard(s: LiveSession, limit = PUBLIC_LEADERBOARD_LIM
   const entries = rows
     .map((r) => ({
       participantId: r.participantId,
+      // Carried alongside the id, not yet instead of it. A leaderboard row
+      // reaching a phone still carries a real `participantId`, and that is the
+      // same bearer token N1 took off `participant:count` — ten stealable seats
+      // per room rather than the whole roster, but the same class of thing.
+      // The client identifies its own row by comparing against the `myPkey` on
+      // its join ack, so once every renderer keys off `pkey` the id can be
+      // stripped from participant-facing boards and the last of them leaves the
+      // wire. Additive first, on purpose: a renderer that still reads
+      // `participantId` keeps working while that switch is made.
+      pkey: publicKeyFor(s, r.participantId),
       name: who(r.participantId)?.name ?? "Anonymous",
       score: r._sum.points ?? 0,
       avatar: who(r.participantId)?.avatar ?? 0,
     }))
     .sort((a, b) => b.score - a.score);
   return {
-    // What a PARTICIPANT may see. Unchanged: ten rows.
-    entries: entries.slice(0, limit),
+    // What a PARTICIPANT may see. Ten rows — and, now, ten rows carrying no
+    // `participantId`.
+    //
+    // The cap was always the wrong half of the protection. It bounded HOW MANY
+    // bearer tokens went to each phone rather than whether any did, because a
+    // `participantId` is the whole of what `participant:join` needs to take
+    // that seat and overwrite that person's answers (N1). Ten stealable seats
+    // per room is better than a whole roster and is still ten.
+    //
+    // Nothing on a phone needs the id: a player finds their own row by
+    // comparing `pkey` against the `myPkey` on their join ack, and every
+    // renderer keys rows by `pkey`. The cap stays regardless — it is also a
+    // legibility and bandwidth bound, and `stageEntries` below is the frame
+    // that deliberately sees more, because the presenter already holds the
+    // roster and the answer key.
+    entries: entries.map(({ participantId: _omit, ...row }) => row).slice(0, limit),
     // What the STAGE may see. See STAGE_LEADERBOARD_LIMIT.
     stageEntries: entries.slice(0, STAGE_LEADERBOARD_LIMIT),
     // Everyone, in order. For rank/score lookups only — this never goes on the
@@ -588,12 +716,31 @@ function cancelLeaderboardPush(s: LiveSession) {
   leaderboardPushes.delete(s.sessionId);
 }
 
+/**
+ * A board row as the SERVER holds it, and as a presenter may see it: it names
+ * the person.
+ */
 interface LeaderboardEntryRow {
   participantId: string;
+  pkey: string;
   name: string;
   score: number;
   avatar: number;
 }
+
+/**
+ * A board row as a PHONE may see it — the same row with the name of the seat
+ * removed.
+ *
+ * Two types rather than an optional field, for the reason `leaderboardView`
+ * and `stageLeaderboardView` are two fields rather than two keys on one
+ * object: a shape a participant receives verbatim should be INCAPABLE of
+ * carrying what a participant may not have. An optional `participantId?` would
+ * compile everywhere and leak the first time somebody passed the wrong array.
+ * This way the compiler refuses — which it already did, once, while this was
+ * being written.
+ */
+type PublicLeaderboardRow = Omit<LeaderboardEntryRow, "participantId">;
 
 /**
  * End the room — per socket, because the podium owes each phone one fact the
@@ -619,7 +766,10 @@ interface LeaderboardEntryRow {
 async function emitSessionEnded(
   io: Server,
   joinCode: string,
-  entries: LeaderboardEntryRow[],
+  // The board every socket in the room receives, phones included — so it is
+  // the public shape, with no `participantId` on any row.
+  entries: PublicLeaderboardRow[],
+  // Server-side only, for the rank lookup below. Never emitted.
   fullEntries: LeaderboardEntryRow[]
 ) {
   // Rank is positional over EVERYONE, 1-based — the same arithmetic
@@ -643,6 +793,100 @@ async function emitSessionEnded(
       myRank: mine?.rank ?? null,
       myScore: mine?.score ?? null,
     });
+  }
+}
+
+/**
+ * May this phone be told how it did on this slide yet?
+ *
+ * The reveal embargo used to live entirely in the client's `FeedbackCard`, one
+ * layer above the data: the submit ack returned the full graded result the
+ * instant it was scored, with no reference to pacing and none to
+ * `revealedSlides`. Since changing your answer is a supported feature, that
+ * made the ack an answer-key oracle costing one round trip per probe — three
+ * probes to the key on a four-option question, still scoring 965 of 1000,
+ * while the honest player in the same room scored 0.
+ *
+ * Two pacings, two answers:
+ *
+ *   PRESENTER — the room shares one clock and one reveal, so there IS a later
+ *   beat at which everyone learns the answer together. Withhold until it.
+ *
+ *   AUDIENCE — there is no shared reveal to wait for, by design (see
+ *   `armRevealTimer`, and N2: giving self-paced decks one locked the deck for
+ *   everyone behind the first player through it). A self-paced player's result
+ *   card is the only feedback they will ever get, so it goes out immediately
+ *   and unchanged. The key is theirs alone: they have already answered, and
+ *   nobody else is on their clock.
+ */
+function embargoed(s: LiveSession, slideId: string): boolean {
+  return s.pacing === "PRESENTER" && !s.revealedSlides.has(slideId);
+}
+
+/** What a phone is told about ITS OWN answer. One spelling, four senders. */
+interface MyResult {
+  isQuiz: true;
+  correct: boolean;
+  points: number;
+  totalScore: number;
+  rank: number;
+}
+
+/**
+ * Send a `slide:reveal` frame to the room, stamped per socket with that
+ * phone's own graded result.
+ *
+ * The reveal is the beat at which a player is ENTITLED to know how they did —
+ * and under presenter pacing it is now the first such beat, because the submit
+ * ack no longer carries the grade (see `participant:submit`). So the frame that
+ * lifts the embargo has to deliver what the embargo withheld, or a player who
+ * answered correctly is simply never told.
+ *
+ * Per socket, in the same room walk `emitSessionEnded` uses and for the same
+ * reason: `myResult` is a fact about the receiver, so it cannot ride on a
+ * shared payload. Presenters get `myResult: null` — a host has no standing in
+ * its own quiz — and the rest of the frame byte-identical to the room's, so the
+ * stage cannot drift from the phones.
+ */
+async function emitRevealFrame(io: Server, joinCode: string, s: LiveSession, payload: any) {
+  const slideId: string | undefined = payload?.slideId;
+  const slide = slideId ? s.slides.find((x) => x.id === slideId) : undefined;
+  const scored = !!slide && isTimed(slide.type, slide.config);
+
+  const graded = new Map<string, { correct: boolean; points: number }>();
+  const standing = new Map<string, { rank: number; score: number }>();
+  if (scored && slideId) {
+    const rows = await prisma.response.findMany({
+      where: { sessionId: s.sessionId, slideId },
+      select: { participantId: true, correct: true, points: true },
+    });
+    for (const r of rows) graded.set(r.participantId, { correct: r.correct, points: r.points });
+    const { fullEntries } = await computeLeaderboard(s);
+    fullEntries.forEach((e, i) => standing.set(e.participantId, { rank: i + 1, score: e.score }));
+  }
+
+  // One stamp for the whole broadcast: every recipient must be able to resolve
+  // its countdown against the same instant, and reading the clock per socket
+  // would hand the last phone in the loop a later "now" than the first.
+  const serverNow = Date.now();
+  const sockets = await io.in(joinCode).fetchSockets();
+  for (const sock of sockets) {
+    const pid =
+      sock.data?.role === "participant"
+        ? (sock.data.participantId as string | undefined)
+        : undefined;
+    const mine = pid ? graded.get(pid) : undefined;
+    const where = pid ? standing.get(pid) : undefined;
+    const myResult: MyResult | null = mine
+      ? {
+          isQuiz: true,
+          correct: mine.correct,
+          points: mine.points,
+          totalScore: where?.score ?? 0,
+          rank: where?.rank ?? 0,
+        }
+      : null;
+    sock.emit("slide:reveal", { ...payload, serverNow, myResult });
   }
 }
 
@@ -674,7 +918,7 @@ async function revealSlide(io: Server, joinCode: string, slide: LiveSession["sli
   // Keep the frame so a late joiner or a revisit can be told the question is
   // closed with exactly what the room already saw, rather than nothing.
   s.revealPayloads.set(slide.id, payload);
-  io.to(joinCode).emit("slide:reveal", payload);
+  await emitRevealFrame(io, joinCode, s, payload);
 
   // A reveal is the beat immediately before the host calls up the standings,
   // so this is the board the bar race will run from: pushed immediately, at
@@ -725,6 +969,10 @@ function emptyLiveShell(): Pick<
   | "participantSockets"
   | "presenterSockets"
   | "audienceArrivals"
+  | "slideCohort"
+  | "outageCredits"
+  | "lastHeardFrom"
+  | "publicKeys"
   | "leaderboardView"
   | "stageLeaderboardView"
   | "navChain"
@@ -738,6 +986,10 @@ function emptyLiveShell(): Pick<
     participantSockets: new Map(),
     presenterSockets: new Set(),
     audienceArrivals: new Map(),
+    slideCohort: { slideId: null, ids: new Set() },
+    outageCredits: new Map(),
+    lastHeardFrom: new Map(),
+    publicKeys: new Map(),
     leaderboardView: null,
     stageLeaderboardView: null,
     navChain: Promise.resolve(),
@@ -859,6 +1111,13 @@ async function rehydrateSession(joinCode: string): Promise<LiveSession | null> {
 
   live.set(joinCode, s);
 
+  // Seat the early-reveal quorum on the slide the room came back to, with
+  // nobody in it: every socket died with the old process, so the room is
+  // waiting for people who have not reconnected yet. Each `participant:join`
+  // adds itself back. Without this the cohort would point at no slide at all
+  // and the early reveal would stay switched off until the host navigated.
+  resetCohort(s, currentIndex >= 0 ? s.slides[currentIndex].id : null);
+
   // Re-arm the auto-reveal with what is LEFT of the window, not a fresh one. If
   // the time ran out while the process was down, this fires straight away and
   // the question closes honestly rather than re-opening.
@@ -914,6 +1173,25 @@ function armRevealTimer(io: Server, joinCode: string, s: LiveSession, remainingM
   s.revealTimer = setTimeout(() => revealSlide(io, joinCode, slideObj), Math.max(0, ms));
 }
 
+/**
+ * Everyone the early reveal has to hear from before it may close a question.
+ *
+ * Reset when the room lands on a new slide, and only ever ADDED to while that
+ * slide is up: by a navigation (everyone present at the time), by a join
+ * (someone arriving mid-question) and by a submission. Measuring the quorum
+ * against a set that can only grow is the whole point — `participants` shrinks
+ * the instant a phone locks, and that shrinkage is what let one player's answer
+ * close the question for a room that was still typing.
+ */
+function resetCohort(s: LiveSession, slideId: string | null) {
+  s.slideCohort = { slideId, ids: new Set(slideId ? s.participants.keys() : []) };
+}
+
+function joinCohort(s: LiveSession, participantId: string, slideId: string | null) {
+  if (!slideId || s.slideCohort.slideId !== slideId) return;
+  s.slideCohort.ids.add(participantId);
+}
+
 function parseIdList(raw: string): string[] {
   try {
     const v = JSON.parse(raw);
@@ -962,7 +1240,92 @@ function scoringStartedAt(s: LiveSession, participantId: string, slideId: string
  */
 function arrivalWallClock(s: LiveSession, participantId: string, slideId: string): number | null {
   const mono = s.audienceArrivals.get(arrivalKey(participantId, slideId))?.mono;
-  return mono === undefined ? null : Date.now() - (monoNow() - mono);
+  // Rounded: `performance.now()` is fractional and a wall-clock millisecond
+  // with a decimal tail is not a thing any client should have to parse.
+  return mono === undefined ? null : Math.round(Date.now() - (monoNow() - mono));
+}
+
+// ---------------------------------------------------------------------------
+// Outage credit — paying back the speed points a delivery gap cost
+// ---------------------------------------------------------------------------
+//
+// An answer tapped while the phone was offline is delivered when the link
+// comes back, and grading it at delivery charged the player for a network they
+// do not control: 983 points earned, 827 awarded, for twelve seconds of dead
+// Wi-Fi. The only party that knows when the tap happened is the client, and
+// `clientTapAt` is therefore attacker-controlled — a scripted client claiming
+// it tapped the instant the question opened would otherwise mint itself a
+// perfect score on every question.
+//
+// THE TRUST DECISION. The client's claim never grants points on its own. The
+// server grants a refund it can justify from ITS OWN measurement — how long
+// this phone was out of contact — and the client's claim can only make that
+// refund SMALLER. In full:
+//
+//   1. Evidence first. A refund exists only when the server measured a gap:
+//      this identity re-joined on a NEW socket, and we know when we last heard
+//      from the old one. No gap, no refund — so a healthy scripted client
+//      claiming `clientTapAt === slideStartedAt` is graded at arrival exactly
+//      as it is today, and gains nothing at all.
+//   2. The claim can only shrink it. The refund is `min(measured gap, the
+//      delay the client actually claims, the elapsed time on the question)`.
+//      Claiming an earlier tap than the gap can explain buys nothing.
+//   3. Hard ceiling. Capped at OUTAGE_CREDIT_CAP_MS regardless, so no
+//      measurement error can refund a whole question.
+//   4. Single use, short-lived. The credit is consumed by the first submission
+//      after the reconnect and expires in OUTAGE_CREDIT_TTL_MS — long enough
+//      for the retry queue's flush (3 retries × 500 ms), far too short to bank.
+//
+// WHAT THIS STILL ALLOWS, stated plainly: a player who deliberately kills
+// their connection, thinks for N seconds, reconnects and claims they tapped at
+// the start can recover up to N seconds of speed bonus, bounded by the cap.
+// That is the irreducible residue of trusting any client clock at all, and it
+// is not free — they must really be disconnected for that long (so the answer
+// window can close under them, and a presenter-paced reveal rejects them
+// outright with TOO_LATE), and every reconnect is visible server-side. The
+// alternative was to charge every honest player on venue Wi-Fi for the outage,
+// which is the defect this fixes and the far more common event.
+//
+// Note on skew: `clientTapAt` is read on the phone's own clock, which may be
+// wrong (that is finding N10). A phone running FAST claims a later delay than
+// it really used and is refunded less — it fails safe. Every frame carrying
+// `startedAt` now also carries `serverNow` precisely so the phone can correct
+// itself before sending.
+const OUTAGE_CREDIT_CAP_MS = Number(process.env.OUTAGE_CREDIT_CAP_MS ?? 30_000);
+const OUTAGE_CREDIT_TTL_MS = Number(process.env.OUTAGE_CREDIT_TTL_MS ?? 15_000);
+
+/**
+ * How long this identity was out of contact, measured by the server.
+ *
+ * Called from `participant:join` BEFORE `participantSockets` is re-pointed, so
+ * `prev` is still the socket that owned this identity. Evidence is a socket
+ * CHANGE: the same socket re-announcing itself (which the client does on every
+ * `connect`, and a second tab does routinely) is not an outage. The reference
+ * point is the last packet we actually received — Socket.IO's own heartbeat
+ * keeps that fresh without the client sending anything — falling back to what
+ * the disconnect handler recorded when the old socket is already gone.
+ */
+function measureOutage(io: Server, s: LiveSession, participantId: string, socketId: string): number {
+  const prev = s.participantSockets.get(participantId);
+  if (prev === socketId) return 0; // same socket: nothing dropped
+  let lastHeard: number | undefined;
+  if (prev) {
+    const prevSock = io.sockets.sockets.get(prev);
+    lastHeard = (prevSock?.data?.lastPacketAt as number | undefined) ?? s.lastHeardFrom.get(participantId);
+  } else {
+    // No socket registered: their last one disconnected and was evicted.
+    lastHeard = s.lastHeardFrom.get(participantId);
+  }
+  if (typeof lastHeard !== "number") return 0; // never seen before — a fresh join
+  return Math.max(0, Date.now() - lastHeard);
+}
+
+/** Take the credit this reconnect earned, if any. One submission, then gone. */
+function consumeOutageCredit(s: LiveSession, participantId: string): number {
+  const c = s.outageCredits.get(participantId);
+  if (!c) return 0;
+  s.outageCredits.delete(participantId);
+  return Date.now() > c.expiresAt ? 0 : c.creditMs;
 }
 
 /** Reveals are one-shot and irreversible, so they belong in the row. */
@@ -1076,6 +1439,17 @@ export function initSessionRuntime(io: Server) {
 
 export function registerSessionHandlers(io: Server, socket: Socket) {
   ioRef = io;
+
+  // When we last heard anything at all from this socket. Engine.IO's heartbeat
+  // keeps it fresh — a phone sitting silently reading a question still answers
+  // the server's pings — so a gap here is a gap in the NETWORK, not in the
+  // player's attention. It is the server-side evidence `measureOutage` needs
+  // before a client's claim about when it tapped can be worth any points.
+  socket.data.lastPacketAt = Date.now();
+  socket.conn.on("packet", () => {
+    socket.data.lastPacketAt = Date.now();
+  });
+
   // Q&A and reactions live in their own module but need to resolve the same
   // in-memory session map and reuse this file's presenter authorization.
   registerQaHandlers(io, socket, {
@@ -1303,8 +1677,9 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // rational reading is that the resume failed, and the rational response
       // is End or a fresh session, which is exactly the data loss the resume
       // path exists to prevent. Same field names, same element shape as the
-      // broadcast, so the client reduces both through one path.
-      ...participantsPayload(found),
+      // broadcast, so the client reduces both through one path. This is a
+      // PRESENTER ack, so the rows keep their `participantId`.
+      ...participantsPayload(found, true),
       // How many people this room has EVER had, which after a restart is the
       // only honest answer to "did the resume work". `count` above is live
       // sockets and is legitimately 0 for the few seconds before the phones
@@ -1322,6 +1697,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // means the stage cannot drift from the phones.
       reveal: revealed ? found.revealPayloads.get(current!.id) ?? null : null,
       startedAt: found.currentSlideStartedAt,
+      // Paired with `startedAt` everywhere it appears — see `slide:changed`.
+      serverNow: Date.now(),
       timeLimitSec:
         idx >= 0 && isTimed(found.slides[idx].type, found.slides[idx].config)
           ? scaledLimit(found, found.slides[idx])
@@ -1353,7 +1730,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // and no leaderboard button on a slide that had both a moment earlier.
     // Re-push the same frames a navigation would, to this socket only: the
     // room's state has not changed, only the host's knowledge of it.
-    io.to(socket.id).emit("participant:count", participantsPayload(found));
+    // Presenter-shaped: this socket is the host window that just resumed.
+    io.to(socket.id).emit("participant:count", participantsPayload(found, true));
     const resumedSlide = currentSlideOf(found);
     if (resumedSlide) await emitResults(io, joinCode, resumedSlide.id);
     const { stageEntries } = await computeLeaderboard(found);
@@ -1465,6 +1843,11 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // present arrives, for those who have not moved themselves yet.
     if (slide) for (const pid of s.participants.keys()) markArrival(s, pid, slide.id);
 
+    // A new slide, a new quorum. Everyone connected at this instant is who the
+    // early reveal has to wait for; a phone that locks later cannot shorten
+    // that list, which is what used to close a question on a room mid-answer.
+    resetCohort(s, slide?.id ?? null);
+
     // Landing on a quiz slide that hasn't been revealed yet: arm the time-up
     // auto-reveal. A revisit of an already-revealed slide keeps its reveal and
     // does NOT restart the timer.
@@ -1491,6 +1874,13 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       status: s.status,
       totalSlides: s.slides.length,
       startedAt: s.currentSlideStartedAt,
+      // The server's clock AT EMIT, beside the server's `startedAt`. Without
+      // it the phone can only subtract `startedAt` from its OWN clock, and a
+      // phone 60 s slow was shown 78 seconds left on a 20-second question,
+      // paced itself against that, and lost it. Every frame and every ack that
+      // carries `startedAt` now carries this too, so the receiver can measure
+      // its own offset instead of being graded on a clock nobody controls.
+      serverNow: Date.now(),
       // Authoritative countdown length, already scaled. The client must not
       // re-derive this from config or the ring and the auto-reveal disagree.
       timeLimitSec:
@@ -1516,7 +1906,10 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // Re-send the stored frame so the UI returns to its revealed state.
     if (slide && s.revealedSlides.has(slide.id)) {
       const stored = s.revealPayloads.get(slide.id);
-      if (stored) io.to(joinCode).emit("slide:reveal", stored);
+      // Per socket, like the reveal itself: this is the only frame that tells a
+      // phone how it did, so a revisit has to re-stamp each one with its own
+      // result rather than re-broadcasting the room's shared half.
+      if (stored) await emitRevealFrame(io, joinCode, s, stored);
     }
 
     // push existing results for the new slide (in case of late reveal)
@@ -1743,6 +2136,17 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     socket.data.joinCode = joinCode;
     socket.data.role = "participant";
     socket.data.participantId = participantId;
+    // How long this identity was out of contact, measured BEFORE the socket
+    // pointer is moved — afterwards there is nothing left to compare against.
+    // This is the only thing that can turn a `clientTapAt` into points; see
+    // the OUTAGE CREDIT block above for the trust argument.
+    const outage = measureOutage(io, s, participantId, socket.id);
+    if (outage > 0) {
+      s.outageCredits.set(participantId, {
+        creditMs: Math.min(outage, OUTAGE_CREDIT_CAP_MS),
+        expiresAt: Date.now() + OUTAGE_CREDIT_TTL_MS,
+      });
+    }
     // This socket is now the one that owns this identity. Disconnect consults
     // this to tell a stale tab's teardown apart from the real player leaving.
     s.participantSockets.set(participantId, socket.id);
@@ -1785,7 +2189,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       console.error("could not persist participant", e);
     }
 
-    io.to(joinCode).emit("participant:count", participantsPayload(s));
+    pushParticipants(io, joinCode, s);
 
     const current = currentSlideOf(s);
     const idx = s.currentIndex;
@@ -1793,6 +2197,11 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // Audience pacing: this is the moment this player reached this slide, and
     // therefore the moment their clock on it starts.
     if (current) markArrival(s, participantId, current.id);
+
+    // Arriving mid-question joins the quorum: the early reveal must now wait
+    // for this phone too, or one answer from somebody already here would close
+    // a question this player has only just been handed.
+    if (current) joinCohort(s, participantId, current.id);
 
     // A re-join (reconnect, reload, resumed tab) must land the phone in the
     // state the room is actually in, not at the top of a fresh question. Two
@@ -1809,13 +2218,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     // without a rank — the player told strictly less than they had a moment
     // earlier, for no reason other than that the only copy of it lived in the
     // tab that went away. The graded row has been here the whole time.
-    let myResult: {
-      isQuiz: true;
-      correct: boolean;
-      points: number;
-      totalScore: number;
-      rank: number;
-    } | null = null;
+    let myResult: MyResult | null = null;
     if (current) {
       const mine = await prisma.response.findUnique({
         where: {
@@ -1831,8 +2234,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
         answered = true;
         myAnswer = safeParse(mine.value);
         // The same test `participant:submit` uses to decide `isQuiz`, so the
-        // two acks cannot disagree about which slides carry a result at all.
-        if (idx >= 0 && isTimed(s.slides[idx].type, s.slides[idx].config)) {
+        // two acks cannot disagree about which slides carry a result at all —
+        // including the embargo. Restoring a result the phone was never given
+        // in the first place would make a reconnect the answer-key oracle the
+        // submit ack has just stopped being: answer, drop the socket, re-join,
+        // read `correct`. A phone can only be handed back what it already had.
+        if (idx >= 0 && isTimed(s.slides[idx].type, s.slides[idx].config) && !embargoed(s, current.id)) {
           const { fullEntries } = await computeLeaderboard(s);
           myResult = {
             isQuiz: true,
@@ -1858,6 +2265,10 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       currentSlide: current,
       totalSlides: s.slides.length,
       startedAt: s.currentSlideStartedAt,
+      // Paired with `startedAt` everywhere it appears — see `slide:changed`.
+      // On this ack in particular it is what lets a phone that has just
+      // reconnected re-measure its offset before it renders a countdown.
+      serverNow: Date.now(),
       // Authoritative, already scaled — same rule as `slide:changed`, so a
       // rejoining phone's ring agrees with the auto-reveal it is racing.
       timeLimitSec:
@@ -1865,6 +2276,13 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
           ? scaledLimit(s, s.slides[idx])
           : null,
       pacing: s.pacing,
+      // This phone's own entry in the opaque key space the roster now speaks.
+      // Additive and not yet required by anything: `participant:count` already
+      // identifies everyone by `pkey`, and the public leaderboard rows still
+      // carry `participantId` purely because the client finds ITSELF in them
+      // by id. With this the client can switch that comparison to `pkey` and
+      // the last ten bearer tokens come off the wire. See the audit note.
+      myPkey: publicKeyFor(s, participantId),
       revealed,
       // Only ever populated once the slide is revealed, so this cannot become a
       // second path by which the answer key reaches a participant early.
@@ -1940,6 +2358,10 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
           // `startedAt` on the wire, so a countdown can be rendered against it
           // rather than the player being graded on a clock they cannot see.
           startedAt: arrivalWallClock(s, participantId, slideObj.id),
+          // Paired with `startedAt` everywhere it appears — see
+          // `slide:changed`. A self-paced player has no shared clock at all,
+          // so this is the only thing that anchors their ring to the server's.
+          serverNow: Date.now(),
           timeLimitSec: isTimed(slideObj.type, slideObj.config)
             ? scaledLimit(s, slideObj)
             : null,
@@ -1952,7 +2374,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   });
 
   // ---- Participant: submit a response ----
-  socket.on("participant:submit", async ({ joinCode, slideId, participantId, value }, cb) => {
+  socket.on("participant:submit", async ({ joinCode, slideId, participantId, value, clientTapAt }, cb) => {
+    // Read the clocks at the top, before any await. Everything below measures
+    // against the instant this frame ARRIVED, not the instant the database
+    // finished with it.
+    const arrivedMono = monoNow();
+    const arrivedWall = Date.now();
     const s = await loadLive(joinCode);
     if (!s) return reject(cb, "SESSION_GONE", "Session not found");
     if (s.status === "ENDED") return reject(cb, "SESSION_ENDED", "Session has ended");
@@ -2019,6 +2446,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     });
     if (prior && prior.value === encoded) {
       if (!isTimed(slide.type, slide.config)) return cb?.({ ok: true, isQuiz: false });
+      // Same embargo as a fresh submission, or it is a trivial way around it:
+      // send a value, get nothing, send the identical value again and read the
+      // grade off the idempotent settle. `duplicate` stays — it is how the
+      // retry queue tells an already-stored answer from a newly scored one,
+      // and it says nothing about whether the answer was right.
+      if (embargoed(s, slideId)) return cb?.({ ok: true, isQuiz: true, duplicate: true });
       const { fullEntries } = await computeLeaderboard(s);
       const rank = fullEntries.findIndex((e) => e.participantId === participantId) + 1;
       const totalScore = fullEntries.find((e) => e.participantId === participantId)?.score ?? 0;
@@ -2035,8 +2468,50 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       });
     }
 
+    // ---- A self-paced answer is final once its result has been handed over ----
+    //
+    // Changing your answer stays a supported feature everywhere the player has
+    // not yet been told whether they were right. Under AUDIENCE pacing they
+    // HAVE been told — there is no shared reveal to wait for, so the result
+    // card goes out with the first ack (see `embargoed`) — and a different
+    // value after that is not a change of mind, it is a second guess against a
+    // key already on their screen. Left open, it is the N3 oracle surviving in
+    // the one room the embargo deliberately does not cover: probe, read
+    // `correct`, probe again, at a cost of one round trip each. An identical
+    // re-send is untouched above, so the offline retry queue still settles.
+    if (prior && s.pacing === "AUDIENCE" && isTimed(slide.type, slide.config)) {
+      return reject(cb, "TOO_LATE", "You've already answered this one");
+    }
+
     // Once a slide is revealed, answers are locked — the window has closed.
     if (s.revealedSlides.has(slideId)) return reject(cb, "TOO_LATE", "Time's up");
+
+    // ---- Pay back whatever a delivery gap cost, and nothing more ----
+    //
+    // See the OUTAGE CREDIT block above for the full trust argument. In short:
+    // the refund is bounded by what the SERVER measured (how long this phone
+    // was out of contact), the client's own claim can only shrink it, and with
+    // no measured gap there is no refund at all — so a healthy client claiming
+    // it tapped at the starting gun is graded exactly as it is today.
+    const startedMono = scoringStartedAt(s, participantId, slideId);
+    const startedWall =
+      s.pacing === "AUDIENCE"
+        ? arrivalWallClock(s, participantId, slideId)
+        : s.currentSlideStartedAt;
+    let creditMs = 0;
+    if (startedMono !== null && startedWall !== null) {
+      const budget = consumeOutageCredit(s, participantId);
+      if (budget > 0 && typeof clientTapAt === "number" && Number.isFinite(clientTapAt)) {
+        // Elapsed as the server sees it, and elapsed as the player claims it.
+        // Clamping the claim into [0, elapsed] is the floor the brief asks
+        // for: a tap "before" the question opened is read as the instant it
+        // opened, and one "after" this frame arrived is read as now.
+        const elapsedMs = Math.max(0, arrivedMono - startedMono);
+        const tapWall = Math.min(Math.max(clientTapAt, startedWall), arrivedWall);
+        const claimedMs = Math.min(tapWall - startedWall, elapsedMs);
+        creditMs = Math.max(0, Math.min(elapsedMs - claimedMs, budget));
+      }
+    }
 
     const graded = gradeSubmission(
       slide.type,
@@ -2058,10 +2533,18 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
         // start measured every answer from whenever the host last happened to
         // touch the deck — or, if they never did, from nothing at all, which
         // disabled speed scoring without saying so.
-        slideStartedAt: scoringStartedAt(s, participantId, slideId),
-        now: monoNow(),
+        slideStartedAt: startedMono,
+        // Arrival, less whatever the measured outage justifies refunding. The
+        // clock is read once at the top of the handler, so the database round
+        // trips above cannot bill the player for the server's own latency.
+        now: arrivedMono - creditMs,
       }
     );
+    if (creditMs > 0) {
+      console.log(
+        `[outage-credit] ${joinCode} ${participantId} slide=${slideId} refunded ${creditMs}ms`
+      );
+    }
 
     // The question AS ASKED, stored alongside the answer. `slide` here is the
     // session's frozen snapshot — the exact text and config the room was shown
@@ -2114,28 +2597,49 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // and in a full room this fires once per answer. Coalesced (see
       // sendLeaderboardToPresenter); the reveal that follows is immediate.
       sendLeaderboardToPresenter(io, s, stageEntries);
-      cb?.({ ok: true, isQuiz: true, correct: graded.correct, points: graded.points, totalScore, rank });
+      // Under presenter pacing a result the room has not been shown yet is the
+      // answer key, one bit at a time. The player is told their answer landed
+      // and nothing else; the grade arrives in the `slide:reveal` beat, which
+      // now carries a per-socket `myResult` for exactly this. See `embargoed`.
+      if (embargoed(s, slideId)) {
+        cb?.({ ok: true, isQuiz: true });
+      } else {
+        cb?.({ ok: true, isQuiz: true, correct: graded.correct, points: graded.points, totalScore, rank });
+      }
 
-      // If everyone present has now answered this slide, reveal early rather
-      // than waiting for the timer to expire. "Everyone present" has to be
-      // measured over the people still in the room: a raw row count includes
-      // players who answered and then dropped their socket (lock screen, wifi
-      // hop, closed tab), whose rows outlive their entry in `participants`. A
-      // single such leaver makes count >= size true while others are still
-      // typing, and the premature reveal rejects their answers with "Time's up".
+      // ---- Everyone has answered: close the question early ----
+      //
+      // AUDIENCE pacing never does this, for the reason `armRevealTimer`
+      // already spells out at length: a reveal is a SHARED moment and a
+      // self-paced deck has none, because at any instant different people are
+      // on different slides. That guard was on the timer path only, and this
+      // path had none at all — so in a self-paced room, where `participants`
+      // is routinely a set of ONE, the first player through the deck revealed
+      // every slide as they finished it, `persistRevealed` made that permanent,
+      // and the next person to open the link was handed the answer key in
+      // their join ack and TOO_LATE on every question.
+      if (s.pacing === "AUDIENCE") return;
+
+      // "Everyone" is the slide's COHORT, not the connected set. The numerator
+      // was already measured over people still in the room — a player who
+      // answered and then dropped their socket must not count — but the
+      // denominator was `participants.size`, which shrinks the moment a phone
+      // locks. One player answering while they were momentarily the only live
+      // socket therefore closed the question on everybody still typing: the
+      // same failure the comment above described, arriving from the other
+      // side. The cohort only grows while a slide is up, so leaving can no
+      // longer shorten the list of people the room is waiting for. Someone who
+      // walks out for good simply means the countdown closes the question
+      // instead of the quorum, which is the safe direction to fail in.
+      const cohort = s.slideCohort.slideId === slideId ? s.slideCohort.ids : null;
+      if (!cohort || cohort.size === 0) return;
       const rows = await prisma.response.findMany({
         where: { sessionId: s.sessionId, slideId },
         select: { participantId: true },
       });
-      const answeredPresent = rows.reduce(
-        (n, r) => n + (s.participants.has(r.participantId) ? 1 : 0),
-        0
-      );
-      if (
-        answeredPresent >= s.participants.size &&
-        s.participants.size > 0 &&
-        !s.revealedSlides.has(slideId)
-      ) {
+      const answered = new Set(rows.map((r) => r.participantId));
+      const everyone = [...cohort].every((pid) => answered.has(pid));
+      if (everyone && !s.revealedSlides.has(slideId)) {
         if (s.revealTimer) {
           clearTimeout(s.revealTimer);
           s.revealTimer = null;
@@ -2167,7 +2671,10 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     if (socket.data.role === "participant" && pid && s.participantSockets.get(pid) === socket.id) {
       s.participantSockets.delete(pid);
       s.participants.delete(pid);
-      io.to(joinCode).emit("participant:count", participantsPayload(s));
+      // Remember when this phone last spoke, so a reconnect can be told apart
+      // from a long silence and the gap between them measured honestly.
+      s.lastHeardFrom.set(pid, (socket.data.lastPacketAt as number | undefined) ?? Date.now());
+      pushParticipants(io, joinCode, s);
     }
     // A host window closing gives up its share of the presenter view. If it was
     // the primary, hand that title to whichever window is still open rather

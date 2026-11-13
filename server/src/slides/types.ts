@@ -66,13 +66,89 @@ export function describe(v: unknown): string {
 }
 
 /**
+ * The stage has SIX answer slots, so six is the most options a slide may
+ * offer. This is not a taste limit, it is the cardinality of the design
+ * system: `client/src/lib/answers.ts` defines `ANSWER_SLOTS` with six entries
+ * and resolves a slot with `index % 6`, so option 7 is handed slot A's hue,
+ * slot A's shape AND slot A's letter. DESIGN.md §6 promises "four redundant
+ * channels on every answer (hue + shape + letter + fixed screen position)";
+ * past six all four wrap together and the promise is simply false — a player
+ * told to pick "A" has two tiles to choose from.
+ *
+ * Measured on the real stage at 1920x1080 with 26 options: the letter channel
+ * reads A B C D E F A B C D E F A B …, the grid starts 372px ABOVE the top of
+ * the viewport (so the question is not on screen at all) and 105 elements are
+ * painted outside it. The editor has always known this number
+ * (`client/src/slides/multipleChoice.tsx`, `disabled={options.length >= 6}`,
+ * and the same line in ranking.tsx and hundredPoints.tsx); the importer did
+ * not, which is the whole of the defect.
+ */
+export const MAX_ANSWER_SLOTS = 6;
+
+/** The explanation that goes with it, shared by every slot-driven list. */
+export const ANSWER_SLOT_WHY =
+  `the stage has ${MAX_ANSWER_SLOTS} answer slots and reuses them from the top, so entry ${MAX_ANSWER_SLOTS + 1} ` +
+  `is drawn in slot A's colour, shape and letter — the room sees two tiles marked "A"`;
+
+/**
+ * The longest an option label may be, in characters.
+ *
+ * Derived from the one rendering constraint that actually stops:
+ * `StageAnswers.tsx` fits every label to the largest size at which none of
+ * them exceeds `MAX_LINES` (3), binary-searching DOWN from the
+ * `stage-answer` ladder step and refusing to go below `ANSWER_FLOOR` (26px,
+ * that step's own clamp minimum). At the floor it stops caring: a longer
+ * label simply takes a fourth line, a fifth, a ninth.
+ *
+ * Measured on the real stage at 1920x1080 — the size DESIGN.md §4 says the
+ * stage scale is designed at — with six options, which is the tightest legal
+ * case. The label column is 634px. Ordinary mixed-case text fills exactly
+ * three lines at 134 characters and spills to four at 136.
+ *
+ * 120 is that measured capacity rounded down, which buys back the roughly 10%
+ * the sample flattered it by (evenly spaced five-letter words wrap better than
+ * real labels do) and holds at and above the design size — measured with six
+ * options at 120 characters:
+ *
+ *     3840 x 2160   3 lines   label column 1475px
+ *     2560 x 1080   3 lines   label column  902px
+ *     1920 x 1080   3 lines   label column  634px   <- the anchor
+ *     1366 x  768   4 lines   label column  449px
+ *
+ * It is a ceiling, not a promise of perfect wrap, and the last row is the
+ * honest half of that. BELOW the design size the column shrinks while the
+ * floor does not, so the three-line contract is already gone at 100
+ * characters there and no character count rescues it. Nor does one describe
+ * glyph width: 120 characters of wide capitals takes four lines even at
+ * 1920x1080 (measured: `WMWM…` runs out of three lines at 100). Past the
+ * floor the stage keeps its 26px minimum and the tile simply grows, which
+ * DESIGN.md §4 already calls a CONTENT problem rather than a typographic one.
+ *
+ * What the cap stops is the categorical case: 400 characters on six options
+ * pushes the grid 138px below the bottom of a 1080p viewport (measured), into
+ * the ~8% §5 says the audience's heads are blocking anyway.
+ */
+export const MAX_OPTION_LABEL = 120;
+
+/**
  * The shared shape behind `options` / `items` / `entries` / `bullets`: a list
  * of non-blank strings that the slide renders verbatim.
  */
 export function checkStringList(
   config: any,
   key: string,
-  opts: { min: number; label: string }
+  opts: {
+    min: number;
+    label: string;
+    /** Most entries the stage can draw. Omit where no measured limit exists. */
+    max?: number;
+    /** Why `max` is what it is, in the host's terms. */
+    maxWhy?: string;
+    /** Longest one entry may be, in characters. */
+    maxEntry?: number;
+    /** Why `maxEntry` is what it is, in the host's terms. */
+    maxEntryWhy?: string;
+  }
 ): ConfigIssue[] {
   const v = config?.[key];
   if (v === undefined) {
@@ -87,12 +163,31 @@ export function checkStringList(
       issues.push(broken(`config.${key}[${i}] must be a string, got ${describe(v[i])}.`));
     } else if (v[i].trim() === "") {
       issues.push(incomplete(`config.${key}[${i}] is blank — it renders as an empty slot.`));
+    } else if (opts.maxEntry !== undefined && v[i].length > opts.maxEntry) {
+      // "broken", not "incomplete": nobody types 400 characters on the way to
+      // a 20-character label, and the value cannot be rendered as written.
+      issues.push(
+        broken(
+          `config.${key}[${i}] is ${v[i].length} characters; the most the stage can set is ${opts.maxEntry}` +
+            `${opts.maxEntryWhy ? ` — ${opts.maxEntryWhy}` : ""}.`
+        )
+      );
     }
   }
   if (v.length < opts.min) {
     issues.push(
       incomplete(
         `config.${key} has ${v.length} entr${v.length === 1 ? "y" : "ies"}; this type needs at least ${opts.min}.`
+      )
+    );
+  }
+  if (opts.max !== undefined && v.length > opts.max) {
+    // "broken", not "incomplete": there is no route to a finished slide that
+    // passes THROUGH seven options, and the editor refuses to create one.
+    issues.push(
+      broken(
+        `config.${key} has ${v.length} entries; this type renders at most ${opts.max}` +
+          `${opts.maxWhy ? ` — ${opts.maxWhy}` : ""}.`
       )
     );
   }

@@ -14,7 +14,14 @@ import { AnsweredEcho, EchoOption, asIndexList } from "./answeredEcho";
 
 function MCEditor({ config, onChange, onReplace }: EditorProps) {
   const options: string[] = config.options ?? [];
-  const correct: number[] = Array.isArray(config.correctIndices) ? config.correctIndices : [];
+  // Out-of-range entries are dropped on the way IN, not just on the way out.
+  // A stored key of `[7]` against two options — the exact config round 8 ran
+  // in front of a room — put the form in a state the form could not leave:
+  // every tick read "not correct", and ticking one wrote `[0, 7]`, which is
+  // worse than what it started with. Reading the key as what the stage can
+  // actually use means the first tick writes `[0]` and the slide is fixed.
+  const correct: number[] = (Array.isArray(config.correctIndices) ? config.correctIndices : [])
+    .filter((x: unknown) => Number.isInteger(x) && (x as number) >= 0 && (x as number) < options.length);
   const [draft, setDraft] = useState<string[] | null>(null);
   const shown = draft ?? options;
 
