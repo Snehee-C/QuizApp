@@ -82,13 +82,13 @@ model Slide {
 }
 
 model Session {
-  id             String       @id @default(cuid())
-  presentationId String
-  presentation   Presentation @relation(fields: [presentationId], references: [id], onDelete: Cascade)
-  joinCode       String       @unique
+  id                    String            @id @default(cuid())
+  presentationId        String
+  presentation          Presentation      @relation(fields: [presentationId], references: [id], onDelete: Cascade)
+  joinCode              String            @unique
   // status: LOBBY | ACTIVE | ENDED
-  status         String       @default("LOBBY")
-  currentSlideId String?
+  status                String            @default("LOBBY")
+  currentSlideId        String?
   // Wall-clock moment the room landed on `currentSlideId`. Lives here, not only
   // in memory, because a restart has to be able to put the question back on the
   // clock it was already running: without it a recovered room either restarts
@@ -99,14 +99,15 @@ model Session {
   // one-shot and irreversible, so it is session state, not UI state — a
   // recovered room must not re-open a question the audience has already been
   // shown the answer to.
-  revealedSlideIds String   @default("[]")
-  startedAt      DateTime     @default(now())
+  revealedSlideIds      String            @default("[]")
+  startedAt             DateTime          @default(now())
   // Set when the host ends the session, so history can show real durations
   // and distinguish a finished run from one that was abandoned.
-  endedAt        DateTime?
-  responses      Response[]
-  questions      Question[]
-  participants   Participant[]
+  endedAt               DateTime?
+  responses             Response[]
+  questions             Question[]
+  participants          Participant[]
+  arrivals              AudienceArrival[]
 
   @@index([presentationId, startedAt])
   @@index([status, startedAt])
@@ -138,6 +139,43 @@ model Participant {
   lastSeenAt    DateTime @default(now())
 
   @@unique([sessionId, participantId])
+  @@index([sessionId])
+}
+
+// When each player reached each slide, in a SELF-PACED deck.
+//
+// Presenter-paced decks have one shared start — the host pressed Next — and it
+// already survives a restart as `Session.currentSlideStartedAt`. A self-paced
+// deck has no shared moment at all: every player reaches every slide whenever
+// they get there, so the only clock a speed score can be measured against is
+// per (player, slide). That lived solely in an in-memory Map, and so died with
+// the process.
+//
+// What that cost, exactly: on recovery the map came back empty, nothing
+// refilled it (a reconnecting phone is deliberately NOT re-seated under
+// audience pacing — it owns its own position), so `scoringStartedAt` returned
+// null and `speedPoints` fell through to its documented fail-safe of treating
+// the answer as instant. Every correct answer in the room scored a flat 1000,
+// however long it actually took. The fail-safe is right per answer — a player
+// must never be charged for a clock the server lost — and ruinous per room.
+//
+// Mirrors `Participant`: same session relation, same unique-triple shape, same
+// reason for existing. Written on first arrival only; a re-stamp would make the
+// clock resettable by leaving and coming back.
+model AudienceArrival {
+  id            String   @id @default(cuid())
+  sessionId     String
+  session       Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  // Keyed by the client-persisted id, like Response.participantId, so an
+  // arrival resolves to the same person a score does.
+  participantId String
+  slideId       String
+  // Wall clock, because only wall clock survives a restart. Converted back to
+  // this process's monotonic scale on rehydrate, by the same arithmetic
+  // `currentSlideStartedAt` already uses.
+  arrivedAt     DateTime @default(now())
+
+  @@unique([sessionId, participantId, slideId])
   @@index([sessionId])
 }
 

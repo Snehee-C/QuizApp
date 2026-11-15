@@ -15,6 +15,7 @@ import {
 import { registerQaHandlers } from "./qa.js";
 import { filterNickname, filterText, type FilterMode } from "../services/contentFilter.js";
 import { clampTimeScale } from "../timeScale.js";
+import { monoFromWall, withinNetworkGrace } from "../sessionClock.js";
 
 // In-memory live state per active session (keyed by joinCode).
 interface LiveSession {
@@ -101,6 +102,12 @@ interface LiveSession {
   revealTimer: ReturnType<typeof setTimeout> | null;
   // slideIds already revealed — revealing is one-shot per slide
   revealedSlides: Set<string>;
+  // When each reveal fired, on the monotonic clock. Only ever read by the
+  // network grace below, which needs to know not THAT a question closed but
+  // HOW LONG AGO. Deliberately not persisted: a reveal that predates a restart
+  // is definitively old, and an absent entry means no grace, which is the safe
+  // direction to fail.
+  revealedAtMono: Map<string, number>;
   // The exact `slide:reveal` frame we emitted, per slideId. A reveal is a
   // one-shot broadcast, so a phone that was offline for it — or a host who
   // navigates back onto the slide — has no way to learn the question is closed.
@@ -897,6 +904,7 @@ async function revealSlide(io: Server, joinCode: string, slide: LiveSession["sli
   const s = live.get(joinCode);
   if (!s) return;
   s.revealedSlides.add(slide.id);
+  s.revealedAtMono.set(slide.id, monoNow());
   // A reveal is irreversible, so it is session state rather than UI state: a
   // room rebuilt after a restart must not re-open a question the audience has
   // already been shown the answer to.
@@ -965,6 +973,7 @@ function emptyLiveShell(): Pick<
   LiveSession,
   | "revealTimer"
   | "revealedSlides"
+  | "revealedAtMono"
   | "revealPayloads"
   | "participantSockets"
   | "presenterSockets"
@@ -982,6 +991,7 @@ function emptyLiveShell(): Pick<
   return {
     revealTimer: null,
     revealedSlides: new Set(),
+    revealedAtMono: new Map(),
     revealPayloads: new Map(),
     participantSockets: new Map(),
     presenterSockets: new Set(),
@@ -1080,7 +1090,43 @@ async function rehydrateSession(joinCode: string): Promise<LiveSession | null> {
   if (currentIndex >= 0 && row.currentSlideStartedAt) {
     const startedWall = row.currentSlideStartedAt.getTime();
     s.currentSlideStartedAt = startedWall;
-    s.currentSlideStartedMono = monoNow() - Math.max(0, Date.now() - startedWall);
+    s.currentSlideStartedMono = monoFromWall(startedWall, Date.now(), monoNow());
+  }
+
+  // Put every self-paced player back on their OWN clock.
+  //
+  // The shared clock restored above is the whole story for a presenter-paced
+  // deck and none of it for a self-paced one, where each player's window opened
+  // whenever they personally reached the slide. Without this the Map comes back
+  // empty and stays empty — a reconnecting phone is deliberately not re-seated
+  // under audience pacing, because it owns its own position — so every correct
+  // answer in the room scores a flat 1000 (see the AudienceArrival model).
+  //
+  // Only for AUDIENCE decks: a presenter-paced room never writes these rows, so
+  // reading them would be a query that can only ever return nothing.
+  if (s.pacing === "AUDIENCE") {
+    const slideIds = new Set(slides.map((sl) => sl.id));
+    const arrivals = await prisma.audienceArrival.findMany({
+      where: { sessionId: row.id },
+      select: { participantId: true, slideId: true, arrivedAt: true },
+    });
+    const nowWall = Date.now();
+    const nowMono = monoNow();
+    for (const a of arrivals) {
+      // A slide deleted while the process was down is not part of this deck any
+      // more, and seating a clock on it would leave an entry nothing can ever
+      // match or clear.
+      if (!slideIds.has(a.slideId)) continue;
+      // The same conversion `currentSlideStartedMono` uses, for the same
+      // reason: monotonic time counts from THIS process's start, so a stored
+      // wall clock has to be walked back onto the new scale. Clamped at 0 so a
+      // row stamped in the future (a clock step between processes) can only
+      // ever read as "just now" rather than as a negative elapsed.
+      s.audienceArrivals.set(arrivalKey(a.participantId, a.slideId), {
+        slideId: a.slideId,
+        mono: monoFromWall(a.arrivedAt.getTime(), nowWall, nowMono),
+      });
+    }
   }
 
   // Rebuild the exact frames a reveal left behind, so a phone that re-joins
@@ -1218,6 +1264,35 @@ function markArrival(s: LiveSession, participantId: string, slideId: string | nu
   const key = arrivalKey(participantId, slideId);
   if (s.audienceArrivals.has(key)) return;
   s.audienceArrivals.set(key, { slideId, mono: monoNow() });
+
+  // ...and on disk, because the Map dies with the process and this is the only
+  // clock a self-paced score can be measured against. See the AudienceArrival
+  // model for what its loss cost (a flat 1000 to every correct answer in the
+  // room, after any restart).
+  //
+  // Fire-and-forget, deliberately. The in-memory stamp above is what THIS
+  // process grades on, and it is already correct; the row only matters to a
+  // process that does not exist yet. Awaiting it would put a database round
+  // trip in front of a navigation the player is waiting on, to protect against
+  // a restart that probably will not happen — the wrong trade on the hot path.
+  //
+  // `createMany` with `skipDuplicates` rather than `create`: first-arrival-only
+  // is enforced by the Map above, but two sockets for one identity can race
+  // through it, and a unique-constraint rejection on a fire-and-forget write is
+  // an unhandled rejection. This makes the second write a no-op instead, which
+  // is also the semantics we want — the EARLIEST arrival is the true one.
+  const wall = new Date();
+  prisma.audienceArrival
+    .createMany({
+      data: [{ sessionId: s.sessionId, participantId, slideId, arrivedAt: wall }],
+      skipDuplicates: true,
+    })
+    .catch((e) => {
+      // Never fatal. A lost row costs this player their speed clock on this
+      // slide IF the process also restarts before they answer; it must not cost
+      // them the navigation they are in the middle of.
+      console.error("[markArrival] could not persist arrival", e);
+    });
 }
 
 /**
@@ -1230,7 +1305,21 @@ function markArrival(s: LiveSession, participantId: string, slideId: string | nu
  */
 function scoringStartedAt(s: LiveSession, participantId: string, slideId: string): number | null {
   if (s.pacing !== "AUDIENCE") return s.currentSlideStartedMono;
-  return s.audienceArrivals.get(arrivalKey(participantId, slideId))?.mono ?? null;
+  const mono = s.audienceArrivals.get(arrivalKey(participantId, slideId))?.mono;
+  if (mono === undefined) {
+    // The fail-safe below is deliberate and stays, but it must not be SILENT.
+    // A null here means this answer is about to be graded as instant and score
+    // full marks, and for a year the only evidence was a leaderboard nobody
+    // could explain. If this line appears for a whole room at once, arrivals
+    // did not survive a restart; if it appears for one player, they reached a
+    // slide by a path that does not mark arrivals.
+    console.warn(
+      `[scoringStartedAt] no arrival for participant=${participantId} slide=${slideId} ` +
+        `session=${s.sessionId} — grading as instant (full speed points)`
+    );
+    return null;
+  }
+  return mono;
 }
 
 /**
@@ -2509,8 +2598,42 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       return reject(cb, "TOO_LATE", "You've already answered this one");
     }
 
-    // Once a slide is revealed, answers are locked — the window has closed.
-    if (s.revealedSlides.has(slideId)) return reject(cb, "TOO_LATE", "Time's up");
+    // ---- Once revealed the window has closed, but not to the millisecond ----
+    //
+    // The reveal fires at exactly `startedAt + limit`, and this check used to
+    // reject anything arriving after it. An answer tapped at 19.9s on a 20s
+    // question and delivered at 20.1s was therefore thrown away — the player
+    // did everything right and the network spent their last tenth of a second.
+    // On venue Wi-Fi that is not an edge case, and it is indistinguishable, to
+    // the person it happens to, from the app losing their answer.
+    //
+    // So a frame that lands within `NETWORK_GRACE_MS` of the close is still
+    // accepted. It buys nothing: grading runs unchanged below, and because
+    // `speedPoints` clamps elapsed to the full window, an answer admitted here
+    // scores the floor — exactly what the slowest honest answer scores. The
+    // grace recovers the ANSWER, never the speed bonus.
+    //
+    // Bounded by the server's own measurement, never a client's claim. The only
+    // input is when this frame arrived, which the client cannot forge: holding
+    // an answer back to think about it past the buzzer still misses the window,
+    // because the window is measured from the close rather than from anything
+    // the phone says about itself.
+    //
+    // A reveal with no recorded instant gets no grace at all. That is the
+    // rehydrate case — a question closed before this process existed — and
+    // treating "I do not know when it closed" as "it closed long ago" is the
+    // direction that cannot reopen a settled question.
+    //
+    // One honest side effect: the room has already SEEN the reveal, and the
+    // aggregate the stage holds is the frozen one. An answer admitted here
+    // updates the stored responses and the next `results:updated`, so a bar can
+    // still move slightly while the reveal animation is playing. A quietly
+    // discarded answer seemed the worse of the two.
+    if (s.revealedSlides.has(slideId)) {
+      if (!withinNetworkGrace(arrivedMono, s.revealedAtMono.get(slideId))) {
+        return reject(cb, "TOO_LATE", "Time's up");
+      }
+    }
 
     // ---- Pay back whatever a delivery gap cost, and nothing more ----
     //
