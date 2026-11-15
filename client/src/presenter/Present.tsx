@@ -24,6 +24,7 @@ import { useStageScale } from "../components/stageScale";
 import type { RowIdentity } from "../components/participantKey";
 import { NumberTicker } from "../components/ui/NumberTicker";
 import { TimerRing } from "../components/ui/TimerRing";
+import { noteServerNow, startClockSync } from "../lib/serverClock";
 import { FitText } from "../components/ui/FitText";
 import { Button } from "../components/ui/Button";
 import { initSound, isMuted, playSound, subscribeMuted, toggleMuted, unlockAudio } from "../lib/sound";
@@ -108,6 +109,13 @@ export default function Present() {
     initSound({ role: "presenter" });
   }, []);
 
+  // The stage measures its own offset from the server, on the same schedule
+  // and through the same filter as every phone in the room. Mounted here
+  // rather than inside the big socket effect because it has nothing to do with
+  // a session: it is true before a join code exists and stays true across one
+  // ending and the next one starting.
+  useEffect(() => startClockSync(getSocket()), []);
+
   useEffect(() => {
     applyStage(stage, rootRef.current);
     // The deck theme is a set of token overrides written on the same element,
@@ -138,6 +146,10 @@ export default function Present() {
     // field name: create-session says `currentIndex`, resume-session says
     // `index` (CONTRACT §4).
     function adoptSession(res: any) {
+      // Before the state that depends on it, as on the phone: this ack is the
+      // first thing a resuming host hears, and it may be carrying a slide that
+      // is already running.
+      noteServerNow(res?.serverNow);
       setJoinCode(res.joinCode);
       joinCodeRef.current = res.joinCode;
       // The trail back. Written here rather than at the exit, because the
@@ -282,6 +294,22 @@ export default function Present() {
     }
 
     socket.on("slide:changed", (payload) => {
+      // THE STAGE IS A CLIENT TOO.
+      //
+      // This line is the whole of a bug the room could see and nobody could
+      // explain. `TimerRing` counts `serverNow() - startedAt`; `startedAt` is
+      // the server's, and `serverNow()` is this machine's clock plus whatever
+      // offset the wire has told us. The phones record that offset on every
+      // frame. The presenter never recorded it anywhere — so `serverNow()`
+      // fell through to `Date.now()` and the projector counted down on the
+      // host laptop's own clock while every phone in the room counted down on
+      // the server's. A laptop a few seconds out of true put the big screen
+      // and the audience on visibly different timers for the entire session,
+      // and neither side had any way to tell which one was lying.
+      //
+      // First, ahead of the state below, for the reason the phone states: the
+      // effects that arm the countdown run after this handler returns.
+      noteServerNow(payload?.serverNow);
       // Re-learn the deck as the host moves through it. `totalSlides` is
       // authoritative on every frame while `slideTitles` is issued once, so a
       // length disagreement is the only signal we get that the session's
@@ -338,6 +366,7 @@ export default function Present() {
     socket.on("leaderboard:updated", (payload) => setLeaderboard(payload.entries ?? []));
 
     socket.on("slide:reveal", (payload) => {
+      noteServerNow(payload?.serverNow);
       if (payload.slideId === currentSlideIdRef.current) {
         setRevealed(true);
         setRevealPayload(payload ?? {});

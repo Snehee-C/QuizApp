@@ -11,6 +11,7 @@ import Home from "./Home";
 import History from "./presenter/History";
 import Templates from "./presenter/Templates";
 import DeckTransfer from "./presenter/DeckTransfer";
+import { ClockDebug } from "./components/ClockDebug";
 
 // A signed-out visit to a real destination used to end at the dashboard: the
 // place you asked for was thrown away at the gate, and after logging in you
@@ -32,65 +33,72 @@ function RequireAuth({ children }: { children: JSX.Element }) {
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Home />} />
-      <Route path="/login" element={<Login />} />
+    <>
+      {/* Renders nothing unless `?clock=1` has been used on this device. Here
+          rather than inside Present/Play so it survives every branch of both
+          — including the error and post-session screens, which are exactly
+          where a host goes looking when the room felt unfair. */}
+      <ClockDebug />
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/login" element={<Login />} />
 
-      {/* Presenter (auth required) */}
-      <Route
-        path="/dashboard"
-        element={
-          <RequireAuth>
-            <Dashboard />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/edit/:id"
-        element={
-          <RequireAuth>
-            <Editor />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/templates"
-        element={
-          <RequireAuth>
-            <Templates />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/transfer"
-        element={
-          <RequireAuth>
-            <DeckTransfer />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/history/:id"
-        element={
-          <RequireAuth>
-            <History />
-          </RequireAuth>
-        }
-      />
-      <Route
-        path="/present/:id"
-        element={
-          <RequireAuth>
-            <Present />
-          </RequireAuth>
-        }
-      />
+        {/* Presenter (auth required) */}
+        <Route
+          path="/dashboard"
+          element={
+            <RequireAuth>
+              <Dashboard />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/edit/:id"
+          element={
+            <RequireAuth>
+              <Editor />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/templates"
+          element={
+            <RequireAuth>
+              <Templates />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/transfer"
+          element={
+            <RequireAuth>
+              <DeckTransfer />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/history/:id"
+          element={
+            <RequireAuth>
+              <History />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/present/:id"
+          element={
+            <RequireAuth>
+              <Present />
+            </RequireAuth>
+          }
+        />
 
-      {/* Participant (no auth) */}
-      <Route path="/join" element={<Join />} />
-      <Route path="/join/:code" element={<Play />} />
+        {/* Participant (no auth) */}
+        <Route path="/join" element={<Join />} />
+        <Route path="/join/:code" element={<Play />} />
 
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+          <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </>
   );
 }

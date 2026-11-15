@@ -29,7 +29,7 @@ import {
   submitWithRetry,
   useConnection,
 } from "../lib/connection";
-import { noteServerNow, serverNow } from "../lib/serverClock";
+import { noteServerNow, serverNow, startClockSync } from "../lib/serverClock";
 import { initSound, playSound, unlockAudio } from "../lib/sound";
 import { burstFrom } from "../lib/confetti";
 import { cn } from "../lib/cn";
@@ -297,6 +297,13 @@ export default function Play() {
   // describe — see the watchdog below.
   const { status: connectionStatus, queued } = useConnection();
 
+  // Keep this phone's read of the server's clock measured, for as long as the
+  // screen is open. Deliberately NOT gated on `joined`: the offset is a
+  // property of this device and the network, not of a room, and starting it at
+  // the join gate means the first question of the session is read against
+  // whatever single sample the join ack happened to produce.
+  useEffect(() => startClockSync(getSocket()), []);
+
   useEffect(() => {
     if (!joined) return;
     const socket = getSocket();
@@ -316,7 +323,10 @@ export default function Play() {
     //
     // `rttMs` is how long this ack took to come back, when the caller timed
     // it; the clock sample inside is stamped at the far end of that trip.
-    const applyJoinAck = (res: any, isRejoin: boolean, rttMs = 0) => {
+    // OMITTED, never 0, when the caller did not time it: zero is now the
+    // best possible round trip and would make an untimed ack outrank every
+    // real measurement we ever take (lib/serverClock.ts).
+    const applyJoinAck = (res: any, isRejoin: boolean, rttMs?: number) => {
       // FIRST, ahead of every setState below: `startedAt` is only meaningful
       // next to the server's own "now", and the effects that arm the
       // countdown run after this handler returns, so the offset has to be

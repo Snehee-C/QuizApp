@@ -1450,6 +1450,32 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     socket.data.lastPacketAt = Date.now();
   });
 
+  // ---- The clock probe ----
+  //
+  // Every countdown in this app is `startedAt + limit - now`, where `startedAt`
+  // is OUR clock and `now` is the client's. The difference between those two
+  // clocks is the one term neither side can see, so each frame that carries
+  // `startedAt` also carries `serverNow` and the client subtracts its own
+  // offset out. That works, but it only ever samples on frames the room
+  // happens to send: a phone that joins and then sits reading for ten minutes
+  // never re-measures, and a sample that arrives on a congested link is
+  // one-way-latency stale with no way to tell how stale.
+  //
+  // This is the same stamp, on demand, as a round trip the caller TIMES. With
+  // `rtt` in hand the client can place the stamp in the middle of the trip
+  // instead of at the end, and — far more useful — it can compare two samples
+  // and keep the one that travelled through less queueing. See
+  // client/src/lib/serverClock.ts for the filter that does it.
+  //
+  // Deliberately unauthenticated and session-free: it reveals nothing but the
+  // time, every client needs it before it has joined anything, and the
+  // PRESENTER needs it too (its ring was reading the laptop's own clock). The
+  // work is one `Date.now()` and a reply, so a client that spams it costs us
+  // strictly less than the heartbeat it is already sending.
+  socket.on("time:sync", (_payload: unknown, cb?: Function) => {
+    cb?.({ serverNow: Date.now() });
+  });
+
   // Q&A and reactions live in their own module but need to resolve the same
   // in-memory session map and reuse this file's presenter authorization.
   registerQaHandlers(io, socket, {
