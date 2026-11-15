@@ -1,0 +1,92 @@
+name: CI
+
+# The two test files in this repo are plain `tsx` scripts that throw (client)
+# or `process.exit(1)` (server) on a failed assertion, so a runner only has to
+# execute them — there is no test framework to configure. Before this workflow
+# existed they were wired to nothing at all and ran only when somebody
+# remembered to type the command out of the comment at the top of the file.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        working-directory: client
+        run: npm ci
+
+      # serverClock.test.ts — the clock filter every countdown in the app is
+      # read through.
+      - name: Test
+        working-directory: client
+        run: npm test
+
+      - name: Lint
+        working-directory: client
+        run: npm run lint
+
+      # `tsc -b && vite build` — the same command deploy-frontend.yml runs, so
+      # a type error cannot reach the deploy workflow unseen. No VITE_API_URL
+      # here on purpose: the build must stand up without it, and what the
+      # deployed bundle points at is a deploy-time concern.
+      - name: Build
+        working-directory: client
+        run: npm run build
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      # @prisma/client generates on postinstall, but it is run explicitly so a
+      # typecheck can never pass or fail on whether that hook happened to fire.
+      # No database is reached — `generate` only reads the schema — and the URL
+      # is a placeholder purely because the datasource block demands one.
+      - name: Generate Prisma client
+        working-directory: server
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+        run: npx prisma generate
+
+      # contentFilter.test.ts — the filter standing between a participant's
+      # free text and the projected screen.
+      - name: Test
+        working-directory: server
+        run: npm test
+
+      # --noEmit: CI is asking whether this compiles, not building an artifact
+      # to ship. The VM deploy runs `npm run build` itself.
+      - name: Typecheck
+        working-directory: server
+        run: npx tsc --noEmit
