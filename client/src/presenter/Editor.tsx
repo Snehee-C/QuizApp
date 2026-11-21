@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { motion } from "motion/react";
+import { motion, AnimatePresence, Reorder } from "motion/react";
 import {
   api,
   parseConfig,
@@ -13,14 +13,19 @@ import { Button } from "../components/ui/Button";
 import { Input, Label } from "../components/ui/Card";
 import { cn } from "../lib/cn";
 import { SLIDE_GROUPS, labelFor, slideType, typesInGroup } from "../slides/registry";
+import type { Removal } from "../slides/types";
 import { ThemePicker } from "../components/ThemePicker";
+import { AppHeader } from "../components/AppHeader";
+import { DeckSwitcher } from "../components/DeckSwitcher";
 import { LiveRoomBar } from "../components/LiveRoomBar";
+import { SaveIndicator } from "../components/SaveIndicator";
 import { getPresenting } from "../lib/liveSession";
 import { usePaneScrollMemory } from "../lib/scrollMemory";
 import { useUndoableDelete } from "../lib/undoDelete";
+import { autosave } from "../lib/autosave";
+import { prefersReducedMotion, spring } from "../lib/motion";
 import { UndoBar } from "../components/UndoBar";
 import { SlideTypePicker } from "../components/SlideTypePicker";
-import { AnimatePresence } from "motion/react";
 
 // Where the host was last working in this deck, per deck, for this tab.
 //
@@ -81,6 +86,27 @@ function noteLiveHonoured(deckId: string, slideId: string): void {
   } catch {
     // Private-mode quota. The editor then follows the room on every mount
     // rather than only when it moves — noisier, never wrong.
+  }
+}
+
+// Whether the phone preview is open on a narrow window. A per-host
+// preference, not a per-visit one: a host on a 13″ laptop who wants the
+// preview wants it every time (UX-PLAN 5.10).
+const PREVIEW_KEY = "menti_editor_preview";
+
+function recallPreview(): boolean {
+  try {
+    return localStorage.getItem(PREVIEW_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function rememberPreview(open: boolean): void {
+  try {
+    localStorage.setItem(PREVIEW_KEY, open ? "1" : "0");
+  } catch {
+    // Costs the memory, not the toggle.
   }
 }
 
@@ -149,14 +175,38 @@ function IssueText({ message }: { message: string }) {
   );
 }
 
+// ── Saving ──────────────────────────────────────────────────────────────
+//
+// Every write the editor makes goes through lib/autosave.ts — the slide's
+// question, config and notes, the deck's title and settings, the slide order.
+// Nothing here calls `api.update*` directly any more, and nothing renders
+// "Saved" that the server has not acknowledged (PULSE.md T2). The pieces that
+// are NOT patches — creating, duplicating, deleting a slide — are awaited
+// with a catch that reports to the same indicator, because a failure with no
+// surface is the thing this whole file used to be.
+
+/** The leave guard reads one boolean, so it subscribes to one boolean. */
+function useUnsaved(): boolean {
+  return useSyncExternalStore(
+    autosave.subscribe,
+    () => autosave.getState().dirty,
+    () => false
+  );
+}
+
+type SlidePatch = { question?: string; config?: any; notes?: string };
+
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
   const [pres, setPres] = useState<PresentationWithSlides | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [checkOpen, setCheckOpen] = useState(false);
-  const [pickerOpen, setPickerOpen] = useState(false);
+  // Where a slide added from the picker lands: after the selected slide (the
+  // common case — you are building where you are) or at the end, by request.
+  const [pickerOpen, setPickerOpen] = useState<false | "after" | "end">(false);
+  const [previewOpen, setPreviewOpen] = useState(recallPreview);
   // Set only once LiveRoomBar has confirmed the room with the server, so the
   // rail's "on screen" marker and the banner can never disagree.
   const [roomLive, setRoomLive] = useState(false);
@@ -164,6 +214,12 @@ export default function Editor() {
   // The last thing in the product that forgot where you were (FLOW.md F3).
   usePaneScrollMemory(pane, id, selectedId);
   const navigate = useNavigate();
+  const unsaved = useUnsaved();
+
+  // The deck as it is NOW, readable from callbacks that outlive a render —
+  // a drag's end, a reorder writer that fires after a debounce.
+  const presRef = useRef(pres);
+  presRef.current = pres;
 
   // One place that moves the selection, so remembering it cannot be forgotten
   // at a call site. Every `setSelectedId` in this file goes through here.
@@ -174,8 +230,34 @@ export default function Editor() {
 
   async function load(keepSelection = true) {
     if (!id) return;
-    const data = await api.getPresentation(id);
-    setPres(data);
+    let data: PresentationWithSlides;
+    try {
+      data = await api.getPresentation(id);
+    } catch (e) {
+      // A deck that will not load is not "Loading…" forever. Say so, and
+      // offer the one thing that can be done about it.
+      if (!presRef.current) {
+        setLoadError(e instanceof Error ? e.message : "Couldn't load this deck");
+      } else {
+        autosave.notify("Couldn't refresh the deck — showing what was last loaded");
+      }
+      return;
+    }
+    setLoadError(null);
+    // A GET that lands while a save is in flight or still coalescing carries
+    // the pre-edit values for those fields; the editor would render a title
+    // or question the host has already seen marked "Saved", then watch it
+    // snap back. Overlay whatever the pipeline has not yet proven delivered.
+    const deckLocal = autosave.unsaved(`deck:${id}`);
+    const merged: PresentationWithSlides = {
+      ...data,
+      ...(deckLocal ?? {}),
+      slides: data.slides.map((sl) => {
+        const local = autosave.unsaved(`slide:${sl.id}`);
+        return local ? { ...sl, ...local } : sl;
+      }),
+    };
+    setPres(merged);
     setSelectedId((cur) => {
       if (keepSelection && cur && data.slides.some((s) => s.id === cur)) return cur;
 
@@ -209,31 +291,127 @@ export default function Editor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  // Leaving the editor sends whatever is still inside the debounce window.
+  // The pipeline outlives this component, so the write completes without it.
+  useEffect(() => () => autosave.flush(), []);
+
+  // Closing the tab with an edit still unacknowledged is the one case where
+  // interrupting is right: the alternative is losing it silently. In-app
+  // navigation never trips this — the pipeline carries on after unmount.
+  useEffect(() => {
+    if (!unsaved) return;
+    function guard(e: BeforeUnloadEvent) {
+      e.preventDefault();
+      // Legacy browsers read the property; modern ones ignore its text.
+      e.returnValue = "";
+    }
+    window.addEventListener("beforeunload", guard);
+    return () => window.removeEventListener("beforeunload", guard);
+  }, [unsaved]);
+
+  /** The server's answer about a slide, folded into the deck in place. */
+  function mergeSlide(saved: Slide) {
+    setPres((p) =>
+      p ? { ...p, slides: p.slides.map((s) => (s.id === saved.id ? { ...s, ...saved } : s)) } : p
+    );
+  }
+
+  function saveSlide(slideId: string, patch: SlidePatch) {
+    if (!id) return;
+    autosave.patch(
+      `slide:${slideId}`,
+      patch,
+      (merged) => api.updateSlide(id, slideId, merged as SlidePatch),
+      (result) => {
+        // The acked slide carries `configIssues` for the rules as the server
+        // ran them on what is NOW stored — which is the whole of what the
+        // inline advisory and the rail marker show.
+        if (result && typeof result === "object") mergeSlide(result as Slide);
+      }
+    );
+  }
+
+  // Deck-level fields. Applied optimistically — single-field writes that
+  // cannot partially fail, and a laggy theme swatch feels broken — and the
+  // ack is NOT folded back: it would briefly revert a title typed after the
+  // request left, and the pipeline is already sequential, so the last write
+  // is the one that stands.
+  function saveDeck(patch: Partial<PresentationWithSlides>) {
+    if (!id) return;
+    setPres((p) => (p ? ({ ...p, ...patch } as PresentationWithSlides) : p));
+    autosave.patch(`deck:${id}`, patch as Record<string, unknown>, (merged) =>
+      api.updatePresentation(id, merged as any)
+    );
+  }
+
+  // The slide order as the rail shows it, persisted as one full-order write.
+  // Coalesced like everything else: six quick ↓ presses are one request, not
+  // six, and a press while one is on the wire queues behind it instead of
+  // being dropped (UX-PLAN 5.4). The writer re-reads the deck at send time
+  // and drops ids that have since been deleted, or the server would refuse
+  // the order and the pipeline would retry a request that can never succeed.
+  function persistOrder(order?: string[]) {
+    if (!id) return;
+    const ids = order ?? presRef.current?.slides.map((s) => s.id) ?? [];
+    autosave.patch(`order:${id}`, { order: ids }, (merged) => {
+      const live = new Set(presRef.current?.slides.map((s) => s.id) ?? []);
+      const wanted = (merged.order as string[]).filter((sid) => live.has(sid));
+      return api.reorderSlides(id, wanted);
+    });
+  }
+
+  /** Put a freshly created slide where the host is, not at the end. */
+  function insertCreated(created: Slide, afterId: string | null) {
+    const cur = presRef.current;
+    if (!cur) return;
+    const slides = [...cur.slides];
+    const at = afterId ? slides.findIndex((s) => s.id === afterId) : -1;
+    const index = at === -1 ? slides.length : at + 1;
+    slides.splice(index, 0, created);
+    setPres({ ...cur, slides });
+    // The server appends (presentations.ts assigns a monotonic `order`), so
+    // anything other than "at the end" is a create followed by a reorder.
+    if (index !== slides.length - 1) persistOrder(slides.map((s) => s.id));
+    select(created.id);
+  }
+
   async function addSlide(type: SlideType) {
     if (!id) return;
+    const where = pickerOpen;
     setPickerOpen(false);
     const def = slideType(type);
-    const slide = await api.addSlide(id, type, "", def ? def.defaultConfig() : {});
-    await load(false);
-    select(slide.id);
+    let created: Slide;
+    try {
+      created = await api.addSlide(id, type, "", def ? def.defaultConfig() : {});
+    } catch {
+      autosave.notify("Couldn't add the slide — check your connection and try again");
+      return;
+    }
+    insertCreated(created, where === "end" ? null : selectedId);
   }
 
   async function duplicate(slide: Slide) {
     if (!id) return;
-    const created = await api.addSlide(
-      id,
-      slide.type,
-      slide.question,
-      parseConfig(slide)
-    );
-    await load(false);
-    select(created.id);
+    let created: Slide;
+    try {
+      created = await api.addSlide(id, slide.type, slide.question, parseConfig(slide));
+    } catch {
+      autosave.notify("Couldn't duplicate the slide — check your connection and try again");
+      return;
+    }
+    // Directly after its source. A copy that lands at the end of a
+    // thirty-slide deck is a copy you then spend fifteen presses moving.
+    insertCreated(created, slide.id);
   }
 
   // Same bargain as the deck list: the slide leaves the rail now, the server
   // hears about it in six seconds, and undo inside that window means it is
-  // never told (lib/undoDelete.ts).
-  const { pending, scheduleDelete, undo, windowMs } = useUndoableDelete();
+  // never told (lib/undoDelete.ts). Option removals inside a slide form share
+  // the same hook and the same bar — one "Deleted … Undo" in the product —
+  // and are told apart by their key.
+  const { pending, scheduleDelete, undo, commit, windowMs } = useUndoableDelete();
+  const restoreFns = useRef<Map<string, () => void>>(new Map());
+  const removalSeq = useRef(0);
 
   function deleteSlide(slideId: string) {
     if (!id || !pres) return;
@@ -249,57 +427,68 @@ export default function Editor() {
       select(remaining[Math.min(at, remaining.length - 1)]?.id ?? null);
     }
     scheduleDelete(slideId, slide.question?.trim() || "an untitled slide", () => {
-      // `load()` either way: on success it reconciles order, and on failure it
-      // is what puts the slide back rather than leaving the rail lying.
-      void api.deleteSlide(id, slideId).finally(() => void load());
+      // On failure `load()` is what puts the slide back rather than leaving
+      // the rail lying — and the indicator says why it came back.
+      void api.deleteSlide(id, slideId).catch(() => {
+        autosave.notify("Couldn't delete the slide — it's back in the deck");
+        void load();
+      });
     });
   }
 
-  function undoDeleteSlide(key: string) {
+  /**
+   * A list-row removal inside the open slide's form. Keyed apart from slide
+   * deletes so the undo handler can tell which it is restoring.
+   */
+  function scheduleRemoval(label: string, destroy: () => void, restore: () => void): string {
+    const key = `field:${++removalSeq.current}`;
+    restoreFns.current.set(key, restore);
+    scheduleDelete(key, label, () => {
+      restoreFns.current.delete(key);
+      destroy();
+    });
+    return key;
+  }
+
+  function onUndo(key: string) {
     if (!undo(key)) return;
+    if (key.startsWith("field:")) {
+      const restore = restoreFns.current.get(key);
+      restoreFns.current.delete(key);
+      restore?.();
+      return;
+    }
     // It was never deleted, so the server still has it — and re-selecting it
     // before the refetch means undo returns you to the slide you rescued.
     select(key);
     void load();
   }
 
-  // Reorder is a swap with the neighbour, persisted as a full id order. The
-  // API already supported this; it just had no UI.
-  async function move(index: number, dir: -1 | 1) {
-    if (!id || !pres || busy) return;
+  // Reorder by keyboard: a swap with the neighbour. The same full-order
+  // write as a drag, so there is one spelling of "the deck is in this order".
+  function move(index: number, dir: -1 | 1) {
+    if (!id || !pres) return;
     const target = index + dir;
     if (target < 0 || target >= pres.slides.length) return;
     const order = pres.slides.map((s) => s.id);
     [order[index], order[target]] = [order[target], order[index]];
-    // Optimistic: reordering should feel instant, and the server call is a
-    // simple reindex that can't partially fail.
     setPres({
       ...pres,
       slides: order.map((sid) => pres.slides.find((s) => s.id === sid)!),
     });
-    setBusy(true);
-    try {
-      await api.reorderSlides(id, order);
-    } finally {
-      setBusy(false);
-    }
+    persistOrder(order);
   }
 
-  async function renameTitle(title: string) {
-    if (!id) return;
-    setPres((p) => (p ? { ...p, title } : p));
-    await api.updatePresentation(id, { title });
-  }
-
-  // Deck-level settings. Applied optimistically — these are single-field
-  // writes that cannot partially fail, and a laggy theme swatch feels broken.
-  async function patchDeck(patch: Partial<PresentationWithSlides>) {
-    if (!id || !pres) return;
-    setPres({ ...pres, ...patch } as PresentationWithSlides);
-    await api.updatePresentation(id, patch as any);
+  // Reorder by drag: the rail follows the pointer locally, and the order is
+  // written once, when the slide is dropped.
+  function onReorder(order: string[]) {
+    setPres((p) =>
+      p ? { ...p, slides: order.map((sid) => p.slides.find((s) => s.id === sid)!) } : p
+    );
   }
 
   const selected = pres?.slides.find((s) => s.id === selectedId) ?? null;
+  const selectedIndex = selected ? pres!.slides.indexOf(selected) : -1;
   // Counted over the WHOLE deck, not the open slide: the fault that reached a
   // projector in round 8 was on a slide nobody was looking at.
   const slides = pres?.slides ?? [];
@@ -312,38 +501,90 @@ export default function Editor() {
   // the host can see that it did, and see where the room is if they then
   // navigate somewhere else in the deck.
   const liveSlideId = roomLive ? (getPresenting(id)?.slideId ?? null) : null;
+  const reduced = prefersReducedMotion();
 
   if (!pres) {
     return (
       <div className="min-h-[100dvh] grid place-items-center bg-canvas text-ink-subtle">
-        Loading…
+        {loadError ? (
+          <div className="text-center flex flex-col items-center gap-3">
+            <p className="text-subhead text-ink">Couldn't load this deck</p>
+            <p className="text-footnote">{loadError}</p>
+            <Button variant="secondary" size="sm" onClick={() => void load()}>
+              Try again
+            </Button>
+          </div>
+        ) : (
+          "Loading…"
+        )}
       </div>
     );
   }
 
+  // Where a slide added from the rail will land, said before the choice.
+  const addsAtEnd = pickerOpen === "end" || !selected || selectedIndex === slides.length - 1;
+  const placement = addsAtEnd
+    ? slides.length === 0
+      ? undefined
+      : "Added at the end of the deck"
+    : `Added after slide ${selectedIndex + 1}`;
+
   return (
     <div className="h-[100dvh] flex flex-col bg-canvas text-ink overflow-hidden">
-      <header className="shrink-0 border-b border-hairline px-5 h-16 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3 min-w-0">
-          {/* A back control names where it goes. A bare arrow is a direction,
-              not a destination: it tells you that leaving is possible and
-              nothing about where you land, so the only way to find out is to
-              press it and see — which is the opposite of the confidence a
-              back button exists to give. */}
-          <Link
-            to="/dashboard"
-            className="shrink-0 flex items-center gap-1.5 -ml-1 px-1.5 py-1 rounded-xs text-subhead text-ink-subtle hover:text-ink transition-colors duration-fast focus-visible:shadow-focus outline-none"
+      <AppHeader
+        width="full"
+        crumb={
+          <>
+            {/* A back control names where it goes. A bare arrow is a direction,
+                not a destination: it tells you that leaving is possible and
+                nothing about where you land, so the only way to find out is to
+                press it and see — which is the opposite of the confidence a
+                back button exists to give. */}
+            <Link
+              to="/dashboard"
+              className="shrink-0 flex items-center gap-1.5 -ml-1 px-1.5 py-1 rounded-xs text-subhead text-ink-subtle hover:text-ink transition-colors duration-fast focus-visible:shadow-focus outline-none"
+            >
+              <span aria-hidden="true">←</span> Decks
+            </Link>
+            <input
+              className="font-display font-bold text-body bg-transparent outline-none min-w-0 max-w-full rounded-xs px-1 -mx-1 focus:shadow-focus"
+              // Sized to the title rather than stretched across the header,
+              // so the switcher's chevron sits beside the name it switches.
+              size={Math.min(48, Math.max(10, pres.title.length + 2))}
+              value={pres.title}
+              // Through the pipeline: one PATCH when typing pauses, not one
+              // per keystroke.
+              onChange={(e) => saveDeck({ title: e.target.value })}
+              aria-label="Deck title"
+            />
+            {/* The title doubles as a switcher: the five decks touched most
+                recently, then the full list. Marked `· live` when this deck
+                has a room open (DeckSwitcher.tsx, UX-PLAN 0.4). */}
+            {id && <DeckSwitcher currentId={id} live={roomLive} />}
+          </>
+        }
+        actions={
+          <>
+          {/* Whether what you see is what the server has. Desk-distance
+              type, never alarming on a healthy save (SaveIndicator.tsx). */}
+          <SaveIndicator className="mr-1" />
+          {/* Below `lg` the phone preview has no column of its own. It used
+              to simply not exist there, with nothing saying so; now it is a
+              press away at any width, and the button is the notice. */}
+          <Button
+            variant={previewOpen ? "secondary" : "ghost"}
+            size="sm"
+            className="lg:hidden"
+            aria-pressed={previewOpen}
+            onClick={() =>
+              setPreviewOpen((v) => {
+                rememberPreview(!v);
+                return !v;
+              })
+            }
           >
-            <span aria-hidden="true">←</span> Decks
-          </Link>
-          <input
-            className="font-display font-bold text-body bg-transparent outline-none min-w-0 flex-1 rounded-xs px-1 -mx-1 focus:shadow-focus"
-            value={pres.title}
-            onChange={(e) => renameTitle(e.target.value)}
-            aria-label="Deck title"
-          />
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
+            Preview
+          </Button>
           <Button variant="ghost" size="sm" onClick={() => navigate(`/history/${id}`)}>
             History
           </Button>
@@ -382,28 +623,29 @@ export default function Editor() {
                 : `${unfinishedSlides.length} ${unfinishedSlides.length === 1 ? "slide" : "slides"} unfinished`}
             </Button>
           )}
+          {/* One navigation, one label. When a room is open this button IS
+              the way back to it, and LiveRoomBar below keeps only its status
+              line rather than a second primary button to the same place
+              (UX-PLAN 5.8). */}
           <Button
             variant="primary"
             size="md"
             disabled={pres.slides.length === 0}
             onClick={() => navigate(`/present/${id}`)}
           >
-            Present
+            {roomLive ? "Back to the room" : "Present"}
           </Button>
-        </div>
-      </header>
+          </>
+        }
+      />
 
       {/* Renders only when a room for THIS deck is still open (and the server
-          agrees it is). The host ducked in here to fix something; this is the
-          thread back out. */}
-      <LiveRoomBar deckId={id} onLive={(code) => setRoomLive(!!code)} />
+          agrees it is). The host ducked in here to fix something; the header's
+          button is the thread back out, so the bar carries status only. */}
+      <LiveRoomBar deckId={id} onLive={(code) => setRoomLive(!!code)} showAction={false} />
 
       {settingsOpen && (
-        <DeckSettings
-          pres={pres}
-          onPatch={patchDeck}
-          onClose={() => setSettingsOpen(false)}
-        />
+        <DeckSettings pres={pres} onPatch={saveDeck} onClose={() => setSettingsOpen(false)} />
       )}
 
       {checkOpen && (
@@ -421,88 +663,126 @@ export default function Editor() {
 
       <div className="flex-1 min-h-0 flex">
         {/* ── slide rail ─────────────────────────────────────────────── */}
-        <aside className="w-72 shrink-0 border-r border-hairline overflow-y-auto p-3 flex flex-col gap-2">
-          {pres.slides.map((s, i) => (
-            <div key={s.id} className="group relative">
-              <button
-                onClick={() => select(s.id)}
-                className={cn(
-                  "w-full text-left px-3 py-2.5 rounded-md transition-colors duration-fast",
-                  selectedId === s.id
-                    ? "bg-surface-2 shadow-line"
-                    : "hover:bg-surface-1"
-                )}
-              >
-                {/* The live marker sits next to the NUMBER, not at the end,
-                    and the line truncates rather than wraps. Both follow from
-                    the same thing: a marker that wrapped made one row in the
-                    rail taller than its neighbours, and a marker at the end of
-                    a truncating line is the first thing to disappear. Ordered
-                    by what must survive — which slide, whether it is the live
-                    one, then what kind it is. */}
-                {/* "needs fixing" sits ahead of the type for the same reason
-                    the live marker does: ordered by what must survive the
-                    truncation. Which slide, whether the room is on it, whether
-                    it can be answered at all — then what kind it is. Only
-                    `broken` is marked. An unfinished slide is marked nowhere
-                    in this rail, deliberately: six of the seventeen types are
-                    born unfinished, and a rail where every new row lights up
-                    is a rail nobody reads. */}
-                <p className="nums text-caption2 font-semibold uppercase track-label text-ink-subtle mb-0.5 truncate">
-                  {i + 1}
-                  {s.id === liveSlideId && (
-                    <>
-                      {" · "}
-                      <span className="text-accent">on screen</span>
-                    </>
-                  )}
-                  {brokenOf(s).length > 0 && (
-                    <>
-                      {" · "}
-                      <span className="text-warn">needs fixing</span>
-                    </>
-                  )}
-                  {" · "}
-                  {labelFor(s.type)}
-                  {parseConfig(s).isQuiz ? " · quiz" : ""}
-                </p>
-                <p className="text-subhead font-medium truncate">
-                  {s.question || <span className="text-ink-subtle">Untitled question</span>}
-                </p>
-              </button>
-              <div className="absolute right-1.5 top-1.5 flex gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-fast">
-                <RailButton label="Move up" disabled={i === 0} onClick={() => move(i, -1)}>
-                  ↑
-                </RailButton>
-                <RailButton
-                  label="Move down"
-                  disabled={i === pres.slides.length - 1}
-                  onClick={() => move(i, 1)}
+        {/* Two parts: the list scrolls, the add control does not. The rail's
+            highest-frequency control used to be the last child INSIDE the
+            scroll container, so on a long deck it needed a scroll to reach
+            (UX-PLAN 5.5). */}
+        <aside className="w-72 shrink-0 border-r border-hairline flex flex-col min-h-0">
+          {/* `layoutScroll` tells the drag reorder that this element scrolls,
+              so a row dragged while the list is scrolled measures correctly. */}
+          <motion.div layoutScroll className="flex-1 min-h-0 overflow-y-auto p-3">
+            <Reorder.Group
+              axis="y"
+              values={pres.slides.map((s) => s.id)}
+              onReorder={onReorder}
+              className="flex flex-col gap-2 list-none m-0 p-0"
+              aria-label="Slides"
+            >
+              {pres.slides.map((s, i) => (
+                <Reorder.Item
+                  key={s.id}
+                  value={s.id}
+                  // The order is written on drop, once — not on every row the
+                  // pointer passes. The swap buttons stay for the keyboard.
+                  onDragEnd={() => persistOrder()}
+                  whileDrag={reduced ? undefined : { scale: 1.02 }}
+                  transition={spring.default}
+                  className="group relative rounded-md bg-canvas"
                 >
-                  ↓
-                </RailButton>
-              </div>
-            </div>
-          ))}
+                  <button
+                    onClick={() => select(s.id)}
+                    className={cn(
+                      "w-full text-left px-3 py-2.5 rounded-md transition-colors duration-fast cursor-grab active:cursor-grabbing",
+                      selectedId === s.id
+                        ? "bg-surface-2 shadow-line"
+                        : "hover:bg-surface-1"
+                    )}
+                  >
+                    {/* The live marker sits next to the NUMBER, not at the end,
+                        and the line truncates rather than wraps. Both follow from
+                        the same thing: a marker that wrapped made one row in the
+                        rail taller than its neighbours, and a marker at the end of
+                        a truncating line is the first thing to disappear. Ordered
+                        by what must survive — which slide, whether it is the live
+                        one, then what kind it is. */}
+                    {/* "needs fixing" sits ahead of the type for the same reason
+                        the live marker does: ordered by what must survive the
+                        truncation. Which slide, whether the room is on it, whether
+                        it can be answered at all — then what kind it is. Only
+                        `broken` is marked. An unfinished slide is marked nowhere
+                        in this rail, deliberately: six of the seventeen types are
+                        born unfinished, and a rail where every new row lights up
+                        is a rail nobody reads. */}
+                    <p className="nums text-caption2 font-semibold uppercase track-label text-ink-subtle mb-0.5 truncate">
+                      {i + 1}
+                      {s.id === liveSlideId && (
+                        <>
+                          {" · "}
+                          <span className="text-accent">on screen</span>
+                        </>
+                      )}
+                      {brokenOf(s).length > 0 && (
+                        <>
+                          {" · "}
+                          <span className="text-warn">needs fixing</span>
+                        </>
+                      )}
+                      {" · "}
+                      {labelFor(s.type)}
+                      {parseConfig(s).isQuiz ? " · quiz" : ""}
+                    </p>
+                    <p className="text-subhead font-medium truncate">
+                      {s.question || <span className="text-ink-subtle">Untitled question</span>}
+                    </p>
+                  </button>
+                  <div className="absolute right-1.5 top-1.5 flex gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-fast">
+                    <RailButton label="Move up" disabled={i === 0} onClick={() => move(i, -1)}>
+                      ↑
+                    </RailButton>
+                    <RailButton
+                      label="Move down"
+                      disabled={i === pres.slides.length - 1}
+                      onClick={() => move(i, 1)}
+                    >
+                      ↓
+                    </RailButton>
+                  </div>
+                </Reorder.Item>
+              ))}
+            </Reorder.Group>
+          </motion.div>
 
           {/* One press, not seventeen. The rail's job is the deck you are
               building; the catalogue of things you COULD build is a different
-              question and now waits to be asked (SlideTypePicker.tsx). This
-              also gives the slide list back the vertical space the catalogue
-              was occupying on every deck. */}
+              question and now waits to be asked (SlideTypePicker.tsx). */}
           {/* The rule separates the deck from the thing that adds to it. With
               no deck yet there is nothing to separate, and a hairline with
               nothing above it is a line drawn for its own sake (DESIGN.md
               P2/P3: a hairline SEPARATES, it does not decorate). */}
-          <div className={cn(pres.slides.length > 0 && "mt-2 pt-3 border-t border-hairline")}>
+          <div className={cn("shrink-0 p-3", pres.slides.length > 0 && "border-t border-hairline")}>
             <Button
               variant="secondary"
               size="md"
               className="w-full"
-              onClick={() => setPickerOpen(true)}
+              onClick={() => setPickerOpen("after")}
             >
               + Add slide
             </Button>
+            {/* Adds where you are. The end of the deck stays one press away
+                for the host who is appending, and the line says which will
+                happen before anything does. */}
+            {selected && selectedIndex < slides.length - 1 && (
+              <p className="text-caption text-ink-subtle text-center mt-2">
+                after slide {selectedIndex + 1} ·{" "}
+                <button
+                  type="button"
+                  onClick={() => setPickerOpen("end")}
+                  className="underline underline-offset-2 hover:text-ink rounded-xs outline-none focus-visible:shadow-focus"
+                >
+                  add at end
+                </button>
+              </p>
+            )}
           </div>
         </aside>
 
@@ -511,23 +791,29 @@ export default function Editor() {
           {selected ? (
             <SlideForm
               key={selected.id}
-              presentationId={id!}
               slide={selected}
-              onChanged={load}
+              onSave={(patch) => saveSlide(selected.id, patch)}
               onDelete={() => deleteSlide(selected.id)}
               onDuplicate={() => duplicate(selected)}
+              scheduleRemoval={scheduleRemoval}
+              commitRemoval={commit}
+              previewOpen={previewOpen}
             />
           ) : (
-            <EmptyDeck onPick={addSlide} onBrowse={() => setPickerOpen(true)} />
+            <EmptyDeck onPick={addSlide} onBrowse={() => setPickerOpen("end")} />
           )}
         </main>
       </div>
 
-      <UndoBar pending={pending} windowMs={windowMs} onUndo={undoDeleteSlide} />
+      <UndoBar pending={pending} windowMs={windowMs} onUndo={onUndo} />
 
       <AnimatePresence>
         {pickerOpen && (
-          <SlideTypePicker onPick={addSlide} onClose={() => setPickerOpen(false)} />
+          <SlideTypePicker
+            onPick={addSlide}
+            onClose={() => setPickerOpen(false)}
+            placement={placement}
+          />
         )}
       </AnimatePresence>
     </div>
@@ -706,8 +992,59 @@ function CheckGroup({
   );
 }
 
+// A choice whose consequence is written on each option, before the choice.
+//
+// The type picker's card: label, then the one line that says what picking it
+// means. The deck's two largest-consequence settings used to carry that line
+// in a `title=` attribute — the exact pattern FLOW.md §3 records fixing for
+// the picker — and a caption under the group that described only the value
+// already chosen (UX-PLAN 5.7). A person deciding needs to read both.
+function ChoiceCards<T extends string | number>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: T;
+  options: { value: T; label: string; hint: string }[];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={label}>
+      {options.map((o) => {
+        const on = o.value === value;
+        return (
+          <button
+            key={String(o.value)}
+            type="button"
+            role="radio"
+            aria-checked={on}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              "text-left px-4 py-3 rounded-md w-52 outline-none transition-colors duration-fast focus-visible:shadow-focus",
+              on ? "bg-accent text-accent-ink" : "bg-surface-2 text-ink hover:bg-surface-3"
+            )}
+          >
+            <span className="block text-subhead font-semibold">{o.label}</span>
+            <span className={cn("block text-caption mt-0.5", on ? "text-accent-ink" : "text-ink-subtle")}>
+              {o.hint}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // Deck-level settings: how the stage looks, who drives the deck, and whether
 // it is offered to others as a template.
+//
+// Two bands, not one. "Pacing" (who advances the slides) and "Pace" (the
+// relaxed-timing accommodation) sat two columns apart under near-identical
+// labels, and nothing said the second was about accessibility (UX-PLAN 5.6).
+// They are unrelated decisions, so they are no longer neighbours: the deck's
+// settings in one band, the accommodation in its own, named for what it is.
 function DeckSettings({
   pres,
   onPatch,
@@ -718,134 +1055,103 @@ function DeckSettings({
   onClose: () => void;
 }) {
   return (
-    <div className="shrink-0 border-b border-hairline bg-surface-1 px-5 py-5">
-      <div className="max-w-5xl flex flex-wrap items-start gap-10">
-        <div>
-          <Label>Stage theme</Label>
-          <ThemePicker value={pres.theme} onChange={(key) => onPatch({ theme: key })} />
-        </div>
-
-        <div>
-          <Label>Pacing</Label>
-          <div className="flex gap-1.5" role="radiogroup" aria-label="Pacing">
-            {(
-              [
-                ["PRESENTER", "I drive", "Everyone sees the slide I'm on."],
-                ["AUDIENCE", "Self-paced", "Each person moves at their own speed."],
-              ] as const
-            ).map(([key, label, hint]) => (
-              <button
-                key={key}
-                role="radio"
-                aria-checked={pres.pacing === key}
-                onClick={() => onPatch({ pacing: key })}
-                title={hint}
-                className={cn(
-                  "px-4 h-11 rounded-md text-subhead font-semibold transition-colors duration-fast",
-                  pres.pacing === key
-                    ? "bg-accent text-accent-ink"
-                    : "bg-surface-2 text-ink-muted hover:text-ink"
-                )}
-              >
-                {label}
-              </button>
-            ))}
+    <>
+      <div className="shrink-0 border-b border-hairline bg-surface-1 px-5 py-5">
+        <div className="max-w-5xl flex flex-wrap items-start gap-10">
+          <div>
+            <Label>Stage theme</Label>
+            <ThemePicker value={pres.theme} onChange={(key) => onPatch({ theme: key })} />
           </div>
-          <p className="text-caption text-ink-subtle mt-2 max-w-[28ch]">
-            {pres.pacing === "AUDIENCE"
-              ? "Self-paced decks have no shared countdown, so quiz timing is off."
-              : "Quiz questions use a shared countdown."}
-          </p>
-        </div>
 
-        <div>
-          <Label>Audience text</Label>
-          <div className="flex gap-1.5" role="radiogroup" aria-label="Content filter">
-            {(
-              [
-                ["mask", "Mask", "Replace rude words with asterisks."],
-                ["block", "Block", "Reject the whole answer and ask them to rephrase."],
-                ["off", "Off", "Show whatever is typed."],
-              ] as const
-            ).map(([key, label, hint]) => (
-              <button
-                key={key}
-                role="radio"
-                aria-checked={pres.filterMode === key}
-                onClick={() => onPatch({ filterMode: key })}
-                title={hint}
-                className={cn(
-                  "px-4 h-11 rounded-md text-subhead font-semibold transition-colors duration-fast",
-                  pres.filterMode === key
-                    ? "bg-accent text-accent-ink"
-                    : "bg-surface-2 text-ink-muted hover:text-ink"
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <p className="text-caption text-ink-subtle mt-2 max-w-[30ch]">
-            Applies to word clouds, open answers, questions and nicknames — a
-            blocklist catches casual abuse, not a determined person.
-          </p>
-        </div>
-
-        <div>
-          <Label>Pace</Label>
-          <div className="flex gap-1.5" role="radiogroup" aria-label="Countdown length">
-            {(
-              [
-                [1, "Normal"],
-                [1.5, "Relaxed"],
-                [2, "Double"],
-              ] as const
-            ).map(([val, label]) => (
-              <button
-                key={val}
-                role="radio"
-                aria-checked={pres.timeScale === val}
-                onClick={() => onPatch({ timeScale: val })}
-                className={cn(
-                  "px-4 h-11 rounded-md text-subhead font-semibold transition-colors duration-fast",
-                  pres.timeScale === val
-                    ? "bg-accent text-accent-ink"
-                    : "bg-surface-2 text-ink-muted hover:text-ink"
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <p className="text-caption text-ink-subtle mt-2 max-w-[30ch]">
-            Stretches every countdown. Scores stay fair — speed is judged
-            against the longer clock, not the original one.
-          </p>
-        </div>
-
-        <div>
-          <Label>Sharing</Label>
-          <label className="flex items-start gap-3 cursor-pointer select-none max-w-[30ch]">
-            <input
-              type="checkbox"
-              checked={pres.isTemplate}
-              onChange={(e) => onPatch({ isTemplate: e.target.checked })}
-              className="mt-0.5 w-4 h-4 accent-[var(--accent)]"
+          <div>
+            <Label>Who advances the slides</Label>
+            <ChoiceCards<"PRESENTER" | "AUDIENCE">
+              label="Who advances the slides"
+              value={pres.pacing}
+              onChange={(pacing) => onPatch({ pacing })}
+              options={[
+                {
+                  value: "PRESENTER",
+                  label: "I do",
+                  hint: "Everyone sees the slide I'm on. Quiz questions run on one shared countdown.",
+                },
+                {
+                  value: "AUDIENCE",
+                  label: "Each player",
+                  hint: "Each person moves at their own speed. No shared countdown, so quiz timing is per player.",
+                },
+              ]}
             />
-            <span>
-              <span className="font-semibold block text-subhead">Offer as a template</span>
-              <span className="text-caption text-ink-subtle">
-                Anyone can copy this deck into their own account.
-              </span>
-            </span>
-          </label>
-        </div>
+          </div>
 
-        <Button variant="ghost" size="sm" className="ml-auto" onClick={onClose}>
-          Done
-        </Button>
+          <div>
+            <Label>Audience text</Label>
+            <ChoiceCards<"mask" | "block" | "off">
+              label="Content filter"
+              value={pres.filterMode}
+              onChange={(filterMode) => onPatch({ filterMode })}
+              options={[
+                { value: "mask", label: "Mask", hint: "Rude words become asterisks." },
+                { value: "block", label: "Block", hint: "The whole answer is refused; they rephrase." },
+                { value: "off", label: "Off", hint: "Whatever is typed is shown." },
+              ]}
+            />
+            <p className="text-caption text-ink-subtle mt-2 max-w-[40ch]">
+              Applies to word clouds, open answers, questions and nicknames — a
+              blocklist catches casual abuse, not a determined person.
+            </p>
+          </div>
+
+          <div>
+            <Label>Sharing</Label>
+            <label className="flex items-start gap-3 cursor-pointer select-none max-w-[30ch]">
+              <input
+                type="checkbox"
+                checked={pres.isTemplate}
+                onChange={(e) => onPatch({ isTemplate: e.target.checked })}
+                className="mt-0.5 w-4 h-4 accent-[var(--accent)]"
+              />
+              <span>
+                <span className="font-semibold block text-subhead">Offer as a template</span>
+                <span className="text-caption text-ink-subtle">
+                  Anyone can copy this deck into their own account.
+                </span>
+              </span>
+            </label>
+          </div>
+        </div>
       </div>
-    </div>
+
+      <div className="shrink-0 border-b border-hairline bg-surface-1 px-5 py-5">
+        <div className="max-w-5xl flex flex-wrap items-start gap-10">
+          <div>
+            <Label>Answer time</Label>
+            <ChoiceCards<number>
+              label="Answer time"
+              value={pres.timeScale}
+              onChange={(timeScale) => onPatch({ timeScale })}
+              options={[
+                { value: 1, label: "Normal · ×1", hint: "Every countdown runs as written on its slide." },
+                { value: 1.5, label: "Relaxed · ×1.5", hint: "Every countdown runs half as long again." },
+                { value: 2, label: "Double · ×2", hint: "Every countdown runs twice as long." },
+              ]}
+            />
+            {/* The accommodation is named as one. Time pressure is a known
+                barrier for dyslexic and ADHD players (DESIGN.md §6), and a
+                host cannot choose it for them without being told it exists. */}
+            <p className="text-caption text-ink-subtle mt-2 max-w-[64ch]">
+              Relaxed timing exists for players who need it — time pressure is a known
+              barrier for dyslexic and ADHD players. Scores stay fair: speed is judged
+              against the longer clock, not the original one.
+            </p>
+          </div>
+
+          <Button variant="ghost" size="sm" className="ml-auto" onClick={onClose}>
+            Done
+          </Button>
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -866,6 +1172,8 @@ function RailButton({
       title={label}
       disabled={disabled}
       onClick={onClick}
+      // A press here must not start a drag on the row underneath.
+      onPointerDown={(e) => e.stopPropagation()}
       className="w-6 h-6 grid place-items-center rounded-xs text-caption bg-surface-3 text-ink-muted hover:text-ink disabled:opacity-25 disabled:pointer-events-none transition-colors duration-fast"
     >
       {children}
@@ -885,48 +1193,105 @@ function normalizeConfig(config: any): any {
 }
 
 function SlideForm({
-  presentationId,
   slide,
-  onChanged,
+  onSave,
   onDelete,
   onDuplicate,
+  scheduleRemoval,
+  commitRemoval,
+  previewOpen,
 }: {
-  presentationId: string;
   slide: Slide;
-  onChanged: () => void;
+  /** A partial write, through the pipeline. */
+  onSave: (patch: SlidePatch) => void;
   onDelete: () => void;
   onDuplicate: () => void;
+  scheduleRemoval: (label: string, destroy: () => void, restore: () => void) => string;
+  commitRemoval: (key: string) => void;
+  previewOpen: boolean;
 }) {
   const def = slideType(slide.type);
   const [question, setQuestion] = useState(slide.question);
   const [config, setConfig] = useState<any>(normalizeConfig(parseConfig(slide)));
   const [notes, setNotes] = useState(slide.notes ?? "");
-  // Straight off the slide prop, which `onChanged` -> `load()` refreshes after
-  // every save — so this is the SERVER's answer about what is now stored, not
-  // a second set of rules running in the browser that could disagree with the
-  // importer. That disagreement is the whole of what N9 was.
+  // Straight off the slide prop, which the save ack refreshes — so this is
+  // the SERVER's answer about what is now stored, not a second set of rules
+  // running in the browser that could disagree with the importer. That
+  // disagreement is the whole of what N9 was.
   const broken = brokenOf(slide);
 
-  async function save(newQuestion = question, newConfig = config, newNotes = notes) {
-    await api.updateSlide(presentationId, slide.id, {
-      question: newQuestion,
-      config: newConfig,
-      notes: newNotes,
-    });
-    onChanged();
+  // The config as it is NOW, for the removal callbacks below, which fire
+  // seconds after the render that created them.
+  const configRef = useRef(config);
+  configRef.current = config;
+
+  // Removals whose write is still inside the undo window. While any is open,
+  // config writes are HELD — the server must not learn of a removal that may
+  // be undone, and a different edit made meanwhile would carry it. The held
+  // edits go out, together, when the last window closes either way.
+  const openRemovals = useRef<Set<string>>(new Set());
+  const holdSeq = useRef(0);
+
+  function writeConfig(next: any) {
+    setConfig(next);
+    configRef.current = next;
+    if (openRemovals.current.size === 0) onSave({ config: next });
   }
 
   // Shallow patch — the common case. `replace` exists for edits that must
   // delete keys, which a merge can't express.
   function onChange(patch: any) {
-    const next = { ...config, ...patch };
-    setConfig(next);
-    save(question, next);
+    writeConfig({ ...configRef.current, ...patch });
   }
   function onReplace(next: any) {
-    setConfig(next);
-    save(question, next);
+    writeConfig(next);
   }
+
+  function onRemove(removal: Removal) {
+    const gone = removal.apply(configRef.current);
+    setConfig(gone);
+    configRef.current = gone;
+    const hold = `remove:${slide.id}:${++holdSeq.current}`;
+    autosave.hold(hold);
+    let key = "";
+    const close = () => {
+      openRemovals.current.delete(key);
+      autosave.release(hold);
+    };
+    key = scheduleRemoval(
+      removal.label,
+      () => {
+        close();
+        if (openRemovals.current.size === 0) {
+          onSave({ config: configRef.current });
+          // The window has already been the wait. A commit on unmount or
+          // pagehide must not then sit in a debounce the page may not live
+          // through.
+          autosave.flush(`slide:${slide.id}`);
+        }
+      },
+      () => {
+        close();
+        const back = removal.restore(configRef.current);
+        setConfig(back);
+        configRef.current = back;
+        if (openRemovals.current.size === 0) onSave({ config: back });
+      }
+    );
+    openRemovals.current.add(key);
+  }
+
+  // Switching slides unmounts this form. A removal still inside its window
+  // commits now, the same way leaving the page commits it — otherwise the
+  // row would be back on the next visit (FLOW.md: the window is the design,
+  // so both ways of leaving it early are handled).
+  useEffect(() => {
+    const open = openRemovals.current;
+    return () => {
+      for (const key of [...open]) commitRemoval(key);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (!def) {
     return (
@@ -963,8 +1328,12 @@ function SlideForm({
             className="h-14 text-body font-display font-semibold"
             placeholder={def.questionPlaceholder ?? "What do you want to ask?"}
             value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            onBlur={() => save()}
+            // Through the pipeline as you type, not on blur: ⌘W after typing
+            // used to lose the question silently.
+            onChange={(e) => {
+              setQuestion(e.target.value);
+              onSave({ question: e.target.value });
+            }}
           />
         </div>
 
@@ -972,6 +1341,7 @@ function SlideForm({
           config={config}
           onChange={onChange}
           onReplace={onReplace}
+          onRemove={onRemove}
           question={question}
         />
 
@@ -1001,21 +1371,25 @@ function SlideForm({
             placeholder="Only you see these, on the presenter view."
             value={notes}
             maxLength={4000}
-            onChange={(e) => setNotes(e.target.value)}
-            onBlur={() => save(question, config, notes)}
+            onChange={(e) => {
+              setNotes(e.target.value);
+              onSave({ notes: e.target.value });
+            }}
           />
         </div>
       </div>
 
       {/* Live phone preview. Seeing the actual player surface while editing is
-          the fastest way to catch an option that is too long. */}
-      <div className="hidden lg:block">
+          the fastest way to catch an option that is too long. Below `lg` it
+          has no column, so it is opened from the header's Preview button and
+          sits under the form instead of silently not existing (UX-PLAN 5.10). */}
+      <div className={cn(previewOpen ? "block" : "hidden lg:block")}>
         <p className="text-caption2 font-semibold uppercase track-label text-ink-subtle mb-3">
           {def.interactive ? "On the player's phone" : "On the big screen"}
         </p>
         <motion.div
           layout
-          className="rounded-xl bg-canvas shadow-elev-2 p-4 flex flex-col gap-3 sticky top-8"
+          className="rounded-xl bg-canvas shadow-elev-2 p-4 flex flex-col gap-3 sticky top-8 max-w-xs"
           style={{ minHeight: 420 }}
         >
           <p className="font-display font-bold text-subhead leading-snug text-ink-muted line-clamp-3 px-1">

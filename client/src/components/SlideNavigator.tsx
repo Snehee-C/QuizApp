@@ -3,6 +3,7 @@ import { motion } from "motion/react";
 import { cn } from "../lib/cn";
 import { duration as dur, ease, prefersReducedMotion } from "../lib/motion";
 import { useArrowFocus } from "../lib/arrowFocus";
+import { Dismiss } from "./ui/Dismiss";
 
 /**
  * Go to slide 9 of 20.
@@ -161,13 +162,25 @@ export function SlideNavigator({
             pressing it does. The count makes the rule legible without a
             paragraph explaining it: "8 not shown yet" tells the host both why
             those cards are blank and exactly what revealing them would cost. */}
-        {hidden > 0 || revealUpcoming ? (
-          <div className="flex items-center justify-between gap-4 mb-2.5 px-1">
+        {/* The row is always rendered, because it also carries the ✕: a
+            visible way out. Escape and the scrim both close this, and neither
+            is discoverable from inside a dialog (UX-PLAN 5.9). The ✕ is kept
+            out of the arrow-key ring (`button[data-slide]`) so Right from the
+            last slide does not land on it. */}
+        <div className="flex items-center justify-between gap-4 mb-2.5 pl-1">
+          {hidden > 0 || revealUpcoming ? (
             <span className="text-caption2 font-semibold uppercase track-label text-ink-subtle">
               {revealUpcoming
                 ? "Upcoming questions are on the big screen"
                 : `${hidden} not shown to the room yet`}
             </span>
+          ) : (
+            <span className="text-caption2 font-semibold uppercase track-label text-ink-subtle">
+              Go to slide
+            </span>
+          )}
+          <span className="flex items-center gap-2 shrink-0">
+          {hidden > 0 || revealUpcoming ? (
             <button
               type="button"
               onClick={onToggleReveal}
@@ -178,10 +191,15 @@ export function SlideNavigator({
                 "bg-surface-2 text-ink-muted hover:text-ink hover:bg-surface-3"
               )}
             >
-              {revealUpcoming ? "Hide upcoming" : "Show upcoming"}
+              {/* Names the consequence BEFORE the press, not only in the
+                  header after it: the cost of this button is the room
+                  reading ahead, and a host should know that from the label. */}
+              {revealUpcoming ? "Hide upcoming from the big screen" : "Show upcoming on the big screen"}
             </button>
-          </div>
-        ) : null}
+          ) : null}
+          <Dismiss onClick={onClose} label="Close the slide list" className="-my-2 -mr-2" />
+          </span>
+        </div>
 
         <div className="grid gap-2 grid-cols-[repeat(auto-fill,minmax(13rem,1fr))]">
           {slides.map((s) => {

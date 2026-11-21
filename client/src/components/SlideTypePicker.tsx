@@ -5,6 +5,7 @@ import { SLIDE_GROUPS, typesInGroup } from "../slides/registry";
 import { duration as dur, ease, prefersReducedMotion } from "../lib/motion";
 import { useArrowFocus } from "../lib/arrowFocus";
 import { Input } from "./ui/Card";
+import { Dismiss } from "./ui/Dismiss";
 
 /**
  * Choosing what kind of slide to add.
@@ -30,9 +31,12 @@ import { Input } from "./ui/Card";
 export function SlideTypePicker({
   onPick,
   onClose,
+  placement,
 }: {
   onPick: (type: string) => void;
   onClose: () => void;
+  /** Where the new slide will land — "After slide 3" — so adding is never a surprise. */
+  placement?: string;
 }) {
   const [q, setQ] = useState("");
   const panel = useRef<HTMLDivElement>(null);
@@ -92,7 +96,17 @@ export function SlideTypePicker({
         transition={{ duration: dur.slow, ease: ease.standard }}
         className="relative w-full max-w-3xl max-h-full overflow-y-auto rounded-xl bg-surface-1 shadow-elev-3 p-6"
       >
-        <h2 className="font-display text-title2 font-bold mb-4">Add a slide</h2>
+        {/* The ✕ is a visible way out (UX-PLAN 5.9): Escape and the scrim
+            both work and neither is discoverable from inside a dialog. */}
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div className="min-w-0">
+            <h2 className="font-display text-title2 font-bold">Add a slide</h2>
+            {placement && (
+              <p className="text-footnote text-ink-subtle mt-0.5">{placement}</p>
+            )}
+          </div>
+          <Dismiss onClick={onClose} label="Close" className="-mt-2 -mr-2 shrink-0" />
+        </div>
 
         <Input
           autoFocus
@@ -121,23 +135,41 @@ export function SlideTypePicker({
               {g.label}
             </p>
             <div className="grid gap-2 grid-cols-1 sm:grid-cols-2">
-              {g.types.map((t) => (
-                <button
-                  key={t.type}
-                  type="button"
-                  data-type={t.type}
-                  onClick={() => onPick(t.type)}
-                  className={cn(
-                    "text-left px-4 py-3 rounded-md bg-surface-2 outline-none",
-                    "hover:bg-surface-3 transition-colors duration-fast focus-visible:shadow-focus"
-                  )}
-                >
-                  <span className="block text-subhead font-semibold text-ink">{t.label}</span>
-                  {/* The hint was always written; it just lived in a `title`
-                      attribute, which is to say it was written for nobody. */}
-                  <span className="block text-caption text-ink-subtle mt-0.5">{t.hint}</span>
-                </button>
-              ))}
+              {g.types.map((t) => {
+                // Enter in the filter adds `first`. That used to be a fact
+                // nobody could see — an empty filter plus Enter silently
+                // added Multiple choice — so the card Enter would pick wears
+                // the focus ring and says so, and it moves as the filter
+                // narrows (UX-PLAN 5.9).
+                const isFirst = t.type === first;
+                return (
+                  <button
+                    key={t.type}
+                    type="button"
+                    data-type={t.type}
+                    data-enter-target={isFirst || undefined}
+                    onClick={() => onPick(t.type)}
+                    className={cn(
+                      "relative text-left px-4 py-3 rounded-md bg-surface-2 outline-none",
+                      "hover:bg-surface-3 transition-[background-color,box-shadow] duration-fast focus-visible:shadow-focus",
+                      isFirst && "shadow-focus"
+                    )}
+                  >
+                    <span className="block text-subhead font-semibold text-ink pr-14">{t.label}</span>
+                    {/* The hint was always written; it just lived in a `title`
+                        attribute, which is to say it was written for nobody. */}
+                    <span className="block text-caption text-ink-subtle mt-0.5">{t.hint}</span>
+                    {isFirst && (
+                      <span
+                        className="absolute top-2.5 right-3 text-caption2 font-semibold uppercase track-label text-accent"
+                        aria-hidden="true"
+                      >
+                        ↵ Enter
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
           </section>
         ))}

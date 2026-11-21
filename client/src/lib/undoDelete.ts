@@ -88,5 +88,10 @@ export function useUndoableDelete() {
     };
   }, [flushAll]);
 
-  return { pending, scheduleDelete, undo, windowMs: WINDOW_MS };
+  // `commit` is exposed for a caller whose OWN lifetime is shorter than the
+  // hook's: the editor's slide form schedules an option removal and is
+  // unmounted when the host switches slides, and that switch must commit the
+  // removal the same way leaving the page does — otherwise the row would
+  // return on the next visit, which is the bug the window exists to avoid.
+  return { pending, scheduleDelete, undo, commit, windowMs: WINDOW_MS };
 }

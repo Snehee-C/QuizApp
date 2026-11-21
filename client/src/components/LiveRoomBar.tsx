@@ -33,6 +33,7 @@ export function LiveRoomBar({
   title,
   onLive,
   contentClassName,
+  showAction = true,
 }: {
   /**
    * Scope the bar to one deck (the editor, where showing a banner about a
@@ -58,6 +59,16 @@ export function LiveRoomBar({
    * the only thing that knows.
    */
   contentClassName?: string;
+  /**
+   * The editor already has a `Present` button in its header, and when a room
+   * is live that button BECOMES "Back to the room" — one navigation, one
+   * label, one accent. A second primary button twelve pixels under it,
+   * going to the same place, is the similarity defect UX-PLAN 5.8 names. So
+   * a page that carries its own door says so, and the bar keeps only its
+   * status line. Defaults to rendering the door, which is right everywhere
+   * else (the dashboard has no Present button for a specific deck).
+   */
+  showAction?: boolean;
 }) {
   const [code, setCode] = useState<string | null>(null);
   const [target, setTarget] = useState<string | null>(null);
@@ -125,14 +136,16 @@ export function LiveRoomBar({
           — room <span className="code text-ink">{code}</span> is still open
         </span>
       </p>
-      <Button
-        variant="primary"
-        size="sm"
-        className="shrink-0"
-        onClick={() => navigate(`/present/${target}`)}
-      >
-        Back to the room
-      </Button>
+      {showAction && (
+        <Button
+          variant="primary"
+          size="sm"
+          className="shrink-0"
+          onClick={() => navigate(`/present/${target}`)}
+        >
+          Back to the room
+        </Button>
+      )}
       </div>
     </motion.div>
   );
