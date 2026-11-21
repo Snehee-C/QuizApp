@@ -1,8 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { motion } from "motion/react";
-import { getToken } from "../lib/api";
-import { API_BASE } from "../lib/config";
+import { downloadSessionCsv } from "../lib/sessionExport";
 import { clearLastRun, getLastRun } from "../lib/liveSession";
 import { Button } from "./ui/Button";
 import { cn } from "../lib/cn";
@@ -36,25 +35,12 @@ export function LastRunBar({
   if (!run) return null;
   const reduced = prefersReducedMotion();
 
-  // The export endpoint is authenticated, so it cannot be a plain <a href>:
-  // the bearer token has to be attached and the browser handed a blob. Same
-  // mechanism as the History page, pointed at the session we just finished.
   async function download() {
     if (!run) return;
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/sessions/${run.sessionId}/export`, {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
-      if (!res.ok) throw new Error(`Export failed (${res.status})`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `session-${run.joinCode}-results.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+      await downloadSessionCsv(run.sessionId, run.joinCode);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Export failed.");
     } finally {

@@ -444,3 +444,62 @@ export function useConnection(): ConnectionState {
 
   return { status, queued };
 }
+
+// ── The presenter's half of the kit ─────────────────────────────────────────
+//
+// A host command is not an answer: there is exactly one presenter, nothing to
+// de-duplicate per slide, and a `next` replayed thirty seconds late after an
+// outage would move a room that has since been moved by hand. So the retry
+// queue above is the wrong tool, and what the presenter needs is smaller — one
+// emit, one ack, one deadline, and a result that says which of the four
+// things happened (landed, rejected, timed out, never sent) so the control
+// bar can say so (PULSE.md T2). Additive: nothing above this line changes.
+
+/** How long a host command waits for its ack before the bar reports it lost. */
+export const PRESENTER_ACK_TIMEOUT_MS = 4000;
+
+export type AckOutcome<T = unknown> =
+  | { ok: true; res: T }
+  | {
+      ok: false;
+      /**
+       * The server's stable rejection code when it sent one, or one of two
+       * client-side verdicts: `TIMEOUT` (sent, never answered) and `OFFLINE`
+       * (not sent — the socket was down, and a command buffered for a later
+       * reconnect is exactly the replay this helper exists to avoid).
+       */
+      code: string;
+      /** Human text, the server's where it gave one. */
+      error: string;
+    };
+
+/**
+ * Emit once with an ack deadline and report what happened. Never rejects, and
+ * never queues: a command that could not be sent is reported as `OFFLINE` the
+ * same instant, so the host hears "that didn't go" rather than watching a
+ * frozen bar and pressing again.
+ */
+export function emitWithAck<T = unknown>(
+  socket: Socket,
+  event: string,
+  payload: unknown,
+  timeoutMs: number = PRESENTER_ACK_TIMEOUT_MS
+): Promise<AckOutcome<T>> {
+  if (!socket.connected) {
+    return Promise.resolve({ ok: false, code: "OFFLINE", error: "Not connected" });
+  }
+  return new Promise((resolve) => {
+    socket.timeout(timeoutMs).emit(event, payload, (err: unknown, res: unknown) => {
+      if (err) {
+        resolve({ ok: false, code: "TIMEOUT", error: "No reply from the server" });
+        return;
+      }
+      const rejection = ackError(res);
+      if (rejection) {
+        resolve({ ok: false, code: ackCode(res) ?? "REJECTED", error: rejection });
+        return;
+      }
+      resolve({ ok: true, res: res as T });
+    });
+  });
+}

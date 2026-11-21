@@ -9,6 +9,16 @@
 // a handful of text nodes, and a portal into another document drags in style
 // re-injection and a second React root for no benefit.
 
+import { serverNow } from "../lib/serverClock";
+
+/** The keys the stage answers to, forwarded from this window (Present.tsx). */
+export interface SpeakerTransport {
+  next: () => void;
+  prev: () => void;
+  first: () => void;
+  last: () => void;
+}
+
 interface SpeakerState {
   index: number;
   total: number;
@@ -17,10 +27,23 @@ interface SpeakerState {
   nextQuestion: string | null;
   participants: number;
   answered: number;
+  /**
+   * The countdown the room is watching, mirrored here so a host with a second
+   * screen reads the clock off it instead of off the wall. Both are the
+   * server's: `startedAt` always was, and the tick below reads `serverNow()`
+   * for the same reason the ring does (TimerRing.tsx). Null when no clock is
+   * running — a content slide, a revealed question, a self-paced deck.
+   */
+  startedAt?: number | null;
+  timeLimitSec?: number | null;
+  /** Self-paced decks have no shared clock; the bar says so instead. */
+  selfPaced?: boolean;
   /** The whole deck, for the jump list. Null titles mean "no longer known". */
   slides?: { index: number; title: string | null }[];
   /** Jumping from here is the leak-free route: this window is not projected. */
   onJump?: (index: number) => void;
+  /** Space/arrows pressed in this window drive the stage, as in Keynote. */
+  transport?: SpeakerTransport;
 }
 
 let win: Window | null = null;
@@ -30,6 +53,14 @@ let win: Window | null = null;
 // is mid-click on it.
 let renderedDeck = "";
 let jump: ((index: number) => void) | null = null;
+// Held at module level, like `jump`: the keydown listener is bound once per
+// open and must see whatever the stage most recently handed over, because
+// `next` closes over slide index and view mode and is rebuilt on every change.
+let transport: SpeakerTransport | null = null;
+// The clock. One interval owned by the OPENER, so it dies with the stage and
+// never with a child document we did not finish writing.
+let clock: { startedAt: number; limitSec: number } | null = null;
+let clockTimer: number | null = null;
 
 const SHELL = `
 <!doctype html><html><head><meta charset="utf-8"><title>Speaker view</title>
@@ -45,6 +76,13 @@ const SHELL = `
   .bar { display: flex; gap: 18px; align-items: baseline;
          font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: #83868f; }
   .bar b { color: #f4f5f8; font-variant-numeric: tabular-nums; }
+  .bar .clock { margin-left: auto; }
+  .bar .clock b { font-size: 28px; line-height: 1; }
+  .bar .clock.urgent b { color: #ff7b72; }
+  .bar .clock[hidden] { display: none; }
+  .keys { margin-top: 10px; font-size: 12px; color: #83868f; letter-spacing: .02em; }
+  .keys kbd { font: inherit; color: #b4b7bf; background: #15161d; border: 1px solid #2a2d37;
+              border-radius: 5px; padding: 1px 6px; }
   h1 { font-size: clamp(22px, 3.4vw, 38px); line-height: 1.15; margin: 18px 0 20px; font-weight: 700; }
   .notes { font-size: clamp(16px, 2vw, 22px); line-height: 1.6; white-space: pre-wrap;
            background: #15161d; border: 1px solid #2a2d37; border-radius: 14px; padding: 20px 22px; }
@@ -69,7 +107,9 @@ const SHELL = `
     <span>Slide <b id="pos">–</b></span>
     <span><b id="people">0</b> joined</span>
     <span><b id="answered">0</b> answered</span>
+    <span class="clock" id="clock" hidden role="timer"><b id="left">–</b> <span id="clocknote">left</span></span>
   </div>
+  <p class="keys"><kbd>→</kbd> <kbd>Space</kbd> next · <kbd>←</kbd> back · <kbd>Home</kbd> <kbd>End</kbd> first / last — keys pressed here drive the big screen</p>
   <h1 id="q"></h1>
   <div class="notes" id="notes"></div>
   <p class="next" id="next"></p>
@@ -89,7 +129,34 @@ export function openSpeakerWindow(): boolean {
   win.document.open();
   win.document.write(SHELL);
   win.document.close();
+  // Keynote's presenter display takes the clicker too. Without this a host
+  // who has the speaker window focused — which is where they are reading —
+  // presses Space and nothing happens anywhere. Bound once per document; the
+  // callbacks it reaches are swapped in by updateSpeakerWindow.
+  win.document.addEventListener("keydown", onSpeakerKey);
   return true;
+}
+
+function onSpeakerKey(e: KeyboardEvent) {
+  // Same rule as the stage (Present.tsx): a browser chord is never a room
+  // command, and a key typed into a field belongs to the field.
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target as HTMLElement | null;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+  if (!transport) return;
+  if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") {
+    e.preventDefault();
+    transport.next();
+  } else if (e.key === "ArrowLeft" || e.key === "PageUp") {
+    e.preventDefault();
+    transport.prev();
+  } else if (e.key === "Home") {
+    e.preventDefault();
+    transport.first();
+  } else if (e.key === "End") {
+    e.preventDefault();
+    transport.last();
+  }
 }
 
 export function speakerWindowOpen(): boolean {
@@ -103,6 +170,66 @@ export function closeSpeakerWindow() {
   // drawn has to die with the old one or the list never renders again.
   renderedDeck = "";
   jump = null;
+  transport = null;
+  stopClock();
+}
+
+function stopClock() {
+  if (clockTimer !== null) window.clearInterval(clockTimer);
+  clockTimer = null;
+  clock = null;
+}
+
+// Four ticks a second is enough for a whole-second readout and cheap enough
+// to run for the whole session; the ring on the stage is the one that owes
+// the room a smooth sweep, this only owes the host the number.
+function tickClock() {
+  if (!win || win.closed || !clock) {
+    stopClock();
+    return;
+  }
+  const d = win.document;
+  const leftEl = d.getElementById("left");
+  const wrap = d.getElementById("clock");
+  if (!leftEl || !wrap) return;
+  const left = Math.max(0, clock.limitSec - (serverNow() - clock.startedAt) / 1000);
+  leftEl.textContent = String(Math.ceil(left));
+  wrap.className = left <= clock.limitSec * 0.25 ? "clock urgent" : "clock";
+  if (left <= 0) {
+    // Zero is the server closing the question (PULSE.md T3); hold the number
+    // and stop spending ticks on it. The next slide re-arms the clock.
+    stopClock();
+  }
+}
+
+function syncClock(d: Document, s: SpeakerState) {
+  const wrap = d.getElementById("clock");
+  const note = d.getElementById("clocknote");
+  if (!wrap || !note) return;
+  if (s.selfPaced) {
+    stopClock();
+    wrap.hidden = false;
+    wrap.className = "clock";
+    const leftEl = d.getElementById("left");
+    if (leftEl) leftEl.textContent = "—";
+    note.textContent = "self-paced, no shared clock";
+    return;
+  }
+  const startedAt = s.startedAt ?? null;
+  const limitSec = s.timeLimitSec ?? null;
+  if (startedAt === null || !limitSec) {
+    stopClock();
+    wrap.hidden = true;
+    return;
+  }
+  note.textContent = "left";
+  wrap.hidden = false;
+  if (!clock || clock.startedAt !== startedAt || clock.limitSec !== limitSec) {
+    stopClock();
+    clock = { startedAt, limitSec };
+    clockTimer = window.setInterval(tickClock, 250);
+  }
+  tickClock();
 }
 
 export function updateSpeakerWindow(s: SpeakerState) {
@@ -127,6 +254,8 @@ export function updateSpeakerWindow(s: SpeakerState) {
   set("next", s.nextQuestion ? `Up next: ${s.nextQuestion}` : "Last slide.");
 
   jump = s.onJump ?? null;
+  transport = s.transport ?? null;
+  syncClock(d, s);
   renderDeck(d, s);
 }
 

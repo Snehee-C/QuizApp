@@ -3,8 +3,12 @@ import { useNavigate, useParams } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
 import { motion, AnimatePresence } from "motion/react";
 import { getSocket } from "../lib/socket";
-import { getToken } from "../lib/api";
-import { API_BASE, isLoopbackHost, resolveJoinOrigin } from "../lib/config";
+import { api, getToken } from "../lib/api";
+import { isLoopbackHost, resolveJoinOrigin } from "../lib/config";
+import { emitWithAck, useConnection, type AckOutcome } from "../lib/connection";
+import { downloadSessionCsv } from "../lib/sessionExport";
+import { FooterNotice, type Notice } from "../components/presenter/FooterNotice";
+import { ShortcutSheet } from "../components/presenter/ShortcutSheet";
 import { applyStage, getStage, setStage, type Stage } from "../lib/theme";
 import { applyTheme } from "../lib/themes";
 import { QaModeration } from "../components/qa/QaModeration";
@@ -15,6 +19,7 @@ import {
   openSpeakerWindow,
   speakerWindowOpen,
   updateSpeakerWindow,
+  type SpeakerTransport,
 } from "../components/SpeakerWindow";
 import { slideType } from "../slides/registry";
 import { Podium, LeaderboardList, type LeaderboardEntry } from "../components/Podium";
@@ -28,7 +33,7 @@ import { noteServerNow, startClockSync } from "../lib/serverClock";
 import { FitText } from "../components/ui/FitText";
 import { Button } from "../components/ui/Button";
 import { initSound, isMuted, playSound, subscribeMuted, toggleMuted, unlockAudio } from "../lib/sound";
-import { MoreMenu } from "../components/MoreMenu";
+import { MoreMenu, type MoreAction } from "../components/MoreMenu";
 import { clearPresenting, markPresenting, markRunFinished } from "../lib/liveSession";
 import {
   getRevealUpcoming,
@@ -57,6 +62,67 @@ interface Participant extends RowIdentity {
   avatar: number;
 }
 
+type Pacing = "PRESENTER" | "AUDIENCE";
+
+/**
+ * A failure from BEFORE there was a session. This is the only kind that may
+ * take over the whole screen: there is no room behind it to protect, and a
+ * host staring at a dead lobby needs a reason and a door more than a stage.
+ * Everything that goes wrong once a join code exists is a notice in the
+ * control bar instead (see `notice`) — a live session with twenty-eight
+ * phones in it must never go blank because of a browser setting.
+ */
+interface Fatal {
+  title: string;
+  detail: string;
+  /** The deck is the problem, so the editor is the right door. */
+  editDoor?: boolean;
+  /** Nothing is wrong with the deck; the wire was. Offer to try again. */
+  retry?: boolean;
+}
+
+function fatalFor(code: string | null, error: string): Fatal {
+  switch (code) {
+    case "EMPTY_DECK":
+      return { title: "This deck has no slides yet", detail: "Add a slide in the editor, then present it.", editDoor: true };
+    case "DECK_GONE":
+      return { title: "This deck no longer exists", detail: "It may have been deleted from another window." };
+    case "UNAUTHORIZED":
+      return { title: "You're signed out", detail: "Sign in again, then open the deck from your decks." };
+    case "TIMEOUT":
+    case "OFFLINE":
+      return { title: "Couldn't reach the server", detail: "Check the connection, then try again.", retry: true };
+    default:
+      return { title: "Couldn't open this deck", detail: error || "Something went wrong." };
+  }
+}
+
+/**
+ * What a refused command means to the host, in the bar. Two of these are
+ * final — the session is gone or this account may not drive it — and stay
+ * until acted on; the rest are one lost press, said once.
+ */
+function noticeFor(r: Extract<AckOutcome, { ok: false }>, verb: string, decks: () => void): Notice {
+  switch (r.code) {
+    case "SESSION_GONE":
+    case "NO_LIVE_SESSION":
+      return { text: "This session no longer exists", warn: true, sticky: true, door: { label: "← Decks", onSelect: decks } };
+    case "SESSION_ENDED":
+      return { text: "The session has ended", warn: true, sticky: true, door: { label: "← Decks", onSelect: decks } };
+    case "UNAUTHORIZED":
+      return { text: "You're signed out — this room didn't accept the command", warn: true, sticky: true, door: { label: "← Decks", onSelect: decks } };
+    case "OFFLINE":
+      return { text: `You're offline — ${verb} wasn't sent`, warn: true };
+    case "TIMEOUT":
+      return { text: `${verb} didn't reach the server — check the connection and press again`, warn: true };
+    default:
+      return { text: `${verb} was refused: ${r.error}`, warn: true };
+  }
+}
+
+/** How long a transient notice stays before it clears itself. */
+const NOTICE_MS = 6000;
+
 export default function Present() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -71,8 +137,32 @@ export default function Present() {
   const [aggregate, setAggregate] = useState<any>(null);
   const [participantCount, setParticipantCount] = useState(0);
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [error, setError] = useState("");
+  // Two kinds of wrong, two surfaces (1.1). `fatal` is pre-session only and
+  // owns the screen; `notice` is anything after a join code exists and lives
+  // in the control bar, where the host reads and the room does not.
+  const [fatal, setFatal] = useState<Fatal | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // From the session ack. Under AUDIENCE pacing the server arms no clock, so
+  // the stage renders none (PULSE.md T3: a countdown whose zero costs nothing
+  // is theatre). Defaults to host-paced, which is what every ack before this
+  // field existed meant.
+  const [pacing, setPacing] = useState<Pacing>("PRESENTER");
+  // Named on the stage, from the REST deck rather than the ack: the ack
+  // carries titles for every slide and none for the deck, and the editor's
+  // own fetch already knows it (F4 — the screen where the wrong deck is most
+  // expensive is the one that never said which deck it was).
+  const [deckTitle, setDeckTitle] = useState<string | null>(null);
+  // B/W: the projector goes dark or white; the session does not. The cheap
+  // non-destructive act that was missing, so `End` was the only way to take
+  // the stage down (1.5).
+  const [blank, setBlank] = useState<"black" | "white" | null>(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
+  // Questions waiting for the host's eye, lifted here from QaModeration so
+  // the `Moderate` button can carry the count before the panel is open.
+  const [qaWaiting, setQaWaiting] = useState(0);
+  const [exportBusy, setExportBusy] = useState(false);
+  const connection = useConnection();
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [viewMode, setViewMode] = useState<"question" | "leaderboard" | "qa">("question");
   const [finalEntries, setFinalEntries] = useState<LeaderboardEntry[] | null>(null);
@@ -100,6 +190,41 @@ export default function Present() {
   // StrictMode double-invokes effects in dev; without this we'd silently
   // create two live sessions (and two join codes) per page load.
   const sessionCreatedRef = useRef(false);
+  // Has this page ever adopted a session? Decides what a `connect` means: the
+  // first one is the bootstrap, every later one is a reconnect that has to
+  // re-adopt the room (the server's `socket.data` died with the old id).
+  const hasAdoptedRef = useRef(false);
+
+  const goDecks = useCallback(() => navigate("/dashboard"), [navigate]);
+
+  // One spelling of "say it in the bar". Transient unless the notice says
+  // otherwise; a sticky one is replaced only by the next sticky one or a
+  // dismiss, so a lost keypress cannot paper over "the session is gone".
+  const say = useCallback((n: Notice) => {
+    setNotice((prev) => (prev?.sticky && !n.sticky ? prev : n));
+  }, []);
+
+  useEffect(() => {
+    if (!notice || notice.sticky) return;
+    const t = window.setTimeout(() => setNotice(null), NOTICE_MS);
+    return () => window.clearTimeout(t);
+  }, [notice]);
+
+  useEffect(() => {
+    if (!id) return;
+    let live = true;
+    api
+      .getPresentation(id)
+      .then((p) => {
+        if (live) setDeckTitle(p.title);
+      })
+      // The title is a courtesy, not a dependency: the session ack is what
+      // decides whether this screen works, and it has its own failure path.
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [id]);
 
   // Stage Light is scoped to this element, not <html>, so a participant view
   // open in the same browser stays dark (DESIGN.md §5).
@@ -150,8 +275,10 @@ export default function Present() {
       // first thing a resuming host hears, and it may be carrying a slide that
       // is already running.
       noteServerNow(res?.serverNow);
+      hasAdoptedRef.current = true;
       setJoinCode(res.joinCode);
       joinCodeRef.current = res.joinCode;
+      if (res.pacing === "AUDIENCE" || res.pacing === "PRESENTER") setPacing(res.pacing);
       // The trail back. Written here rather than at the exit, because the
       // exits we care about are the ones we do not control: browser Back, a
       // bookmark, a reload, a host who alt-tabs to the editor in another tab.
@@ -244,15 +371,16 @@ export default function Present() {
     }
 
     function createSession() {
-      socket.emit(
-        "presenter:create-session",
-        { token: getToken(), presentationId: id },
-        (res: any) => {
-          if (res?.error) {
-            setError(res.error);
+      // Pre-session, so a refusal here is the one failure allowed to own the
+      // screen — and it gets a deadline, because a create that is never
+      // answered used to leave a lobby of six dots on the projector forever.
+      emitWithAck<any>(socket, "presenter:create-session", { token: getToken(), presentationId: id }, 8000).then(
+        (r) => {
+          if (!r.ok) {
+            setFatal(fatalFor(r.code, r.error));
             return;
           }
-          adoptSession(res);
+          adoptSession(r.res);
         }
       );
     }
@@ -292,6 +420,34 @@ export default function Present() {
       if (socket.connected) bootstrapSession();
       else socket.once("connect", bootstrapSession);
     }
+
+    // The presenter's reconnect, which it never had (1.2). Socket.IO comes
+    // back under a NEW id with empty `socket.data`: the room would still be
+    // running, the answered-counter would freeze, and the next clicker press
+    // would be refused as UNAUTHORIZED — silently, before this. The repair is
+    // the reload path: resume-session re-attaches this socket and re-pushes
+    // the frames a reload would miss. `hasAdoptedRef` keeps the bootstrap's
+    // own first `connect` from running it twice.
+    function onReconnect() {
+      if (!hasAdoptedRef.current) return;
+      emitWithAck<any>(socket, "presenter:resume-session", { token: getToken(), presentationId: id }, 6000).then(
+        (r) => {
+          if (r.ok && r.res?.ok) {
+            adoptSession(r.res);
+            setNotice((prev) => (prev?.sticky ? prev : { text: "Back online — the room is yours again" }));
+            return;
+          }
+          if (!r.ok) {
+            say(noticeFor(r, "Reconnecting", goDecks));
+            return;
+          }
+          // Answered, but with no room to give back: it ended or was reaped
+          // while this window was away.
+          say(noticeFor({ ok: false, code: "SESSION_GONE", error: "" }, "Reconnecting", goDecks));
+        }
+      );
+    }
+    socket.on("connect", onReconnect);
 
     socket.on("slide:changed", (payload) => {
       // THE STAGE IS A CLIENT TOO.
@@ -382,9 +538,43 @@ export default function Present() {
       socket.off("participant:count");
       socket.off("leaderboard:updated");
       socket.off("slide:reveal");
+      socket.off("connect", onReconnect);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  // The waiting count for the `Moderate` badge (6.8). Same seed-then-subscribe
+  // shape as QaModeration, which also listens — off by handler reference so
+  // the two never unhook each other.
+  useEffect(() => {
+    if (!joinCode) return;
+    const socket = getSocket();
+    let live = true;
+    const count = (qs: any[] | undefined) =>
+      setQaWaiting((qs ?? []).filter((q) => q?.status === "PENDING").length);
+    const onUpdated = (payload: { questions?: any[] }) => count(payload?.questions);
+    socket.emit("qa:list", { joinCode }, (res: any) => {
+      if (live && res?.ok) count(res.questions);
+    });
+    socket.on("qa:updated", onUpdated);
+    return () => {
+      live = false;
+      socket.off("qa:updated", onUpdated);
+    };
+  }, [joinCode]);
+
+  // Every host command through one door: ack, deadline, and a sentence in the
+  // bar when it did not land (PULSE.md T2 — "fire-and-forget is forbidden").
+  // The optimistic local change the caller already made stands; the server's
+  // own broadcast reconciles it when the command does land.
+  const command = useCallback(
+    (event: string, verb: string, extra: Record<string, unknown> = {}) =>
+      emitWithAck<any>(getSocket(), event, { joinCode: joinCodeRef.current, token: getToken(), ...extra }).then((r) => {
+        if (!r.ok) say(noticeFor(r, verb, goDecks));
+        return r;
+      }),
+    [say, goDecks]
+  );
 
   // "Is this a scored, timed slide?" is now a property of the slide's config,
   // not of its type — several types can be quiz-capable.
@@ -392,21 +582,18 @@ export default function Present() {
 
   const showLeaderboard = useCallback(() => {
     setViewMode("leaderboard");
-    getSocket().emit(
-      "presenter:show-leaderboard",
-      { joinCode: joinCodeRef.current, token: getToken() },
-      () => {}
-    );
-  }, []);
+    command("presenter:show-leaderboard", "Standings").then((r) => {
+      // The stage flipped before the round trip (T1); a board the room never
+      // received must not stay up on the one screen that did not need the
+      // network to show it.
+      if (!r.ok) setViewMode((v) => (v === "leaderboard" ? "question" : v));
+    });
+  }, [command]);
 
   const hideLeaderboard = useCallback(() => {
     setViewMode("question");
-    getSocket().emit(
-      "presenter:hide-leaderboard",
-      { joinCode: joinCodeRef.current, token: getToken() },
-      () => {}
-    );
-  }, []);
+    command("presenter:hide-leaderboard", "Hiding standings");
+  }, [command]);
 
   // m4: the standings interstitial is only worth a press when there is a
   // scoreboard behind it. Routing a skipped/unanswered quiz slide through it
@@ -428,8 +615,8 @@ export default function Present() {
     // clock on a question that is already over.
     if (index >= totalSlides - 1) return;
     setViewMode("question");
-    getSocket().emit("presenter:next", { joinCode: joinCodeRef.current, token: getToken() }, () => {});
-  }, [showsStandingsNext, showLeaderboard, index, totalSlides]);
+    command("presenter:next", "Next");
+  }, [showsStandingsNext, showLeaderboard, index, totalSlides, command]);
 
   const prev = useCallback(() => {
     if (viewMode === "leaderboard") {
@@ -440,34 +627,43 @@ export default function Present() {
     // without passing the disabled button, and a -1 index means "back to the
     // lobby", which snaps every phone out of the running session (M5).
     if (index <= 0) return;
-    getSocket().emit("presenter:prev", { joinCode: joinCodeRef.current, token: getToken() }, () => {});
-  }, [viewMode, hideLeaderboard, index]);
+    command("presenter:prev", "Back");
+  }, [viewMode, hideLeaderboard, index, command]);
 
   // One frame, where stepping there was N. `presenter:goto` runs the same
   // validated nav chain as next/prev (including deleted-slide reconciliation),
   // and it is what `start()` has always used to open the deck at index 0 — so
   // this is not a new path through the server, it is the existing one finally
   // given a surface.
-  const jumpTo = useCallback((target: number) => {
-    setNavOpen(false);
-    setViewMode("question");
-    getSocket().emit(
-      "presenter:goto",
-      { joinCode: joinCodeRef.current, index: target, token: getToken() },
-      () => {}
-    );
-  }, []);
+  const jumpTo = useCallback(
+    (target: number) => {
+      setNavOpen(false);
+      setViewMode("question");
+      command("presenter:goto", `Slide ${target + 1}`, { index: target });
+    },
+    [command]
+  );
 
-  function start() {
-    getSocket().emit(
-      "presenter:goto",
-      { joinCode: joinCodeRef.current, index: 0, token: getToken() },
-      () => {}
-    );
-  }
+  const start = useCallback(() => {
+    command("presenter:goto", "Start", { index: 0 });
+  }, [command]);
+
+  // Home/End (1.5): the same `goto` the navigator uses, so a deleted slide is
+  // reconciled on the way exactly as it would be from a click.
+  const first = useCallback(() => {
+    if (totalSlides > 0) jumpTo(0);
+  }, [totalSlides, jumpTo]);
+  const last = useCallback(() => {
+    if (totalSlides > 0) jumpTo(totalSlides - 1);
+  }, [totalSlides, jumpTo]);
 
   function endSession() {
-    getSocket().emit("presenter:end", { joinCode: joinCodeRef.current, token: getToken() }, (res: any) => {
+    command("presenter:end", "End").then((r) => {
+      // A refused End is the one refusal that must not fall through to the
+      // podium: the room is still running, and showing final results over a
+      // live session would be rendering a success we cannot prove (T2). The
+      // bar has already said why.
+      if (!r.ok) return;
       // The room is gone, so the trail back to it must go too — otherwise the
       // editor greets the host with "you're presenting this deck" pointing at
       // a session that just died. LiveRoomBar re-checks with the server and
@@ -480,23 +676,28 @@ export default function Present() {
       if (id && sessionId && joinCodeRef.current) {
         markRunFinished(id, sessionId, joinCodeRef.current);
       }
-      setFinalEntries(res?.entries ?? []);
+      setFinalEntries(r.res?.entries ?? []);
     });
   }
 
+  // Busy while it runs, and a sentence when it fails (6.6) — the same shape
+  // the last-run bar and the history page give the same file. The failure
+  // lands in the bar on the live stage and under the button on the final
+  // screen, which is wherever the host pressed.
+  const [exportError, setExportError] = useState<string | null>(null);
   async function exportCsv() {
-    if (!sessionId) return;
-    const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/export`, {
-      headers: { Authorization: `Bearer ${getToken()}` },
-    });
-    if (!res.ok) return;
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `session-${joinCode}-results.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    if (!sessionId || exportBusy) return;
+    setExportBusy(true);
+    setExportError(null);
+    try {
+      await downloadSessionCsv(sessionId, joinCode);
+    } catch (e: unknown) {
+      const text = e instanceof Error ? e.message : "Export failed.";
+      setExportError(text);
+      say({ text: `Download didn't start — ${text}`, warn: true });
+    } finally {
+      setExportBusy(false);
+    }
   }
 
   function toggleStage() {
@@ -514,32 +715,83 @@ export default function Present() {
   // with a clicker that sends arrow keys.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      // A browser chord is never a room command (1.4). ⌘F dropped fullscreen
+      // and ⌘L — focusing the address bar — broadcast the leaderboard to
+      // every phone mid-question, because the handler only read `key`.
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      // Letters are case-folded so Caps Lock does not silently disarm the
+      // clicker shortcuts; `?` and the named keys pass through untouched.
+      const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if (sheetOpen) {
+        if (k === "?" || k === "Escape") {
+          e.preventDefault();
+          setSheetOpen(false);
+        }
+        return;
+      }
       // While the navigator is open the arrows belong to IT. Without this,
       // browsing the map with the keyboard would also be driving the room:
       // ArrowRight here is `presenter:next`, a broadcast to every phone.
       if (navOpen) {
-        if (e.key === "g") {
+        if (k === "g") {
           e.preventDefault();
           setNavOpen(false);
         }
         return;
       }
-      if (e.key === "g") {
+      if (k === "?") {
+        e.preventDefault();
+        setSheetOpen(true);
+        return;
+      }
+      // Blanking (1.5). B and W each toggle their own colour and switch from
+      // the other; Escape clears either. Transport keys do NOT unblank — and
+      // while the screen is blank they do not drive the room either, because
+      // a host who took the stage down is not expecting the phones to move,
+      // and a clicker press they cannot see the effect of is a press they
+      // will make twice. The bar stays awake and says so (ControlBar `hold`).
+      if (k === "b") {
+        e.preventDefault();
+        setBlank((v) => (v === "black" ? null : "black"));
+        return;
+      }
+      if (k === "w") {
+        e.preventDefault();
+        setBlank((v) => (v === "white" ? null : "white"));
+        return;
+      }
+      if (k === "Escape") {
+        if (blank) {
+          e.preventDefault();
+          setBlank(null);
+        }
+        return;
+      }
+      if (k === "f") {
+        toggleFullscreen();
+        return;
+      }
+      if (k === "g") {
         e.preventDefault();
         if (totalSlides > 0) setNavOpen(true);
         return;
       }
-      if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") {
+      if (blank) return;
+      if (k === "ArrowRight" || k === " " || k === "PageDown") {
         e.preventDefault();
         if (status === "LOBBY") start();
         else next();
-      } else if (e.key === "ArrowLeft" || e.key === "PageUp") {
+      } else if (k === "ArrowLeft" || k === "PageUp") {
         e.preventDefault();
         prev();
-      } else if (e.key === "f") {
-        toggleFullscreen();
-      } else if (e.key === "l") {
+      } else if (k === "Home") {
+        e.preventDefault();
+        first();
+      } else if (k === "End") {
+        e.preventDefault();
+        last();
+      } else if (k === "l") {
         if (viewMode === "leaderboard") hideLeaderboard();
         else showLeaderboard();
       }
@@ -547,7 +799,7 @@ export default function Present() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, next, prev, viewMode, showLeaderboard, hideLeaderboard, navOpen, totalSlides]);
+  }, [status, next, prev, first, last, start, viewMode, showLeaderboard, hideLeaderboard, navOpen, totalSlides, sheetOpen, blank]);
 
   // What each slide is called, for the jump navigator. Nullable per entry,
   // because "we no longer know" is a state this has to be able to express:
@@ -582,6 +834,18 @@ export default function Present() {
     resolveJoinOrigin().then(setJoinOrigin);
   }, []);
 
+  // What the speaker window's keys do (1.8). From the lobby, "next" is Start,
+  // exactly as on the stage's own handler.
+  const speakerTransport = useMemo<SpeakerTransport>(
+    () => ({
+      next: () => (status === "LOBBY" ? start() : next()),
+      prev,
+      first,
+      last,
+    }),
+    [status, start, next, prev, first, last]
+  );
+
   // Mirror the live state into the speaker window whenever anything it shows
   // changes. Cheap text writes, so no need to be clever about diffing.
   useEffect(() => {
@@ -598,13 +862,36 @@ export default function Present() {
       nextQuestion: slideTitles[index + 1] ?? null,
       participants: participantCount,
       answered: aggregate?.total ?? 0,
+      // The clock the room sees, or none: the same gate the stage ring uses.
+      startedAt: isCurrentQuiz && !revealed && status === "ACTIVE" ? startedAt : null,
+      timeLimitSec: timeLimit ?? currentSlide?.config?.timeLimitSec ?? null,
+      selfPaced: pacing === "AUDIENCE" && status === "ACTIVE",
       // The same deck the stage navigator offers, on the one surface the
       // projector never shows. A host with a second screen never has to put
       // the upcoming questions on the wall to find one.
       slides: navSlides,
       onJump: jumpTo,
+      transport: speakerTransport,
     });
-  }, [speakerOpen, index, totalSlides, currentSlide, notes, slideTitles, participantCount, aggregate, navSlides, jumpTo]);
+  }, [
+    speakerOpen,
+    index,
+    totalSlides,
+    currentSlide,
+    notes,
+    slideTitles,
+    participantCount,
+    aggregate,
+    navSlides,
+    jumpTo,
+    startedAt,
+    timeLimit,
+    isCurrentQuiz,
+    revealed,
+    status,
+    pacing,
+    speakerTransport,
+  ]);
 
   useEffect(() => () => closeSpeakerWindow(), []);
 
@@ -618,10 +905,35 @@ export default function Present() {
   const nextDisabled = !showsStandingsNext && index >= totalSlides - 1;
   const responses = aggregate?.total ?? 0;
 
-  if (error) {
+  // Pre-session only (1.1). Stage ladder, because a projector may already be
+  // showing this; a reason, because a bare string was not one; and a door,
+  // because a screen with no way out in fullscreen is a wall.
+  if (fatal) {
     return (
-      <div ref={rootRef} className="min-h-screen grid place-items-center bg-canvas text-ink">
-        <p className="font-display text-title2 font-bold">{error}</p>
+      <div ref={rootRef} className="h-[100dvh] flex flex-col items-center justify-center gap-8 px-stage-safe bg-canvas text-ink overflow-hidden">
+        <StageBloom />
+        <p className="relative z-10 text-stage-label font-semibold uppercase track-label text-ink-subtle">
+          {deckTitle ?? "Present"}
+        </p>
+        <h1 className="relative z-10 font-display text-stage-q-sm font-bold text-center balance max-w-[24ch]">
+          {fatal.title}
+        </h1>
+        <p className="relative z-10 text-stage-name text-ink-muted text-center max-w-[40ch]">{fatal.detail}</p>
+        <div className="relative z-10 flex flex-wrap items-center justify-center gap-3">
+          <Button variant="secondary" size="xl" className="text-stage-label" onClick={goDecks}>
+            ← Decks
+          </Button>
+          {fatal.editDoor && (
+            <Button variant="primary" size="xl" className="text-stage-label" onClick={() => navigate(`/edit/${id}`)}>
+              Edit deck
+            </Button>
+          )}
+          {fatal.retry && (
+            <Button variant="primary" size="xl" className="text-stage-label" onClick={() => window.location.reload()}>
+              Try again
+            </Button>
+          )}
+        </div>
       </div>
     );
   }
@@ -632,6 +944,8 @@ export default function Present() {
         <FinalResults
           entries={finalEntries}
           canExport={!!sessionId}
+          exportBusy={exportBusy}
+          exportError={exportError}
           onExport={exportCsv}
           onAgain={() => {
             // A finished session cannot be revived, so "again" means a new
@@ -642,11 +956,28 @@ export default function Present() {
             window.location.reload();
           }}
           onEdit={() => navigate(`/edit/${id}`)}
-          onBack={() => navigate("/dashboard")}
+          onBack={goDecks}
         />
       </div>
     );
   }
+
+  // What the bar says when the wire is the news. Only while something is
+  // wrong — a permanent indicator trains the host to ignore the one moment it
+  // matters (ConnectionBanner.tsx). It outranks any other notice: nothing a
+  // refused press can say matters more than "the room cannot hear you".
+  const connectionNotice: Notice | null =
+    connection.status === "offline"
+      ? { text: "Offline — the room can't hear you. Reconnecting…", warn: true, sticky: true }
+      : connection.status === "reconnecting"
+        ? { text: "Reconnecting…", warn: true, sticky: true }
+        : connection.status === "connecting"
+          ? { text: "Connecting…", warn: true, sticky: true }
+          : null;
+  const blankNotice: Notice | null = blank
+    ? { text: "Screen blanked — press B or Esc to resume. Slide keys are paused.", sticky: true }
+    : null;
+  const barNotice = connectionNotice ?? notice ?? blankNotice;
 
   return (
     <div ref={rootRef} className="h-[100dvh] flex flex-col bg-canvas text-ink overflow-hidden">
@@ -665,6 +996,23 @@ export default function Present() {
         </aside>
       )}
 
+      {/* Header and stage share one box so the blank overlay can cover exactly
+          them and never the footer beneath (1.5). */}
+      <div className="relative flex-1 min-h-0 flex flex-col">
+      {/* The blank screen (1.5): a real element over the projected stage and
+          nothing else — the footer stays reachable and readable, which is
+          where the host is told how to get the stage back. Pure black and
+          pure white rather than tokens, because the projector is being asked
+          for nothing, not for a dark surface. */}
+      {blank && (
+        <div
+          aria-hidden="true"
+          data-blank={blank}
+          className="absolute inset-0 z-30"
+          style={{ background: blank === "black" ? "#000" : "#fff" }}
+        />
+      )}
+
       {/* ── status strip. Nothing here is below 18px; it sits inside the
           safe area because projectors crop the edges. ───────────────── */}
       <header className="relative z-20 shrink-0 flex items-center justify-between px-stage-safe pt-6 pb-2">
@@ -676,12 +1024,29 @@ export default function Present() {
           <span className="text-ink-muted">joined</span>
         </span>
 
-        <span className="text-stage-label font-semibold uppercase track-label text-ink-muted">
-          {status === "LOBBY"
-            ? "Lobby"
-            : viewMode === "leaderboard"
-              ? "Standings"
-              : `${index + 1} / ${totalSlides}`}
+        {/* Where you are, and in WHICH deck (1.7). The title is sentence case
+            beside an uppercase position so the two read as name · place,
+            not as one long label; it truncates rather than wraps because a
+            status strip that grows a second line moves the stage under it. */}
+        <span className="flex items-center gap-3 min-w-0 text-stage-label font-semibold text-ink-muted">
+          {deckTitle && (
+            <>
+              <span className="truncate max-w-[36vw]">{deckTitle}</span>
+              <span aria-hidden="true" className="text-ink-subtle">
+                ·
+              </span>
+            </>
+          )}
+          <span className="uppercase track-label shrink-0">
+            {status === "LOBBY"
+              ? "Lobby"
+              : viewMode === "leaderboard"
+                ? "Standings"
+                : `${index + 1} / ${totalSlides}`}
+          </span>
+          {pacing === "AUDIENCE" && (
+            <span className="uppercase track-label shrink-0 text-ink-subtle">Self-paced</span>
+          )}
         </span>
 
         <span className="flex items-center gap-3">
@@ -769,10 +1134,13 @@ export default function Present() {
               revealPayload={revealPayload}
               revealBadgeRef={revealBadgeRef}
               timeLimit={timeLimit}
+              selfPaced={pacing === "AUDIENCE"}
+              answered={responses}
             />
           )}
         </AnimatePresence>
       </main>
+      </div>
 
       <ControlBar
         status={status}
@@ -782,6 +1150,20 @@ export default function Present() {
         // editor shows a LiveRoomBar for exactly this crumb, so the door is
         // visible from both sides.
         onEditDeck={() => navigate(`/edit/${id}`)}
+        notice={barNotice}
+        // The connection and the blank screen clear themselves; only a
+        // notice the host was handed is theirs to dismiss.
+        onDismissNotice={barNotice === notice ? () => setNotice(null) : undefined}
+        // The bar's auto-hide is paused whenever there is something on it the
+        // host has to be able to read or is in the middle of using.
+        hold={!!barNotice || navOpen || sheetOpen || qaOpen}
+        selfPaced={pacing === "AUDIENCE"}
+        qaWaiting={qaWaiting}
+        exportBusy={exportBusy}
+        blank={blank}
+        onToggleBlank={() => setBlank((v) => (v ? null : "black"))}
+        sheetOpen={sheetOpen}
+        onToggleSheet={() => setSheetOpen((v) => !v)}
         slides={navSlides}
         currentIndex={index}
         navOpen={navOpen}
@@ -820,8 +1202,10 @@ export default function Present() {
           } else if (openSpeakerWindow()) {
             setSpeakerOpen(true);
           } else {
-            // Popup blocked — say so rather than leaving a dead button.
-            setError("Allow pop-ups for this site to use the speaker view.");
+            // Popup blocked — say so in the bar rather than leaving a dead
+            // button. This used to replace the entire presenter view with one
+            // line of text, mid-session, in front of the room (1.1).
+            say({ text: "Allow pop-ups for this site to open the speaker view", warn: true });
           }
         }}
       />
@@ -936,6 +1320,8 @@ function QuestionStage({
   revealPayload,
   revealBadgeRef,
   timeLimit,
+  selfPaced,
+  answered,
 }: {
   slide: CurrentSlide | null;
   aggregate: any;
@@ -945,6 +1331,13 @@ function QuestionStage({
   revealed: boolean;
   revealPayload: Record<string, any> | null;
   revealBadgeRef: React.RefObject<HTMLDivElement | null>;
+  /**
+   * AUDIENCE pacing (1.3): the server arms no reveal for a self-paced deck, so
+   * a ring here would count down to nothing — suspense theatre the phone was
+   * already spared (FLOW.md §6.3). The slot carries the honest line instead.
+   */
+  selfPaced: boolean;
+  answered: number;
 }) {
   // Before the early return: a hook may not sit behind a condition.
   const stageK = useStageScale();
@@ -980,7 +1373,17 @@ function QuestionStage({
               {slide.question}
             </FitText>
           </div>
-          {isQuiz && !revealed && (
+          {isQuiz && !revealed && selfPaced && (
+            <p className="shrink-0 self-center text-right text-stage-label font-semibold text-ink-muted max-w-[22ch]">
+              Everyone at their own pace
+              <br />
+              <span className="nums text-ink">
+                <NumberTicker value={answered} />
+              </span>{" "}
+              answered
+            </p>
+          )}
+          {isQuiz && !revealed && !selfPaced && (
             <TimerRing
               key={slide.id}
               startedAt={startedAt}
@@ -1031,7 +1434,12 @@ function useSettingsActions(props: {
   speakerOpen: boolean;
   onToggleSpeaker: () => void;
   onExport: () => void;
-}) {
+  exportBusy: boolean;
+  blank: "black" | "white" | null;
+  onToggleBlank: () => void;
+  onToggleSheet: () => void;
+  onEditDeck: () => void;
+}): MoreAction[] {
   // The mute flag lives in lib/sound, not in React, and can be changed from
   // another surface — so it is subscribed to rather than mirrored.
   const muted = useSyncExternalStore(subscribeMuted, isMuted, () => true);
@@ -1049,9 +1457,20 @@ function useSettingsActions(props: {
       // fights itself: "Bright room … Dim" reads as two claims about one row.
       // The old spelling is gone rather than duplicated, so this is one name,
       // not a synonym (DESIGN.md P1).
+      //
+      // `checked` so the row keeps the menu open like its neighbours (6.5):
+      // the setting most likely to be flipped twice was the one that ejected
+      // you. It is a toggle, and the menu's rule is that toggles stay.
       label: "Room lighting",
       detail: props.stage === "dark" ? "Dim" : "Bright",
+      checked: props.stage === "light",
       onSelect: props.onToggleStage,
+    },
+    {
+      label: "Blank screen",
+      detail: props.blank ? "On" : "Off",
+      checked: !!props.blank,
+      onSelect: props.onToggleBlank,
     },
     { label: "Fullscreen", onSelect: props.onFullscreen },
     {
@@ -1066,9 +1485,14 @@ function useSettingsActions(props: {
         toggleMuted();
       },
     },
+    { label: "Keyboard shortcuts", detail: "?", onSelect: props.onToggleSheet },
+    // The way OUT without ending. It was first in the bar — the cheapest
+    // position, spent on a twice-a-session verb (6.4). The room survives it:
+    // the editor shows a LiveRoomBar for the crumb this page writes.
+    { label: "Edit deck", detail: "Room stays open", onSelect: props.onEditDeck },
     // One name for one file, product-wide: the final-results screen and the
     // deck list both call this "Download results".
-    { label: "Download results", onSelect: props.onExport },
+    { label: "Download results", detail: props.exportBusy ? "Preparing…" : undefined, onSelect: props.onExport },
   ];
 }
 
@@ -1076,6 +1500,18 @@ function ControlBar(props: {
   status: string;
   stage: Stage;
   onEditDeck: () => void;
+  /** What the bar has to say that is not a button (FooterNotice). */
+  notice: Notice | null;
+  onDismissNotice?: () => void;
+  /** Keep the bar awake: something on it must stay readable or usable. */
+  hold: boolean;
+  selfPaced: boolean;
+  qaWaiting: number;
+  exportBusy: boolean;
+  blank: "black" | "white" | null;
+  onToggleBlank: () => void;
+  sheetOpen: boolean;
+  onToggleSheet: () => void;
   slides: { index: number; title: string | null; seen: boolean }[];
   currentIndex: number;
   navOpen: boolean;
@@ -1106,12 +1542,24 @@ function ControlBar(props: {
   const moreActions = useSettingsActions(props);
   const [visible, setVisible] = useState(true);
   const timer = useRef<number | null>(null);
+  // Is the pointer inside the bar's band? A bar that fades under a hovering
+  // cursor moves the target the hand is already over (6.3, Fitts).
+  const hovering = useRef(false);
+  const holdRef = useRef(props.hold);
+  holdRef.current = props.hold;
 
   useEffect(() => {
+    const arm = () => {
+      if (timer.current) window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => {
+        // Not yet: re-arm rather than hide, and ask again in three seconds.
+        if (hovering.current || holdRef.current) arm();
+        else setVisible(false);
+      }, 3000);
+    };
     const wake = () => {
       setVisible(true);
-      if (timer.current) window.clearTimeout(timer.current);
-      timer.current = window.setTimeout(() => setVisible(false), 3000);
+      arm();
     };
     wake();
     window.addEventListener("pointermove", wake);
@@ -1123,11 +1571,25 @@ function ControlBar(props: {
     };
   }, []);
 
+  // Something to say wakes the bar on its own — a notice nobody can see is
+  // silence with extra steps (PULSE.md T2).
+  useEffect(() => {
+    if (props.hold) setVisible(true);
+  }, [props.hold, props.notice]);
+
+  const inLobby = props.status === "LOBBY";
+
   return (
     <motion.footer
       animate={{ opacity: visible ? 1 : 0, y: visible ? 0 : 16 }}
       transition={{ duration: 0.22 }}
-      className="relative z-30 shrink-0 flex justify-center pb-5 pt-1"
+      onPointerEnter={() => {
+        hovering.current = true;
+      }}
+      onPointerLeave={() => {
+        hovering.current = false;
+      }}
+      className="relative z-30 shrink-0 flex flex-col items-center gap-2 pb-5 pt-1"
     >
       <AnimatePresence>
         {props.navOpen && (
@@ -1140,111 +1602,137 @@ function ControlBar(props: {
             onClose={props.onToggleNav}
           />
         )}
+        {props.sheetOpen && <ShortcutSheet key="sheet" onClose={props.onToggleSheet} />}
       </AnimatePresence>
+
+      {/* Desk-distance, inside the footer, never on the stage (1.1, 1.2). */}
+      <FooterNotice notice={props.notice} onDismiss={props.onDismissNotice} />
 
       <div
         // Wrap rather than clip. Twelve controls fit every projector width we
         // target, but a bar that silently pushes "End" off the right edge of a
         // narrow one is a failure mode with no warning and no recovery.
-        className="flex flex-wrap justify-center items-center gap-2 max-w-[92vw] rounded-pill px-3 py-2.5 shadow-elev-2"
+        //
+        // Grouped by proximity rather than by drawn dividers (6.4): a wider
+        // gap between groups than within them is grouping that exists, and
+        // it survives a wrap, which a hairline between two rows does not.
+        className="flex flex-wrap justify-center items-center gap-5 max-w-[92vw] rounded-pill px-4 py-2.5 shadow-elev-2"
         style={{
           background: "color-mix(in oklch, var(--surface-1), transparent 22%)",
           backdropFilter: "blur(16px)",
         }}
       >
-        {/* The way OUT, and the first thing in the bar because that is where
-            every system on earth puts "back" (Jakob's Law) and because a
-            corner-adjacent target is the cheapest one to hit.
-            
-            Before this, the presenter view had nine buttons and no door: the
-            only exits were the browser's Back button — invisible in
-            fullscreen, which is where a projector lives — and "End", which
-            destroys the room. A host who wanted to fix a typo had to choose
-            between an invisible control and an irreversible one. It is
-            deliberately NOT spelled "← Back": that arrow already means "the
-            previous slide" two buttons along, and one glyph cannot mean two
-            different journeys in the same bar (DESIGN.md P1). */}
-        <Button variant="ghost" size="md" onClick={props.onEditDeck} title="The room stays open">
-          Edit deck
-        </Button>
-        <span className="w-px h-6 bg-hairline mx-1" aria-hidden="true" />
-
-        {props.status === "LOBBY" ? (
-          <Button variant="primary" size="lg" disabled={!props.canStart} onClick={props.onStart}>
-            Start
-          </Button>
-        ) : (
-          <>
-            <Button variant="ghost" size="md" disabled={props.prevDisabled} onClick={props.onPrev}>
-              ← Back
+        {/* ── Transport. First, because it is 80% of every press, and `Next`
+            large for the same reason (6.4). Both `Next` and `Scores` sit in
+            slots of fixed width so neither a label change ("Next" →
+            "Standings") nor the first answer landing moves the target the
+            hand is already over (6.3). ───────────────────────────────── */}
+        <div className="flex items-center gap-1.5">
+          {inLobby ? (
+            <Button
+              variant="primary"
+              size="lg"
+              disabled={!props.canStart}
+              onClick={props.onStart}
+              className="min-w-[10.5rem]"
+            >
+              Start
             </Button>
-            <Button variant="primary" size="md" onClick={props.onNext} disabled={props.nextDisabled}>
-              {props.nextLabel} →
-            </Button>
-            {props.hasScores && (
-              <Button variant="ghost" size="md" onClick={props.onToggleLeaderboard}>
-                {props.leaderboardOpen ? "Hide scores" : "Scores"}
+          ) : (
+            <>
+              <Button variant="ghost" size="md" disabled={props.prevDisabled} onClick={props.onPrev}>
+                ← Back
               </Button>
-            )}
-          </>
-        )}
+              <Button
+                variant="primary"
+                size="lg"
+                onClick={props.onNext}
+                disabled={props.nextDisabled}
+                className="min-w-[10.5rem]"
+              >
+                {props.nextLabel} →
+              </Button>
+            </>
+          )}
 
-        {/* Sits with Back/Next because it is the same verb at a different
-            distance: those move one slide, this moves any number. Available
-            from the lobby too — opening a deck at slide 4 is a legitimate
-            thing to want, and `goto` has always supported it. */}
-        {props.slides.length > 0 && (
+          {/* Sits with Back/Next because it is the same verb at a different
+              distance: those move one slide, this moves any number. Available
+              from the lobby too — opening a deck at slide 4 is a legitimate
+              thing to want, and `goto` has always supported it. */}
+          {props.slides.length > 0 && (
+            <Button
+              variant={props.navOpen ? "secondary" : "ghost"}
+              size="md"
+              onClick={props.onToggleNav}
+              aria-expanded={props.navOpen}
+              aria-haspopup="dialog"
+              title="Go to any slide (g)"
+            >
+              Slides
+            </Button>
+          )}
+        </div>
+
+        {/* ── The room: what is on the big screen besides the slide. ──── */}
+        <div className="flex items-center gap-1.5">
+          {!inLobby && (
+            // The slot is always there; the button appears in it. Width
+            // covers the longer of its two labels.
+            <span className="inline-flex justify-center w-[8.5rem]">
+              {props.hasScores && (
+                <Button variant="ghost" size="md" onClick={props.onToggleLeaderboard} className="w-full">
+                  {props.leaderboardOpen ? "Hide scores" : "Scores"}
+                </Button>
+              )}
+            </span>
+          )}
           <Button
-            variant={props.navOpen ? "secondary" : "ghost"}
+            variant={props.qaStageOpen ? "secondary" : "ghost"}
             size="md"
-            onClick={props.onToggleNav}
-            aria-expanded={props.navOpen}
-            aria-haspopup="dialog"
-            title="Go to any slide (g)"
+            onClick={props.onToggleQaStage}
+            title="Put the audience's questions on the big screen"
           >
-            Slides
+            Q&amp;A
           </Button>
-        )}
+          <Button variant="ghost" size="md" onClick={props.onOpenQaPanel} title="Moderate questions">
+            Moderate
+            {/* The queue, before the panel is open (6.8): the number is the
+                reason to press, so it belongs on the button. */}
+            {props.qaWaiting > 0 && (
+              <span
+                className="nums inline-flex items-center justify-center min-w-6 h-6 px-1.5 rounded-pill bg-accent text-accent-ink text-caption font-bold"
+                aria-label={`${props.qaWaiting} waiting`}
+              >
+                {props.qaWaiting}
+              </span>
+            )}
+          </Button>
+          {props.selfPaced && (
+            <span
+              className="text-caption font-semibold uppercase track-label text-ink-subtle px-2"
+              title="Each player moves through the deck at their own pace; there is no shared clock"
+            >
+              Self-paced
+            </span>
+          )}
+        </div>
 
-        <span className="w-px h-6 bg-hairline mx-1" aria-hidden="true" />
-
-        <Button
-          variant={props.qaStageOpen ? "secondary" : "ghost"}
-          size="md"
-          onClick={props.onToggleQaStage}
-          title="Put the audience's questions on the big screen"
-        >
-          Q&amp;A
-        </Button>
-        <Button variant="ghost" size="md" onClick={props.onOpenQaPanel} title="Moderate questions">
-          Moderate
-        </Button>
-
-        <span className="w-px h-6 bg-hairline mx-1" aria-hidden="true" />
-
-        {/* Everything you set once and stop thinking about.
-        
-            The bar had grown to twelve controls in one flat row, mixing four
-            unrelated jobs — driving the deck, running the room, configuring
-            the host's own screen, and ending the session — separated only by
-            dividers, which is grouping drawn on rather than grouping that
-            exists. Adding a thirteenth for the slide jump would have been the
-            move that made it unarguable.
-        
-            The split is by WHEN, not by category, because that is the question
-            the host's hand is actually asking: Back/Next/Slides/Scores/Q&A are
-            touched throughout a session; notes, room lighting, fullscreen,
-            sound and the CSV are touched once at the start or once at the end.
-            Five of those collapse to one, and the bar reads as what it is —
-            transport, room, settings, stop. */}
-        <MoreMenu
-          label="Presenter settings"
-          triggerLabel="More"
-          placement="above"
-          size="md"
-          actions={moreActions}
-        />
-        <EndButton onEnd={props.onEnd} />
+        {/* ── Settings and stop. Everything you set once and stop thinking
+            about collapses into `More`; `End` stays last, alone, where a
+            destructive verb can be aimed at deliberately (6.4). The split is
+            by WHEN, not by category: Back/Next/Slides/Scores/Q&A are touched
+            throughout a session; notes, lighting, fullscreen, sound, the CSV
+            and now Edit deck are touched once. ──────────────────────── */}
+        <div className="flex items-center gap-1.5">
+          <MoreMenu
+            label="Presenter settings"
+            triggerLabel="More"
+            placement="above"
+            size="md"
+            actions={moreActions}
+          />
+          <EndButton onEnd={props.onEnd} />
+        </div>
       </div>
     </motion.footer>
   );
@@ -1291,6 +1779,8 @@ function EndButton({ onEnd }: { onEnd: () => void }) {
 function FinalResults({
   entries,
   canExport,
+  exportBusy,
+  exportError,
   onExport,
   onAgain,
   onEdit,
@@ -1298,6 +1788,8 @@ function FinalResults({
 }: {
   entries: LeaderboardEntry[];
   canExport: boolean;
+  exportBusy: boolean;
+  exportError: string | null;
   onExport: () => void;
   onAgain: () => void;
   onEdit: () => void;
@@ -1353,17 +1845,26 @@ function FinalResults({
         {/* Hidden rather than disabled when there is no session to export:
             a dead control invites a press and explains nothing. */}
         {canExport && (
-          <Button variant="secondary" size="lg" onClick={onExport}>
-            Download results
+          <Button variant="secondary" size="lg" disabled={exportBusy} onClick={onExport}>
+            {exportBusy ? "Preparing…" : "Download results"}
           </Button>
         )}
         <Button variant="ghost" size="lg" onClick={onEdit}>
           Edit deck
         </Button>
+        {/* Named for where it goes, like every other door (F1, 6.8): "Done"
+            was the one unnamed exit in the product. */}
         <Button variant="ghost" size="lg" onClick={onBack}>
-          Done
+          ← Decks
         </Button>
       </div>
+      {/* A failed download says so where the button is — stage ladder,
+          because this screen is projected. */}
+      {exportError && (
+        <p role="alert" className="relative z-10 text-stage-label font-semibold text-warn text-center">
+          Download didn't start — {exportError}
+        </p>
+      )}
     </div>
   );
 }
