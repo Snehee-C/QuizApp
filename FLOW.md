@@ -44,7 +44,7 @@ alone would have measured none of what was wrong here.
 
 ---
 
-## 2. The six principles
+## 2. The seven principles
 
 ### F1 — Every room has a door, and the door says where it goes.
 A control that offers to take you somewhere must name the somewhere. A bare
@@ -145,6 +145,35 @@ ending as a full stop.
 
 **Test:** at the last screen of any flow, write down the three things the
 person most likely wants next. Is each of them one press away?
+
+### F7 — Distance is measured in presses *plus scans*, and the hub is a home, not a toll booth.
+A journey's cost is not its click count; it is clicks plus every list the
+person must visually search on the way. "Three clicks" through two labelled
+doors is cheap; two clicks with an unsearched hundred-row scan between them is
+not — NN/g's own demolition of the three-click rule
+([The 3-Click Rule for Navigation Is False](https://www.nngroup.com/articles/3-click-rule/))
+is exactly this point: what predicts failure is not depth but **effort and
+confidence per step**.
+
+The structural failure this names is the hub bounce: a product whose global
+destinations are reachable only from one page makes every cross-journey
+`spoke → hub → scan → spoke`, and the hub's list is a toll paid even when
+choosing from that list was never the point of the journey. The rule:
+
+- **Global places are one press from everywhere.** If a destination appears in
+  any page's header, it appears in every page's header — one shared shell, not
+  N hand-rolled ones (this is `DESIGN.md` P1 applied to doors).
+- **No journey passes through a list you must scan unless choosing from that
+  list is the point of the journey.** Moving between two known documents is
+  switching, not choosing; it gets a switcher or a typed jump, not a scroll.
+- **Anything with a name can be reached by typing it.** A searchable list is
+  the floor; a command palette is the ceiling and also the expert path
+  (`FLOW.md` §3's own type-picker lesson: the filter pays the expert back).
+
+**Test:** pick the five errands a host actually chains (edit A → edit B;
+results → fix the question; templates → import; anywhere → present this
+week's deck). Each must cost ≤ 2 presses with no unsearched scan between
+them.
 
 ---
 

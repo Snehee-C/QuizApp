@@ -46,6 +46,18 @@ jobs:
         working-directory: client
         run: npm run lint
 
+      # DESIGN.md P5: no arbitrary type sizes in components, and every ladder
+      # step registered with tailwind-merge. A dropped size renders as body
+      # text, not as an obvious bug, so this has to be a gate.
+      - name: Design lint
+        working-directory: client
+        run: npm run lint:design
+
+      # DESIGN.md §5: every accent pair clears 7:1 against its own ink.
+      - name: Theme contrast audit
+        working-directory: client
+        run: npm run audit:themes
+
       # `tsc -b && vite build` — the same command deploy-frontend.yml runs, so
       # a type error cannot reach the deploy workflow unseen. No VITE_API_URL
       # here on purpose: the build must stand up without it, and what the

@@ -311,18 +311,31 @@ Measured, not asserted. Redundant encoding is geometry here, not an overlay.
 - Optional per-session **relaxed timing (×1.5)** — time pressure is a known
   barrier for dyslexic and ADHD players.
 
-**Two audits run in CI, because both failures are invisible by nature:**
+**Two audits are gated in CI** (`lint:design`, `audit:themes`), and two
+more are described here that **do not yet exist as scripts** — they were run
+by hand inside QA harnesses and the earlier revision of this document
+overstated them. Recorded rather than deleted, because both failures are
+invisible by nature and both still need to become gates:
 
-- The **24px floor** audit walks the whole deck at 1920×1080 and measures
-  *computed* font sizes. A dropped custom size renders as ordinary body text,
-  not as an obvious bug — and that is not hypothetical: `tailwind-merge` could
-  not distinguish `text-stage-answer` from `text-ink` and silently discarded the
-  size at **eight** call sites until `lib/cn.ts` was taught the custom font-size
-  group. Every name on the §4 type ladder is registered in that group for the
-  same reason.
-- The **contrast** audit resolves every colour through a canvas — computed style
-  serialises as `oklch()`, and an `rgb()` regex silently reads channel numbers
-  as bytes — and accounts for absolutely positioned fills behind a label.
+- **Design lint** (in CI) walks every component for an arbitrary Tailwind
+  value and checks each ladder step is registered with `tailwind-merge`. That
+  is not hypothetical: `tailwind-merge` could not distinguish
+  `text-stage-answer` from `text-ink` and silently discarded the size at
+  **eight** call sites until `lib/cn.ts` was taught the custom font-size
+  group. A dropped custom size renders as ordinary body text, not as an
+  obvious bug.
+- **Theme audit** (in CI) resolves every accent pair through OKLCH and fails
+  any pair under 7:1 against its own ink.
+- **The 24px floor** — *not yet a script.* It should walk the whole deck at
+  1920×1080 and measure *computed* font sizes outside the control-bar
+  `<footer>`. Last run by hand (November 2026) it passed on the lobby,
+  question, self-paced and failure screens and **failed on the final-results
+  screen**: `Podium`/`LeaderboardList` labels at 11–16px and the four
+  `size="lg"` buttons at 17px. Open in `UX-PLAN.md`.
+- **The contrast audit** — *not yet a script.* It must resolve every colour
+  through a canvas (computed style serialises as `oklch()`, and an `rgb()`
+  regex silently reads channel numbers as bytes) and account for absolutely
+  positioned fills behind a label.
 
 ---
 

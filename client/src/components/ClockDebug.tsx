@@ -111,7 +111,7 @@ export function ClockDebug() {
       // Bottom-left: the bottom-right corner is where this app puts real
       // controls on both screens, and a diagnostic must never sit on top of
       // something a host is about to press in front of a room.
-      className="fixed bottom-2 left-2 z-[9999] rounded-md px-2 py-1 font-mono text-[11px] leading-tight shadow-lg"
+      className="fixed bottom-2 left-2 z-[9999] rounded-md px-2 py-1 font-mono text-caption2 shadow-lg"
       style={{ background: "var(--surface-2)", color: colour, opacity: 0.92 }}
       role="status"
       aria-live="off"

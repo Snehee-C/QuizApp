@@ -71,6 +71,12 @@ reach yet:
   while the editor rendered it as saved, which is worse than storing a
   half-finished slide. Surfacing those advisories in the editor is the missing
   client half; only after that can the route refuse.
+
+  Status: **client half done** — advisories are surfaced in the header
+  counter, `DeckCheck` and inline per field, and the editor's writes now go
+  through one acked, retrying pipeline with a visible save state
+  (`lib/autosave.ts`, `UX-PLAN.md` 5.1). The route still answers 200; it may
+  now refuse, because a refused write is shown rather than rendered as saved.
 - **A 400-character option label still imports.** A cap needs a number agreed
   with whoever owns the stage fitter (it binary-searches down to the 26px
   `ANSWER_FLOOR` and then stops, so a long label is free to exceed
@@ -200,6 +206,10 @@ Deck and slide deletion are guarded by a native `confirm()`. Undo is the right
 pattern for both — and a native dialog drops some engines out of fullscreen,
 which on a presenter screen means flashing the desktop at the room.
 
+Status: **done** — deferred-destroy undo for decks and slides (`FLOW.md` §3,
+"Deleting something, with a way back"), and now for option rows inside a
+slide (`UX-PLAN.md` 5.3). Zero native dialogs remain.
+
 ### Per-deck reveal preference
 `Show upcoming` in the slide navigator is persisted per HOST, so someone
 running trivia nights and staff all-hands from one account gets one answer for
@@ -219,6 +229,12 @@ confirmed the contrast it was supposed to buy.
   REST API, which is why a missing `Edit` button survived all of them. Drag
   reorder, form-level validation and the six-option preview are untested
   through the actual interface.
+
+  Status: **partly closed** — the Wave 5 harness drives the editor through
+  the real interface (typing, save state, aborted PATCHes, time-limit clamp,
+  option undo, duplicate-after, drag and keyboard reorder, the pinned add
+  button, both modals' dismiss). Note the earlier wording was wrong: drag
+  reorder did not exist to be untested; it exists now (`UX-PLAN.md` 5.4).
 - **Real network conditions.** All reconnect testing has been instant local
   socket kills. A 3G-with-loss profile would exercise the retry queue and the
   ack-timeout path far harder.
