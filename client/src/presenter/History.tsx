@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { motion } from "motion/react";
-import { api, getToken, type SessionSummary } from "../lib/api";
-import { API_BASE } from "../lib/config";
+import { api, type SessionSummary } from "../lib/api";
+import { downloadSessionCsv } from "../lib/sessionExport";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
+import { AppHeader } from "../components/AppHeader";
 import { duration as dur, STAGGER, prefersReducedMotion } from "../lib/motion";
 import { cn } from "../lib/cn";
 import { useScrollMemory } from "../lib/scrollMemory";
@@ -90,23 +91,11 @@ export default function History() {
     };
   }, [id]);
 
-  // The export endpoint is authenticated, so it can't be a plain <a href>: we
-  // have to attach the bearer token and hand the browser a blob instead.
   async function downloadCsv(s: SessionSummary) {
     setBusy((b) => ({ ...b, [s.id]: true }));
     setExportError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/sessions/${s.id}/export`, {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
-      if (!res.ok) throw new Error(`Export failed (${res.status})`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `session-${s.joinCode}-results.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+      await downloadSessionCsv(s.id, s.joinCode);
     } catch (e: unknown) {
       setExportError(e instanceof Error ? e.message : "Export failed.");
     } finally {
@@ -118,25 +107,18 @@ export default function History() {
 
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
-      {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
-          inject an alpha channel into an `oklch()` token and computes to fully
-          transparent, so this header has been relying on `backdrop-blur`
-          alone — page content scrolled underneath it blurred but untinted. */}
-      <header
-        className="sticky top-0 z-20 backdrop-blur border-b border-hairline"
-        style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
-      >
-        <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
-          {/* A trail, not a single door.
+      <AppHeader
+        crumb={
+          /* A trail, not a single door.
 
-              A deck's history sits under that deck, which sits under Decks —
-              but the one control here used to be "Back to decks", which threw
-              a host who arrived from the editor two levels up and left them to
-              find their way back in. Reaching this page from two places
-              (the editor and the dashboard) means a single "back" cannot be
-              right for both; naming the whole path is right for both, and it
-              also answers "where am I" without anyone having to press
-              anything (NN/g: recognition over recall). */}
+             A deck's history sits under that deck, which sits under Decks —
+             but the one control here used to be "Back to decks", which threw
+             a host who arrived from the editor two levels up and left them to
+             find their way back in. Reaching this page from two places
+             (the editor and the dashboard) means a single "back" cannot be
+             right for both; naming the whole path is right for both, and it
+             also answers "where am I" without anyone having to press
+             anything (NN/g: recognition over recall). */
           <nav aria-label="Breadcrumb" className="min-w-0 flex items-center gap-2 text-subhead">
             <Link
               to="/dashboard"
@@ -149,7 +131,9 @@ export default function History() {
             </span>
             <Link
               to={id ? `/edit/${id}` : "/dashboard"}
-              className="min-w-0 truncate text-ink-subtle hover:text-ink transition-colors duration-fast rounded-xs outline-none focus-visible:shadow-focus"
+              // A floor, so a long title squeezed by the shell's nav still
+              // shows its first letters and an ellipsis rather than nothing.
+              className="min-w-16 truncate text-ink-subtle hover:text-ink transition-colors duration-fast rounded-xs outline-none focus-visible:shadow-focus"
             >
               {title ?? "Deck"}
             </Link>
@@ -160,13 +144,25 @@ export default function History() {
               History
             </span>
           </nav>
-          <Link to={id ? `/present/${id}` : "/dashboard"} className="shrink-0">
-            <Button variant="secondary" size="sm">
-              Present
-            </Button>
-          </Link>
-        </div>
-      </header>
+        }
+        actions={
+          <>
+            {/* The one-way spoke, closed (UX-PLAN 0.5): a session's results
+                are exactly where a bad question announces itself, and the
+                editor used to be three presses and a scan from here. */}
+            <Link to={id ? `/edit/${id}` : "/dashboard"} className="shrink-0">
+              <Button variant="ghost" size="sm">
+                Edit deck
+              </Button>
+            </Link>
+            <Link to={id ? `/present/${id}` : "/dashboard"} className="shrink-0">
+              <Button variant="secondary" size="sm">
+                Present
+              </Button>
+            </Link>
+          </>
+        }
+      />
 
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="mb-7">

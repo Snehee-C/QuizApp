@@ -1,10 +1,10 @@
 import { useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { getToken, type Presentation } from "../lib/api";
 import { API_BASE } from "../lib/config";
-import { useAuth } from "../auth";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
+import { AppHeader } from "../components/AppHeader";
 
 /**
  * Move decks in and out of the account as JSON files.
@@ -29,7 +29,6 @@ export default function DeckTransfer() {
 
   const fileInput = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
-  const { user, logout } = useAuth();
 
   async function importFromFile(file: File) {
     setImporting(true);
@@ -95,35 +94,9 @@ export default function DeckTransfer() {
 
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
-      {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
-          inject an alpha channel into an `oklch()` token and computes to fully
-          transparent, so this header has been relying on `backdrop-blur`
-          alone — page content scrolled underneath it blurred but untinted. */}
-      <header
-        className="sticky top-0 z-20 backdrop-blur border-b border-hairline"
-        style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
-      >
-        <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
-          {/* Inside the app, a wordmark means "home" and home is the deck
-              list — not the marketing page, which is where this pointed from
-              every signed-in screen. Clicking a logo should never log you out
-              of the feeling of being in the product. */}
-          <Link to="/dashboard" className="font-display font-bold text-title3">
-            Floodlight
-          </Link>
-          <div className="flex items-center gap-2">
-            <Link to="/dashboard">
-              <Button variant="ghost" size="sm">
-                Back to decks
-              </Button>
-            </Link>
-            <span className="text-subhead text-ink-subtle hidden sm:block">{user?.name}</span>
-            <Button variant="ghost" size="sm" onClick={logout}>
-              Log out
-            </Button>
-          </div>
-        </div>
-      </header>
+      {/* The shared shell (components/AppHeader.tsx) carries the way back to
+          the decks, the account, and the other global places. */}
+      <AppHeader />
 
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="mb-7">

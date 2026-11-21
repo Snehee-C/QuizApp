@@ -4,6 +4,7 @@ import { motion } from "motion/react";
 import { api, type TemplateSummary } from "../lib/api";
 import { Button } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
+import { AppHeader } from "../components/AppHeader";
 import { duration as dur, STAGGER, prefersReducedMotion } from "../lib/motion";
 import { useScrollMemory } from "../lib/scrollMemory";
 
@@ -52,29 +53,10 @@ export default function Templates() {
 
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
-      {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
-          inject an alpha channel into an `oklch()` token and computes to fully
-          transparent, so this header has been relying on `backdrop-blur`
-          alone — page content scrolled underneath it blurred but untinted. */}
-      <header
-        className="sticky top-0 z-20 backdrop-blur border-b border-hairline"
-        style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
-      >
-        <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
-          {/* Inside the app, a wordmark means "home" and home is the deck
-              list — not the marketing page, which is where this pointed from
-              every signed-in screen. Clicking a logo should never log you out
-              of the feeling of being in the product. */}
-          <Link to="/dashboard" className="font-display font-bold text-title3">
-            Floodlight
-          </Link>
-          <Link to="/dashboard">
-            <Button variant="ghost" size="sm">
-              Back to decks
-            </Button>
-          </Link>
-        </div>
-      </header>
+      {/* The shared shell (components/AppHeader.tsx). "Back to decks" is gone
+          because the shell's `Decks` is the same door — two spellings of one
+          exit is DESIGN.md P1's failure. */}
+      <AppHeader />
 
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="mb-7">

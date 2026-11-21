@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
 import { api, type Presentation } from "../lib/api";
-import { useAuth } from "../auth";
 import { Button } from "../components/ui/Button";
-import { Card } from "../components/ui/Card";
+import { Card, Input } from "../components/ui/Card";
+import { AppHeader } from "../components/AppHeader";
 import { LiveRoomBar } from "../components/LiveRoomBar";
 import { MoreMenu } from "../components/MoreMenu";
 import { exportDeckToFile } from "../lib/deckFile";
@@ -13,11 +13,11 @@ import { UndoBar } from "../components/UndoBar";
 import { getLastRun, getPresenting } from "../lib/liveSession";
 import { LastRunBar } from "../components/LastRunBar";
 import { useScrollMemory } from "../lib/scrollMemory";
+import { formatRelative } from "../lib/relativeTime";
 
 export default function Dashboard() {
   const [items, setItems] = useState<Presentation[]>([]);
   const [loading, setLoading] = useState(true);
-  const { user, logout } = useAuth();
   const navigate = useNavigate();
   // Eighty rows deep is a real place to be; coming back to the top of the
   // list is not the same page (FLOW.md F3) — unless there is a band at the top
@@ -33,26 +33,68 @@ export default function Dashboard() {
     });
   }, []);
 
+  // Type-to-filter, the floor of FLOW.md F7's third rule: anything with a name
+  // can be reached by typing it. A 104-row scan becomes four keystrokes.
+  const [q, setQ] = useState("");
+  const needle = q.trim().toLowerCase();
+  const shown = useMemo(
+    () => (needle ? items.filter((p) => p.title.toLowerCase().includes(needle)) : items),
+    [items, needle]
+  );
+  // The three decks touched most recently, as cards above the list (UX-PLAN
+  // 0.6): a host presents the same deck weekly, and the serial-position
+  // effect says the first thing on the page is the cheapest to reach. Hidden
+  // while filtering (the filter IS the shortcut then) and on a short list,
+  // where a strip of three above a list of three would be the same list
+  // twice.
+  const recents = !needle && items.length >= 4 ? items.slice(0, 3) : [];
+
+  // One place for a row-level failure to land. The menu an action came from
+  // has already closed, and a create has no row yet, so above the list is the
+  // only place that is always there.
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  // Pending states, so a double-click cannot make two decks (UX-PLAN 6.7).
+  // Same shape as Templates.tsx — one id in flight, the rest of the page
+  // stays usable.
+  const [creating, setCreating] = useState(false);
+  const [copying, setCopying] = useState<string | null>(null);
+
   async function createNew() {
-    const p = await api.createPresentation("Untitled deck");
-    navigate(`/edit/${p.id}`);
+    if (creating) return;
+    setCreating(true);
+    setActionError(null);
+    try {
+      const p = await api.createPresentation("Untitled deck");
+      navigate(`/edit/${p.id}`);
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : "Could not create a deck.");
+      setCreating(false);
+    }
   }
 
   async function duplicate(id: string) {
-    const copy = await api.duplicatePresentation(id);
-    navigate(`/edit/${copy.id}`);
+    if (copying) return;
+    setCopying(id);
+    setActionError(null);
+    try {
+      const copy = await api.duplicatePresentation(id);
+      navigate(`/edit/${copy.id}`);
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : "Could not copy that deck.");
+      setCopying(null);
+    }
   }
 
   // Exporting is a per-deck verb, so it lives on the deck. It used to mean
   // leaving this list, finding the same deck again in a second list on the
   // Import/export page, and pressing Download beside it (lib/deckFile.ts).
-  const [exportError, setExportError] = useState<string | null>(null);
   async function exportDeck(p: Presentation) {
-    setExportError(null);
+    setActionError(null);
     try {
       await exportDeckToFile(p.id, p.title);
     } catch (e: unknown) {
-      setExportError(e instanceof Error ? e.message : "Could not export that deck.");
+      setActionError(e instanceof Error ? e.message : "Could not export that deck.");
     }
   }
 
@@ -86,42 +128,7 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
-      {/* The fill is a color-mix, not `bg-canvas/80`: the slash-alpha cannot
-          inject an alpha channel into an `oklch()` token and computes to fully
-          transparent, so this header has been relying on `backdrop-blur`
-          alone — page content scrolled underneath it blurred but untinted. */}
-      <header
-        className="sticky top-0 z-20 backdrop-blur border-b border-hairline"
-        style={{ background: "color-mix(in oklch, var(--canvas), transparent 20%)" }}
-      >
-        <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
-          {/* Inside the app, a wordmark means "home" and home is the deck
-              list — not the marketing page, which is where this pointed from
-              every signed-in screen. Clicking a logo should never log you out
-              of the feeling of being in the product. */}
-          <Link to="/dashboard" className="font-display font-bold text-title3">
-            Floodlight
-          </Link>
-          <div className="flex items-center gap-2">
-            <Link to="/templates">
-              <Button variant="ghost" size="sm">
-                Templates
-              </Button>
-            </Link>
-            {/* Import only. Export moved onto the deck rows, where the deck
-                is — so this link now names one task instead of two. */}
-            <Link to="/transfer">
-              <Button variant="ghost" size="sm">
-                Import
-              </Button>
-            </Link>
-            <span className="text-subhead text-ink-subtle hidden sm:block">{user?.name}</span>
-            <Button variant="ghost" size="sm" onClick={logout}>
-              Log out
-            </Button>
-          </div>
-        </div>
-      </header>
+      <AppHeader />
 
       {/* The other end of the same thread as the editor's bar. A host who
           closed the presenter tab, or wandered here to start something else,
@@ -146,17 +153,17 @@ export default function Dashboard() {
       <main className="relative z-10 max-w-4xl mx-auto px-6 py-10">
         <div className="flex items-end justify-between gap-4 mb-7">
           <h1 className="font-display text-large-title font-bold leading-none">Your decks</h1>
-          <Button variant="primary" size="md" onClick={createNew}>
-            New deck
+          {/* Secondary: the page's one accent goes to `Present` on the rows,
+              the verb a host comes here for weekly. Creating a deck is a
+              once-per-deck event (FLOW.md F5, UX-PLAN 6.1). */}
+          <Button variant="secondary" size="md" disabled={creating} onClick={createNew}>
+            {creating ? "Creating…" : "New deck"}
           </Button>
         </div>
 
-        {/* A row-level failure, reported once above the list rather than
-            inside the row: the menu it came from has already closed, so there
-            is nowhere in the row left to put it. */}
-        {exportError && (
+        {actionError && (
           <p role="status" className="text-subhead text-ink-muted mb-3">
-            {exportError}
+            {actionError}
           </p>
         )}
 
@@ -168,68 +175,180 @@ export default function Dashboard() {
             <p className="text-ink-subtle text-subhead mb-6">
               Build a deck of questions, then put the join code on the big screen.
             </p>
-            <Button variant="primary" size="md" onClick={createNew}>
-              Create your first deck
+            <Button variant="primary" size="md" disabled={creating} onClick={createNew}>
+              {creating ? "Creating…" : "Create your first deck"}
             </Button>
           </Card>
         )}
 
-        <div className="flex flex-col gap-2.5">
-          {items.map((p, i) => (
-            <motion.div
-              key={p.id}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: i * 0.035, duration: 0.24 }}
-            >
-              <Card
-                level={1}
-                className="flex items-center justify-between gap-4 px-5 py-4 transition-colors duration-fast hover:bg-surface-2"
-              >
-                {/* The title is a link to the editor, but it cannot be the ONLY
-                    way in: every other action on this card wears a label, so an
-                    unlabelled one reads as "there is no edit function". It is
-                    also the action a host reaches for most. Kept as a link AND
-                    given a button below. */}
-                <Link to={`/edit/${p.id}`} className="flex-1 min-w-0" title={`Edit "${p.title}"`}>
-                  <p className="font-semibold text-callout truncate">{p.title}</p>
-                  <p className="nums text-footnote text-ink-subtle mt-0.5">
-                    {p._count?.slides ?? 0} slide{(p._count?.slides ?? 0) === 1 ? "" : "s"}
-                  </p>
-                </Link>
-                {/* Two verbs on the row, the rest one layer in. These are the
-                    two things a host opens this page to do; History,
-                    Duplicate and Delete are occasional, and one of them is
-                    irreversible and used to sit a pixel from "Present" at
-                    identical weight (MoreMenu.tsx). */}
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <Link to={`/edit/${p.id}`}>
-                    <Button variant="ghost" size="sm">
-                      Edit
-                    </Button>
-                  </Link>
-                  <Link to={`/present/${p.id}`}>
-                    <Button variant="secondary" size="sm">
-                      Present
-                    </Button>
-                  </Link>
-                  <MoreMenu
-                    label={`More actions for "${p.title}"`}
-                    actions={[
-                      { label: "Session history", onSelect: () => navigate(`/history/${p.id}`) },
-                      { label: "Duplicate", onSelect: () => duplicate(p.id) },
-                      { label: "Export as file", onSelect: () => exportDeck(p) },
-                      { label: "Delete deck", onSelect: () => remove(p), danger: true },
-                    ]}
-                  />
+        {!loading && items.length > 0 && (
+          <>
+            {recents.length > 0 && (
+              <section aria-label="Recent decks" className="mb-7">
+                <p className="text-caption2 font-semibold uppercase track-label text-ink-subtle mb-2">
+                  Recent
+                </p>
+                <div className="grid gap-2.5 sm:grid-cols-3">
+                  {recents.map((p) => {
+                    const n = p._count?.slides ?? 0;
+                    return (
+                      <Card
+                        key={p.id}
+                        level={1}
+                        className="flex flex-col gap-4 px-5 py-5 transition-colors duration-fast hover:bg-surface-2"
+                      >
+                        <Link to={`/edit/${p.id}`} className="min-w-0" title={`Edit "${p.title}"`}>
+                          <p className="font-semibold text-title3 leading-snug truncate">{p.title}</p>
+                          <p className="nums text-footnote text-ink-subtle mt-1">
+                            <SlideMeta n={n} updatedAt={p.updatedAt} />
+                          </p>
+                        </Link>
+                        <div className="flex items-center gap-1.5">
+                          <PresentButton id={p.id} slides={n} size="md" />
+                          <Link to={`/edit/${p.id}`}>
+                            <Button variant="ghost" size="md">
+                              Edit
+                            </Button>
+                          </Link>
+                        </div>
+                      </Card>
+                    );
+                  })}
                 </div>
-              </Card>
-            </motion.div>
-          ))}
-        </div>
+              </section>
+            )}
+
+            <Input
+              autoFocus
+              data-palette-hotkey="allow"
+              type="search"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && q) {
+                  e.preventDefault();
+                  setQ("");
+                }
+              }}
+              placeholder="Filter decks by title…"
+              aria-label="Filter decks by title"
+              className="mb-4"
+            />
+
+            {shown.length === 0 && (
+              <p className="text-ink-subtle text-subhead py-6 text-center" role="status">
+                No decks match “{q.trim()}”.
+              </p>
+            )}
+
+            <div className="flex flex-col gap-2.5">
+              {shown.map((p, i) => {
+                const n = p._count?.slides ?? 0;
+                return (
+                  <motion.div
+                    key={p.id}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: Math.min(i, 12) * 0.035, duration: 0.24 }}
+                  >
+                    <Card
+                      level={1}
+                      className="flex items-center justify-between gap-4 px-5 py-4 transition-colors duration-fast hover:bg-surface-2"
+                    >
+                      {/* The title is a link to the editor, but it cannot be the ONLY
+                          way in: every other action on this card wears a label, so an
+                          unlabelled one reads as "there is no edit function". It is
+                          also the action a host reaches for most. Kept as a link AND
+                          given a button below. */}
+                      <Link
+                        to={`/edit/${p.id}`}
+                        className="flex-1 min-w-0"
+                        title={`Edit "${p.title}"`}
+                      >
+                        <p className="font-semibold text-callout truncate">{p.title}</p>
+                        <p className="nums text-footnote text-ink-subtle mt-0.5">
+                          {copying === p.id ? (
+                            "Copying…"
+                          ) : (
+                            <SlideMeta n={n} updatedAt={p.updatedAt} />
+                          )}
+                        </p>
+                      </Link>
+                      {/* Two verbs on the row, the rest one layer in. These are the
+                          two things a host opens this page to do; History,
+                          Duplicate and Delete are occasional, and one of them is
+                          irreversible and used to sit a pixel from "Present" at
+                          identical weight (MoreMenu.tsx). */}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <Link to={`/edit/${p.id}`}>
+                          <Button variant="ghost" size="sm">
+                            Edit
+                          </Button>
+                        </Link>
+                        <PresentButton id={p.id} slides={n} size="sm" />
+                        <MoreMenu
+                          label={`More actions for "${p.title}"`}
+                          actions={[
+                            {
+                              label: "Session history",
+                              onSelect: () => navigate(`/history/${p.id}`),
+                            },
+                            { label: "Duplicate", onSelect: () => duplicate(p.id) },
+                            { label: "Export as file", onSelect: () => exportDeck(p) },
+                            { label: "Delete deck", onSelect: () => remove(p), danger: true },
+                          ]}
+                        />
+                      </div>
+                    </Card>
+                  </motion.div>
+                );
+              })}
+            </div>
+          </>
+        )}
       </main>
 
       <UndoBar pending={pending} windowMs={windowMs} onUndo={undoRemove} />
     </div>
+  );
+}
+
+/** "12 slides · updated 3 d ago" — the count, and the key the list is sorted by. */
+function SlideMeta({ n, updatedAt }: { n: number; updatedAt: string }) {
+  return (
+    <>
+      {n} slide{n === 1 ? "" : "s"}
+      {" · "}
+      updated {formatRelative(updatedAt)}
+      {/* The reason the row's Present is off, said where the count is. */}
+      {n === 0 && <span className="text-ink-muted"> — add a slide first</span>}
+    </>
+  );
+}
+
+/**
+ * The row's primary verb (FLOW.md F5: the accent goes to the most frequent
+ * action). An empty deck cannot be launched: the server would refuse it with
+ * EMPTY_DECK on a projector that is already live (UX-PLAN 1.6), so the button
+ * is off here, with the reason on hover and in the row's metadata.
+ */
+function PresentButton({ id, slides, size }: { id: string; slides: number; size: "sm" | "md" }) {
+  if (slides === 0) {
+    return (
+      // The wrapper carries the tooltip: a disabled button takes no pointer
+      // events, so a title on the button itself would never show.
+      <span title="Add a slide first" className="inline-flex">
+        <Button variant="primary" size={size} disabled aria-disabled="true">
+          Present
+        </Button>
+      </span>
+    );
+  }
+  return (
+    <Link to={`/present/${id}`}>
+      <Button variant="primary" size={size}>
+        Present
+      </Button>
+    </Link>
   );
 }
