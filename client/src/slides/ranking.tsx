@@ -5,6 +5,7 @@ import { Button } from "../components/ui/Button";
 import { Input, Label } from "../components/ui/Card";
 import { Shape } from "../components/ui/Shape";
 import { slotFor } from "../lib/answers";
+import { insertAt, removeAt } from "../lib/listEdit";
 import { STAGGER_LG, duration, ease, spring } from "../lib/motion";
 import { AnsweredEcho, EchoOption, asIndexList } from "./answeredEcho";
 
@@ -15,7 +16,7 @@ import { AnsweredEcho, EchoOption, asIndexList } from "./answeredEcho";
 // if it tracked position instead, every reorder would repaint the list and the
 // room would lose track of which bar is which.
 
-function RankingEditor({ config, onChange }: EditorProps) {
+function RankingEditor({ config, onChange, onRemove }: EditorProps) {
   const items: string[] = config.items ?? [];
   const [draft, setDraft] = useState<string[] | null>(null);
   const shown = draft ?? items;
@@ -55,7 +56,14 @@ function RankingEditor({ config, onChange }: EditorProps) {
                 onBlur={() => draft && commit(draft)}
               />
               <button
-                onClick={() => onChange({ items: items.filter((_, j) => j !== i) })}
+                onClick={() => {
+                  setDraft(null);
+                  const removed = items[i];
+                  const apply = (c: any) => ({ ...c, items: removeAt(c.items ?? [], i) });
+                  const restore = (c: any) => ({ ...c, items: insertAt(c.items ?? [], i, removed) });
+                  if (onRemove) onRemove({ label: `item ${i + 1}`, apply, restore });
+                  else onChange(apply(config));
+                }}
                 disabled={items.length <= 2}
                 aria-label={`Remove item ${i + 1}`}
                 className="shrink-0 w-9 h-9 grid place-items-center rounded-sm text-ink-subtle hover:text-ink disabled:opacity-25 disabled:pointer-events-none transition-colors duration-fast"

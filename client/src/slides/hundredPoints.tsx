@@ -5,6 +5,7 @@ import { Button } from "../components/ui/Button";
 import { Input, Label } from "../components/ui/Card";
 import { Shape } from "../components/ui/Shape";
 import { slotFor } from "../lib/answers";
+import { insertAt, removeAt } from "../lib/listEdit";
 import { STAGGER_LG, duration, ease, spring } from "../lib/motion";
 import { AnsweredEcho, EchoOption, asNumberList } from "./answeredEcho";
 
@@ -16,7 +17,7 @@ import { AnsweredEcho, EchoOption, asNumberList } from "./answeredEcho";
  *  odd remainder is always reachable even on a non-round budget. */
 const STEP = 5;
 
-function HPEditor({ config, onChange }: EditorProps) {
+function HPEditor({ config, onChange, onRemove }: EditorProps) {
   const options: string[] = config.options ?? [];
   const [draft, setDraft] = useState<string[] | null>(null);
   const shown = draft ?? options;
@@ -53,7 +54,17 @@ function HPEditor({ config, onChange }: EditorProps) {
                   onBlur={() => draft && commit(draft)}
                 />
                 <button
-                  onClick={() => onChange({ options: options.filter((_, j) => j !== i) })}
+                  onClick={() => {
+                    setDraft(null);
+                    const removed = options[i];
+                    const apply = (c: any) => ({ ...c, options: removeAt(c.options ?? [], i) });
+                    const restore = (c: any) => ({
+                      ...c,
+                      options: insertAt(c.options ?? [], i, removed),
+                    });
+                    if (onRemove) onRemove({ label: `option ${slot.letter}`, apply, restore });
+                    else onChange(apply(config));
+                  }}
                   disabled={options.length <= 2}
                   aria-label={`Remove option ${slot.letter}`}
                   className="shrink-0 w-9 h-9 grid place-items-center rounded-sm text-ink-subtle hover:text-ink disabled:opacity-25 disabled:pointer-events-none transition-colors duration-fast"

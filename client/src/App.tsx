@@ -1,5 +1,5 @@
 import type { JSX } from "react";
-import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation, useParams } from "react-router-dom";
 import { useAuth } from "./auth";
 import Login from "./presenter/Login";
 import Dashboard from "./presenter/Dashboard";
@@ -30,6 +30,17 @@ function RequireAuth({ children }: { children: JSX.Element }) {
   ) : (
     <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />
   );
+}
+
+// One `<Play>` per room. The route element is the same for every code, so
+// React would keep the instance across `/join/AAAAAA` → `/join/BBBBBB` — the
+// next session's QR scanned into the same tab — and the finished room's
+// podium would stay on screen while the join effect quietly seated the phone
+// in the new one. Keying by code remounts cleanly; seat and nickname logic
+// are untouched.
+function PlayByCode() {
+  const { code } = useParams();
+  return <Play key={code ?? ""} />;
 }
 
 export default function App() {
@@ -100,7 +111,7 @@ export default function App() {
 
         {/* Participant (no auth) */}
         <Route path="/join" element={<Join />} />
-        <Route path="/join/:code" element={<Play />} />
+        <Route path="/join/:code" element={<PlayByCode />} />
 
           <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

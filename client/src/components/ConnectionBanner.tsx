@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { cn } from "../lib/cn";
 import { duration, prefersReducedMotion, spring } from "../lib/motion";
@@ -27,6 +27,15 @@ function message(status: ConnectionStatus, queued: number): string | null {
 }
 
 /**
+ * How long an unconfirmed submission on a HEALTHY link sits before the strip
+ * says so. The queue notifies synchronously on enqueue, so without this the
+ * warning-shaped strip sprang in and straight back out on every 40–80ms ack —
+ * an indicator that appears on every healthy action is itself a defect
+ * (PULSE T1, the inverse clause). Past this it is true: something is slow.
+ */
+const PENDING_GRACE_MS = 400;
+
+/**
  * A thin, non-blocking status strip for flaky venue Wi-Fi.
  *
  * Shown only when something is actually wrong or pending. A permanent
@@ -39,8 +48,21 @@ export function ConnectionBanner({ className }: ConnectionBannerProps) {
   // render would mean a matchMedia call on every status tick.
   const [reduced] = useState(prefersReducedMotion);
 
-  const text = message(status, queued);
+  // Only the "Sending your answer…" case is held back. An outage is reported
+  // the moment it is known (T2: within a second), because that message is
+  // never a false alarm.
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (queued === 0) {
+      setSlow(false);
+      return;
+    }
+    const t = window.setTimeout(() => setSlow(true), PENDING_GRACE_MS);
+    return () => window.clearTimeout(t);
+  }, [queued]);
+
   const pending = status === "offline" || status === "reconnecting" || status === "connecting";
+  const text = message(status, pending || slow ? queued : 0);
 
   return (
     // The live region is always mounted, even while empty. Screen readers
@@ -80,7 +102,7 @@ export function ConnectionBanner({ className }: ConnectionBannerProps) {
               )}
             />
             <span className={pending ? "text-warn" : "text-ink-muted"}>{text}</span>
-            {queued > 0 && (
+            {queued > 0 && (pending || slow) && (
               <span className="text-ink-subtle">
                 <span className="nums font-semibold text-ink">{queued}</span> waiting
               </span>

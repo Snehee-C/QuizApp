@@ -119,8 +119,9 @@ export function ReactionBar({ joinCode, className }: ReactionBarProps) {
     <div
       className={cn(
         "w-full select-none",
-        // Sits at the bottom of a phone, so clear the home indicator.
-        "pb-[env(safe-area-inset-bottom)]",
+        // No safe-area padding here: it belongs on whatever element is
+        // actually bottom-most, which is the footer that mounts this bar
+        // (Play.tsx) — the tablist renders after it.
         className
       )}
     >

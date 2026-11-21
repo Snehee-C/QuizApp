@@ -20,12 +20,40 @@ export interface EditorProps {
   onChange: (patch: any) => void;
   /** Replaces config wholesale — for edits that must remove keys. */
   onReplace: (config: any) => void;
+  /**
+   * Remove a row from a list field with a way back. The row leaves at once;
+   * the write waits out the same six-second undo window a slide delete gets
+   * (FLOW.md "Deleting something, with a way back"), and undo re-inserts it
+   * into the config AS IT THEN IS, so an edit made meanwhile is kept.
+   *
+   * Optional on the shell side: a module falls back to `onChange(apply(c))`
+   * when it is absent, which is the one-press-irreversible behaviour this
+   * replaces (UX-PLAN 5.3).
+   */
+  onRemove?: (removal: Removal) => void;
   question: string;
+}
+
+export interface Removal {
+  /** What the undo bar says left: "option B", "accepted answer 2". */
+  label: string;
+  /** The config with the row gone. Applied now, saved after the window. */
+  apply: (config: any) => any;
+  /** The row put back at its index in whatever the config has become. */
+  restore: (config: any) => any;
 }
 
 export interface PlayerProps {
   slide: SlideLike;
-  onSubmit: (value: unknown) => void;
+  /**
+   * Hand the shell an answer. Resolves `true` once the server has accepted
+   * it and `false` when it was refused or abandoned, so a module that shows
+   * the pick optimistically can put the board back on failure. The return is
+   * optional on both sides: a module may ignore it, and an older shell may
+   * return nothing — which a module must read as "no verdict", never as
+   * failure.
+   */
+  onSubmit: (value: unknown) => void | Promise<boolean>;
   disabled?: boolean;
   /**
    * The player's OWN previously stored answer, echoed back by the server on

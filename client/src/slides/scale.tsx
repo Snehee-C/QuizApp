@@ -4,6 +4,7 @@ import { Input, Label } from "../components/ui/Card";
 import { slotFor } from "../lib/answers";
 import { STAGGER_LG, spring } from "../lib/motion";
 import { AnsweredEcho, asNumber } from "./answeredEcho";
+import { cn } from "../lib/cn";
 
 function ScaleEditor({ config, onChange }: EditorProps) {
   return (
@@ -30,6 +31,31 @@ function ScaleEditor({ config, onChange }: EditorProps) {
       </div>
     </div>
   );
+}
+
+/**
+ * Column count from the range size, so the grid is never ragged by accident.
+ * `grid-cols-5` was hard-coded, which rendered a 1–7 scale as 5 + 2 and a 1–3
+ * scale as three squares and two holes. Literal class names, because Tailwind
+ * only emits what it can read.
+ *
+ *   ≤5  → one row
+ *   6–7 → four across (4+2, 4+3)
+ *   8–10 → five across (two rows, 5+3 at worst)
+ *   11+ → six across (0–10 is 6+5)
+ *
+ * Every square stays ≥44px on a 320px phone: six across at 320 − 32 px of
+ * padding is 48px minus gaps.
+ */
+function colsFor(n: number): string {
+  if (n <= 1) return "grid-cols-1";
+  if (n === 2) return "grid-cols-2";
+  if (n === 3) return "grid-cols-3";
+  if (n === 4) return "grid-cols-4";
+  if (n === 5) return "grid-cols-5";
+  if (n <= 7) return "grid-cols-4";
+  if (n <= 10) return "grid-cols-5";
+  return "grid-cols-6";
 }
 
 function ScalePlayer({ slide, onSubmit, disabled, value }: PlayerProps) {
@@ -65,7 +91,7 @@ function ScalePlayer({ slide, onSubmit, disabled, value }: PlayerProps) {
         <span>{min} · lowest</span>
         <span>{max} · highest</span>
       </div>
-      <div className="grid grid-cols-5 gap-2.5">
+      <div className={cn("grid gap-2.5", colsFor(nums.length))}>
         {nums.map((n, i) => (
           <motion.button
             key={n}
@@ -126,9 +152,10 @@ function ScaleStage({ aggregate }: StageProps) {
 function ScalePreview({ config }: { config: any; question: string }) {
   const min = config.scaleMin ?? 1;
   const max = config.scaleMax ?? 5;
+  const count = Math.max(0, max - min + 1);
   return (
-    <div className="grid grid-cols-5 gap-2">
-      {Array.from({ length: Math.max(0, max - min + 1) }, (_, i) => min + i).map((n) => (
+    <div className={cn("grid gap-2", colsFor(count))}>
+      {Array.from({ length: count }, (_, i) => min + i).map((n) => (
         <span key={n} className="nums aspect-square rounded-md bg-surface-2 grid place-items-center text-subhead font-bold">
           {n}
         </span>

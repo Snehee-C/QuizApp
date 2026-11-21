@@ -53,56 +53,85 @@ export function AvatarBubble({ avatar, size = 28 }: { avatar?: number; size?: nu
 // Instead the winner gets a full card flooded with their OWN colour, their
 // name in display type and their score counting up; 2nd and 3rd sit beside it
 // as smaller, already-resolved cards.
+//
+// Two layouts, one vocabulary. The STAGE keeps the three-across row it has
+// always had. The PHONE stacks: the row needed 456px (176 + 2×128 + gaps)
+// inside a 375px screen with `overflow-hidden` on the shell, so #2 and #3
+// were clipped in half, unscrollable, on the biggest emotional moment in the
+// product (UX-PLAN 4.1). Winner on top at full width, the two runners-up
+// side by side beneath, nothing with a minimum width the screen cannot
+// honour — it renders unclipped at 320px.
 export function Podium({ entries, stage = false }: { entries: LeaderboardEntry[]; stage?: boolean }) {
   const [first, second, third] = entries;
   if (!first) return null;
+
+  if (!stage) {
+    return (
+      <div className="flex flex-col items-stretch gap-3 w-full">
+        <WinnerCard entry={first} stage={false} />
+        {(second || third) && (
+          <div className="grid grid-cols-2 gap-3">
+            {second && <RunnerUp entry={second} place={2} delay={0} stage={false} />}
+            {third && <RunnerUp entry={third} place={3} delay={0.08} stage={false} />}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className={cn("flex items-stretch justify-center gap-4", stage ? "gap-6" : "gap-3")}>
       {second && <RunnerUp entry={second} place={2} delay={0} stage={stage} />}
 
-      <motion.div
-        initial={{ opacity: 0, y: 28, scale: 0.92 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        // One of the three budgeted uses of the overshoot spring.
-        transition={{ ...spring.pop, delay: 0.26 }}
-        className={cn(
-          "relative overflow-hidden rounded-2xl flex flex-col items-center justify-center text-center",
-          stage ? "px-12 py-10 min-w-[22rem]" : "px-7 py-6 min-w-[11rem]"
-        )}
-        style={{ background: paletteOf(first).solid, color: paletteOf(first).ink }}
-      >
-        <span
-          aria-hidden="true"
-          className="absolute inset-0"
-          style={{ background: "radial-gradient(120% 90% at 50% 0%, oklch(1 0 0 / .14), transparent 62%)" }}
-        />
-        <span className="relative flex flex-col items-center gap-3">
-          <AvatarBubble avatar={first.avatar} size={stage ? 96 : 56} />
-          <span
-            className={cn(
-              "font-display font-bold leading-none",
-              stage ? "text-stage-name" : "text-title2"
-            )}
-          >
-            {first.name}
-          </span>
-          <span
-            className={cn(
-              "nums font-bold leading-none",
-              stage ? "text-stage-q-sm" : "text-title1"
-            )}
-          >
-            <NumberTicker value={first.score} />
-          </span>
-          <span className="text-caption2 font-semibold uppercase track-label opacity-70">
-            Winner
-          </span>
-        </span>
-      </motion.div>
+      <WinnerCard entry={first} stage={stage} />
 
       {third && <RunnerUp entry={third} place={3} delay={0.08} stage={stage} />}
     </div>
+  );
+}
+
+function WinnerCard({ entry: first, stage }: { entry: LeaderboardEntry; stage: boolean }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 28, scale: 0.92 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      // One of the three budgeted uses of the overshoot spring.
+      transition={{ ...spring.pop, delay: 0.26 }}
+      className={cn(
+        "relative overflow-hidden rounded-2xl flex flex-col items-center justify-center text-center",
+        // Phone: full width of its column, no minimum the screen cannot honour.
+        stage ? "px-12 py-10 min-w-[22rem]" : "px-6 py-6 w-full min-w-0"
+      )}
+      style={{ background: paletteOf(first).solid, color: paletteOf(first).ink }}
+    >
+      <span
+        aria-hidden="true"
+        className="absolute inset-0"
+        style={{ background: "radial-gradient(120% 90% at 50% 0%, oklch(1 0 0 / .14), transparent 62%)" }}
+      />
+      <span className={cn("relative flex flex-col items-center gap-3", !stage && "min-w-0 max-w-full")}>
+        <AvatarBubble avatar={first.avatar} size={stage ? 96 : 56} />
+        <span
+          className={cn(
+            "font-display font-bold leading-none",
+            stage ? "text-stage-name" : "text-title2 truncate max-w-full"
+          )}
+        >
+          {first.name}
+        </span>
+        <span
+          className={cn(
+            "nums font-bold leading-none",
+            stage ? "text-stage-q-sm" : "text-title1"
+          )}
+        >
+          <NumberTicker value={first.score} />
+        </span>
+        <span className="text-caption2 font-semibold uppercase track-label opacity-70">
+          Winner
+        </span>
+      </span>
+    </motion.div>
   );
 }
 
@@ -124,7 +153,10 @@ function RunnerUp({
       transition={{ ...spring.default, delay }}
       className={cn(
         "self-end rounded-xl bg-surface-1 shadow-elev-1 flex flex-col items-center text-center gap-2",
-        stage ? "px-8 py-6 min-w-[15rem]" : "px-5 py-4 min-w-[8rem]"
+        // The phone card has no minimum width: it is one of two in a grid
+        // that already divides whatever the screen has, and `min-w-0` is
+        // what lets the name truncate instead of pushing the grid wider.
+        stage ? "px-8 py-6 min-w-[15rem]" : "px-4 py-4 min-w-0 self-stretch"
       )}
     >
       <span className="nums text-caption font-bold uppercase track-label text-ink-subtle">

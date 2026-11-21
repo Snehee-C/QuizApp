@@ -16,6 +16,7 @@ import { registerQaHandlers } from "./qa.js";
 import { filterNickname, filterText, type FilterMode } from "../services/contentFilter.js";
 import { clampTimeScale } from "../timeScale.js";
 import { monoFromWall, withinNetworkGrace } from "../sessionClock.js";
+import { createThrottle } from "../coalesce.js";
 
 // In-memory live state per active session (keyed by joinCode).
 interface LiveSession {
@@ -437,6 +438,53 @@ function pushParticipants(io: Server, joinCode: string, s: LiveSession) {
   );
 }
 
+const LEADERBOARD_PUSH_MS = Number(process.env.LEADERBOARD_PUSH_MS ?? 500);
+
+/**
+ * "14 of 32 have answered" — the one fact about the room a phone that has
+ * already answered is allowed to hold while it waits.
+ *
+ * The stage has carried this count since the beginning; phones never got it,
+ * and a host-paced player spent the 15 seconds after answering reading "Hold
+ * tight" with no bound on it. Two integers and the slide they describe, and
+ * nothing else: no roster, no ids, no aggregate (which under some types is
+ * computed from the answer key, and which is why `results:updated` stays
+ * presenter-only). `total` is the slide's cohort — the people the early
+ * reveal is waiting for — so the two numbers agree with the one the stage
+ * closes the question on.
+ *
+ * Coalesced on the same window `leaderboard:updated` uses, for the same
+ * reason: this fires once per submission, and a full room answering at once
+ * is one frame's worth of news, not two hundred. The whole room receives it
+ * (host windows included — they already hold more), through `io.to`, which
+ * is the same recipient set `participant:count` uses.
+ */
+async function emitAnsweredCount(io: Server, joinCode: string, s: LiveSession, slideId: string) {
+  // One row per (participant, slide), so a count is a distinct count.
+  const answered = await prisma.response.count({ where: { sessionId: s.sessionId, slideId } });
+  const cohort = s.slideCohort.slideId === slideId ? s.slideCohort.ids.size : s.participants.size;
+  // A phone that answered and then dropped its socket is in `answered` and
+  // may have left the connected set; the number is never allowed to read
+  // "5 of 4".
+  const total = Math.max(cohort, answered);
+  io.to(joinCode).emit("answered:count", { slideId, answered, total });
+}
+
+const answeredPushes = createThrottle<{ io: Server; joinCode: string; s: LiveSession; slideId: string }>(
+  LEADERBOARD_PUSH_MS,
+  (_key, { io, joinCode, s, slideId }) => {
+    emitAnsweredCount(io, joinCode, s, slideId).catch((err) =>
+      console.error("[answered:count] failed to notify room", s.sessionId, err)
+    );
+  }
+);
+
+/** Fire-and-forget, coalesced. Host-paced rooms only — a self-paced deck has no shared slide to count against. */
+function pushAnsweredCount(io: Server, joinCode: string, s: LiveSession, slideId: string) {
+  if (s.pacing !== "PRESENTER") return;
+  answeredPushes.push(s.sessionId, { io, joinCode, s, slideId });
+}
+
 // Socket.IO JSON-encodes every payload, so `NaN` and `Infinity` arrive here as
 // `null` — and `Number(null) === 0`. A `Number.isFinite` guard therefore never
 // ran for the exact values it was written for: the intended no-op became
@@ -671,7 +719,6 @@ async function computeLeaderboard(s: LiveSession, limit = PUBLIC_LEADERBOARD_LIM
 // show, a navigation, a resumed stage — passes `immediate` and is therefore
 // exact. The only thing a window can ever delay is a mid-answering refresh
 // that the next push supersedes anyway.
-const LEADERBOARD_PUSH_MS = Number(process.env.LEADERBOARD_PUSH_MS ?? 500);
 const leaderboardPushes = new Map<
   string,
   { lastAt: number; timer: ReturnType<typeof setTimeout> | null; pending: LeaderboardEntryRow[] | null }
@@ -721,6 +768,9 @@ function cancelLeaderboardPush(s: LiveSession) {
   const st = leaderboardPushes.get(s.sessionId);
   if (st?.timer) clearTimeout(st.timer);
   leaderboardPushes.delete(s.sessionId);
+  // The answered count rides the same lifecycle: nothing to count once the
+  // deck has ended or the room is gone.
+  answeredPushes.cancel(s.sessionId);
 }
 
 /**
@@ -799,6 +849,12 @@ async function emitSessionEnded(
       entries,
       myRank: mine?.rank ?? null,
       myScore: mine?.score ?? null,
+      // How many people `myRank` is a rank among. A bare `#11` is a ranking;
+      // `#11 of 34` is a result (PULSE T5). It is the length of the board the
+      // rank was computed over — everyone who scored — so the two numbers
+      // cannot disagree about who counts. A scalar about the room, not about
+      // anybody in it; it leaks nothing.
+      totalPlayers: fullEntries.length,
     });
   }
 }
@@ -2183,6 +2239,49 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     cb?.({ ok: true, entries: stageEntries });
   });
 
+  // ---- Participant: is this code a room I can walk into? ----
+  //
+  // The join used to be the first thing that could say "Invalid code", and it
+  // is gated on the nickname — so a wrong digit was discovered two screens
+  // later, on a dead-end screen whose one button landed on an EMPTY field
+  // (UX-PLAN 3.1). This answers the question the moment the code is typed,
+  // with nothing more than the title to put over the nickname field.
+  //
+  // It is a read, so it seats nobody and writes nothing, and it reveals
+  // nothing `participant:join` would not: the same three refusals, the same
+  // budget. A BAD_CODE here is charged exactly as a BAD_CODE there (it is the
+  // one shape that looks like somebody walking the code space), so a phone
+  // cannot use this to enumerate codes more cheaply than it could already.
+  // `participant:join` keeps every check it has — defence in depth, and the
+  // QR path never comes through here at all.
+  socket.on("session:peek", async ({ joinCode, participantId }, cb) => {
+    const ip = clientIp(socket);
+    if (tooManyJoinFailures(ip, participantId)) {
+      return reject(cb, "RATE_LIMITED", "Too many attempts. Try again in a minute.");
+    }
+    const s = await loadLive(joinCode);
+    if (!s) {
+      recordJoinFailure(ip, participantId, true);
+      return reject(cb, "BAD_CODE", "Invalid code");
+    }
+    if (s.status === "ENDED") {
+      recordJoinFailure(ip, participantId, false);
+      return reject(cb, "SESSION_ENDED", "Session has ended");
+    }
+    // The title is a courtesy, not a contract: the room is real without it.
+    let title: string | undefined;
+    try {
+      const row = await prisma.presentation.findUnique({
+        where: { id: s.presentationId },
+        select: { title: true },
+      });
+      title = row?.title ?? undefined;
+    } catch {
+      /* the peek still answers */
+    }
+    cb?.({ ok: true, status: s.status, title });
+  });
+
   // ---- Participant: join by code ----
   socket.on("participant:join", async ({ joinCode, participantId, name, avatar }, cb) => {
     const ip = clientIp(socket);
@@ -2231,6 +2330,9 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
             // null, not an invented last place (matching `emitSessionEnded`).
             myRank: i >= 0 ? i + 1 : null,
             myScore: i >= 0 ? fullEntries[i].score : null,
+            // Same shape as `session:ended`, same reason (FLOW §6.4): a reload
+            // on the podium must come back to the same screen, "of 34" included.
+            totalPlayers: fullEntries.length,
           });
         } catch {
           // The board is a courtesy on a refusal path. If it cannot be built,
@@ -2379,6 +2481,12 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       index: idx,
       currentSlide: current,
       totalSlides: s.slides.length,
+      // The name the ROOM will see, after the cap and the filter above. The
+      // phone used to say "You're in, Dave" while the wall said "Anonymous",
+      // with nothing on the phone to explain it — the only copy of the stored
+      // name was in the roster. Echoed so the phone can say what was understood
+      // (PULSE T6: the normalisation is shown).
+      name: identity.name,
       startedAt: s.currentSlideStartedAt,
       // Paired with `startedAt` everywhere it appears — see `slide:changed`.
       // On this ack in particular it is what lets a phone that has just
@@ -2735,6 +2843,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     }
 
     await emitResults(io, joinCode, slideId);
+    pushAnsweredCount(io, joinCode, s, slideId);
 
     if (isTimed(slide.type, slide.config)) {
       // Single leaderboard query, reused for both this participant's ack and

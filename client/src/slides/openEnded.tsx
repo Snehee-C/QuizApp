@@ -13,8 +13,15 @@ function OEEditor(_: EditorProps) {
   );
 }
 
+/** Server-enforced too — mirrored so the counter is honest. */
+const MAX_LEN = 500;
+
 function OEPlayer({ onSubmit, disabled }: PlayerProps) {
   const [text, setText] = useState("");
+  // The same "{n} left" the Q&A composer shows at 280: one spelling of one
+  // decision (DESIGN.md P1). A 500-character box with no counter was the
+  // other spelling.
+  const remaining = MAX_LEN - text.length;
   return (
     <form
       className="w-full flex flex-col gap-3"
@@ -27,13 +34,18 @@ function OEPlayer({ onSubmit, disabled }: PlayerProps) {
         className="w-full bg-surface-2 text-ink placeholder:text-ink-subtle rounded-md px-4 py-3.5 min-h-[128px] text-body shadow-line outline-none focus:shadow-[var(--line),var(--focus)] transition-shadow duration-fast resize-none"
         placeholder="Type your answer…"
         value={text}
-        maxLength={500}
+        maxLength={MAX_LEN}
         aria-label="Your answer"
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => setText(e.target.value.slice(0, MAX_LEN))}
       />
-      <Button type="submit" variant="primary" size="lg" disabled={!text.trim() || disabled}>
-        Send
-      </Button>
+      <div className="flex items-center justify-between gap-3">
+        <span className="nums text-footnote text-ink-subtle" aria-live="polite">
+          {remaining} left
+        </span>
+        <Button type="submit" variant="primary" size="lg" disabled={!text.trim() || disabled}>
+          Send
+        </Button>
+      </div>
     </form>
   );
 }

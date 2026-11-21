@@ -7,12 +7,14 @@ import { Input, Card, Label } from "../components/ui/Card";
 import { Shape } from "../components/ui/Shape";
 import { slotFor } from "../lib/answers";
 import { cn } from "../lib/cn";
+import { insertAt, removeAt } from "../lib/listEdit";
+import { TimeLimitField } from "../components/TimeLimitField";
 import { AnsweredEcho, EchoOption, asIndexList } from "./answeredEcho";
 
 // Multiple choice — also serves as "Quiz: select answer" when config.isQuiz is
 // on, which is how Mentimeter models it too.
 
-function MCEditor({ config, onChange, onReplace }: EditorProps) {
+function MCEditor({ config, onChange, onReplace, onRemove }: EditorProps) {
   const options: string[] = config.options ?? [];
   // Out-of-range entries are dropped on the way IN, not just on the way out.
   // A stored key of `[7]` against two options — the exact config round 8 ran
@@ -30,12 +32,30 @@ function MCEditor({ config, onChange, onReplace }: EditorProps) {
     onChange({ options: next });
   }
 
+  // Dropping an option must also drop it from the answer key and shift every
+  // index above it down, or the key silently points at the wrong option —
+  // and putting it back must do the exact inverse, including its own tick.
   function removeOption(i: number) {
-    const next = options.filter((_, j) => j !== i);
-    // Dropping an option must also drop it from the answer key and shift every
-    // index above it down, or the key silently points at the wrong option.
-    const nextCorrect = correct.filter((x) => x !== i).map((x) => (x > i ? x - 1 : x));
-    onChange({ options: next, correctIndices: nextCorrect });
+    setDraft(null);
+    const removed = options[i];
+    const wasCorrect = correct.includes(i);
+    const apply = (c: any) => ({
+      ...c,
+      options: removeAt(c.options ?? [], i),
+      correctIndices: ((c.correctIndices ?? []) as number[])
+        .filter((x) => x !== i)
+        .map((x) => (x > i ? x - 1 : x)),
+    });
+    const restore = (c: any) => {
+      const shifted = ((c.correctIndices ?? []) as number[]).map((x) => (x >= i ? x + 1 : x));
+      return {
+        ...c,
+        options: insertAt(c.options ?? [], i, removed),
+        correctIndices: wasCorrect ? [...shifted, i].sort((a, b) => a - b) : shifted,
+      };
+    };
+    if (onRemove) onRemove({ label: `option ${slotFor(i).letter}`, apply, restore });
+    else onChange(apply(config));
   }
 
   return (
@@ -152,21 +172,11 @@ function MCEditor({ config, onChange, onReplace }: EditorProps) {
         </label>
 
         {config.isQuiz && (
-          <div className="flex items-center gap-3">
-            <Label className="mb-0" htmlFor="mc-tl">
-              Time limit
-            </Label>
-            <Input
-              id="mc-tl"
-              type="number"
-              min={5}
-              max={120}
-              className="nums w-24 h-9"
-              value={config.timeLimitSec ?? 20}
-              onChange={(e) => onChange({ timeLimitSec: Number(e.target.value) })}
-            />
-            <span className="text-footnote text-ink-subtle">seconds</span>
-          </div>
+          <TimeLimitField
+            id="mc-tl"
+            value={config.timeLimitSec}
+            onCommit={(timeLimitSec) => onChange({ timeLimitSec })}
+          />
         )}
       </Card>
     </>
@@ -177,6 +187,8 @@ function MCPlayer({ slide, onSubmit, disabled, value }: PlayerProps) {
   const options: string[] = slide.config?.options ?? [];
   const allowMultiple = !!slide.config?.allowMultiple;
   const [picked, setPicked] = useState<number[]>([]);
+  // Single-select: the option whose submit is in flight or accepted.
+  const [sent, setSent] = useState<number | null>(null);
 
   // Reconnected with an answer already banked: show which option(s) went, not
   // a board of live tiles. Indices are filtered against the CURRENT options —
@@ -195,14 +207,33 @@ function MCPlayer({ slide, onSubmit, disabled, value }: PlayerProps) {
 
   if (!allowMultiple) {
     return (
-      <div className="flex flex-col gap-3 w-full h-full justify-center">
+      <div className={cn("flex flex-col w-full h-full justify-center", options.length >= 5 ? "gap-2" : "gap-3")}>
         {options.map((opt, i) => (
           <AnswerTile
             key={i}
             index={i}
             label={opt}
-            disabled={disabled}
-            onClick={() => onSubmit(i)}
+            // Optimistic. The tapped tile goes `chosen` in the same commit as
+            // the tap, before the emit — the eye is on the thumb, and the
+            // only feedback used to be a 13px strip 200px away, after the
+            // round trip (PULSE T1). The rest of the board locks so a second
+            // tap cannot silently replace the first; it unlocks only if the
+            // server refuses, and the shell shows why.
+            state={sent === i ? "chosen" : "idle"}
+            disabled={disabled || (sent !== null && sent !== i)}
+            // Five or six options have to share a 375×667 phone with the
+            // question and one footer pill — see `dense` on AnswerTile.
+            dense={options.length >= 5}
+            onClick={() => {
+              if (sent !== null) return;
+              setSent(i);
+              const verdict = onSubmit(i);
+              if (verdict && typeof (verdict as Promise<boolean>).then === "function") {
+                void (verdict as Promise<boolean>).then((ok) => {
+                  if (ok === false) setSent(null);
+                });
+              }
+            }}
           />
         ))}
       </div>
@@ -258,6 +289,9 @@ function MCReveal({ slide, reveal }: RevealProps) {
           index={i}
           label={opt}
           state={correctSet.has(i) ? "correct" : "wrong"}
+          // Same density as the board they just answered on, so the reveal
+          // keeps the player's own verdict beneath it within reach.
+          dense={options.length >= 5}
         />
       ))}
     </div>

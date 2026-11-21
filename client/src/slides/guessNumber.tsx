@@ -5,6 +5,7 @@ import { Button } from "../components/ui/Button";
 import { Card, Input, Label } from "../components/ui/Card";
 import { ease, spring, STAGGER } from "../lib/motion";
 import { cn } from "../lib/cn";
+import { TimeLimitField } from "../components/TimeLimitField";
 import { AnsweredEcho, asNumber } from "./answeredEcho";
 
 // Guess the number — everyone submits a number, closest to the target wins.
@@ -76,20 +77,12 @@ function GNEditor({ config, onChange }: EditorProps) {
           : "Only the exact value scores. Raise the tolerance to accept a range."}
       </p>
 
-      <Card level={0} className="px-5 py-4 flex items-center gap-3">
-        <Label className="mb-0" htmlFor="gn-tl">
-          Time limit
-        </Label>
-        <Input
+      <Card level={0} className="px-5 py-4">
+        <TimeLimitField
           id="gn-tl"
-          type="number"
-          min={5}
-          max={120}
-          className="nums w-24 h-9"
-          value={config.timeLimitSec ?? 20}
-          onChange={(e) => onChange({ timeLimitSec: Number(e.target.value) })}
+          value={config.timeLimitSec}
+          onCommit={(timeLimitSec) => onChange({ timeLimitSec })}
         />
-        <span className="text-footnote text-ink-subtle">seconds</span>
       </Card>
     </>
   );

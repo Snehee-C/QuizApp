@@ -5,6 +5,7 @@ import { FitText } from "../components/ui/FitText";
 import { Button } from "../components/ui/Button";
 import { Input, Label } from "../components/ui/Card";
 import { STAGGER_LG, spring } from "../lib/motion";
+import { insertAt, removeAt } from "../lib/listEdit";
 
 // Content slides — the non-interactive half of a deck.
 //
@@ -110,7 +111,7 @@ export const contentHeading: SlideTypeDef = {
 
 const MAX_BULLETS = 6;
 
-function BulletsEditor({ config, onChange }: EditorProps) {
+function BulletsEditor({ config, onChange, onRemove }: EditorProps) {
   const bullets: string[] = config.bullets ?? [];
   // Typing is buffered locally and committed on blur: every keystroke in this
   // panel otherwise round-trips a save for the whole slide.
@@ -152,7 +153,14 @@ function BulletsEditor({ config, onChange }: EditorProps) {
             <button
               onClick={() => {
                 setDraft(null);
-                onChange({ bullets: bullets.filter((_, j) => j !== i) });
+                const removed = bullets[i];
+                const apply = (c: any) => ({ ...c, bullets: removeAt(c.bullets ?? [], i) });
+                const restore = (c: any) => ({
+                  ...c,
+                  bullets: insertAt(c.bullets ?? [], i, removed),
+                });
+                if (onRemove) onRemove({ label: `bullet ${i + 1}`, apply, restore });
+                else onChange(apply(config));
               }}
               disabled={bullets.length <= 1}
               aria-label={`Remove bullet ${i + 1}`}

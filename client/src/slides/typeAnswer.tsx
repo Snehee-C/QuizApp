@@ -5,6 +5,8 @@ import { Button } from "../components/ui/Button";
 import { Card, Input, Label } from "../components/ui/Card";
 import { ease, spring, STAGGER_LG } from "../lib/motion";
 import { cn } from "../lib/cn";
+import { insertAt, removeAt } from "../lib/listEdit";
+import { TimeLimitField } from "../components/TimeLimitField";
 
 // Quiz: type answer — free text graded against a list of accepted spellings.
 //
@@ -25,7 +27,7 @@ function normalize(s: string, caseSensitive: boolean): string {
   return caseSensitive ? collapsed : collapsed.toLocaleLowerCase();
 }
 
-function TAEditor({ config, onChange }: EditorProps) {
+function TAEditor({ config, onChange, onRemove }: EditorProps) {
   const accepted: string[] = Array.isArray(config.acceptedAnswers) ? config.acceptedAnswers : [""];
   // Typing is held locally and committed on blur, so a keystroke doesn't fire
   // a save per character (same pattern as multipleChoice's options list).
@@ -62,7 +64,16 @@ function TAEditor({ config, onChange }: EditorProps) {
               <button
                 onClick={() => {
                   setDraft(null);
-                  onChange({ acceptedAnswers: accepted.filter((_, j) => j !== i) });
+                  const removed = accepted[i];
+                  const list = (c: any): string[] =>
+                    Array.isArray(c.acceptedAnswers) ? c.acceptedAnswers : [""];
+                  const apply = (c: any) => ({ ...c, acceptedAnswers: removeAt(list(c), i) });
+                  const restore = (c: any) => ({
+                    ...c,
+                    acceptedAnswers: insertAt(list(c), i, removed),
+                  });
+                  if (onRemove) onRemove({ label: `accepted answer ${i + 1}`, apply, restore });
+                  else onChange(apply(config));
                 }}
                 disabled={accepted.length <= 1}
                 aria-label={`Remove accepted answer ${i + 1}`}
@@ -109,21 +120,11 @@ function TAEditor({ config, onChange }: EditorProps) {
           </span>
         </label>
 
-        <div className="flex items-center gap-3">
-          <Label className="mb-0" htmlFor="ta-tl">
-            Time limit
-          </Label>
-          <Input
-            id="ta-tl"
-            type="number"
-            min={5}
-            max={120}
-            className="nums w-24 h-9"
-            value={config.timeLimitSec ?? 20}
-            onChange={(e) => onChange({ timeLimitSec: Number(e.target.value) })}
-          />
-          <span className="text-footnote text-ink-subtle">seconds</span>
-        </div>
+        <TimeLimitField
+          id="ta-tl"
+          value={config.timeLimitSec}
+          onCommit={(timeLimitSec) => onChange({ timeLimitSec })}
+        />
       </Card>
     </>
   );

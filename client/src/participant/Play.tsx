@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { motion, AnimatePresence } from "motion/react";
 import {
@@ -30,7 +30,15 @@ import {
   useConnection,
 } from "../lib/connection";
 import { noteServerNow, serverNow, startClockSync } from "../lib/serverClock";
-import { initSound, playSound, unlockAudio } from "../lib/sound";
+import {
+  initSound,
+  isMuted,
+  playSound,
+  subscribeMuted,
+  toggleMuted,
+  unlockAudio,
+} from "../lib/sound";
+import { peekSession, type JoinState } from "./joinCode";
 import { burstFrom } from "../lib/confetti";
 import { cn } from "../lib/cn";
 
@@ -78,6 +86,25 @@ interface LobbyParticipant {
 // the atmospheric wash that sits on top of it.
 const PHONE_SHELL =
   "h-[100dvh] w-full flex flex-col bg-canvas text-ink overflow-hidden";
+
+// The bottom-most element on every phone screen pads for the home indicator.
+// `viewport-fit=cover` (index.html) is what makes the inset non-zero on a
+// notched phone; before it the only use of the inset sat on the reaction bar,
+// which was not the last element anyway (UX-PLAN 2.5). 16px of ordinary
+// padding plus whatever the hardware asks for.
+const SAFE_BOTTOM: React.CSSProperties = {
+  paddingBottom: "calc(var(--s-4) + env(safe-area-inset-bottom, 0px))",
+};
+
+// `justify-content: safe center`. A centred, scrollable column clips its
+// block-start overflow — option A on a six-option slide was unreachable by
+// scrolling (UX-PLAN 2.3). `safe` falls back to start alignment the moment
+// the content is taller than the box. Inline because Tailwind 3 has no
+// utility for the keyword; a browser that does not know it ignores the
+// declaration and gets start alignment, which is also reachable.
+const SAFE_CENTER: React.CSSProperties = { justifyContent: "safe center" };
+
+type Tab = "answer" | "qa";
 
 // The player's seat in a room, persisted across reloads.
 //
@@ -175,6 +202,21 @@ export default function Play() {
   // turned back into an identity to join as.
   const myPkey = useRef<string | null>(null);
   const [name, setName] = useState(getNickname());
+  // The name the ROOM sees — the join ack's `name`, after the server's cap
+  // and filter. Kept apart from `name` on purpose: `name` is what this
+  // phone SENDS, and it is an effect dependency, so writing the server's
+  // answer into it would re-emit the join on every ack (UX-PLAN 3.4).
+  const [roomName, setRoomName] = useState<string | null>(null);
+  // The nickname gate, reached a second time from the lobby's "Change name".
+  const [renaming, setRenaming] = useState(false);
+  // Is this code a room at all? Checked BEFORE the nickname is asked for, so
+  // a wrong digit never costs the player a name they typed — and the check
+  // is skipped entirely for a phone with a seat, whose reload path must stay
+  // byte-identical (UX-PLAN 3.1).
+  const [gate, setGate] = useState<"checking" | "ready">(() =>
+    !!getNickname() && hasSeat(code) ? "ready" : "checking"
+  );
+  const [roomTitle, setRoomTitle] = useState<string | undefined>(undefined);
   // Restored from the persisted seat, so a reload re-enters the room instead
   // of rendering the join gate over a live question (B4). A seat without a
   // nickname is not enough — we would re-join as "Anonymous".
@@ -200,7 +242,7 @@ export default function Play() {
   // rows and the server sends each phone two scalars about itself instead.
   // Before this, everyone who finished 11th or below reached their own podium
   // and was told nothing at all about how they had done.
-  const [myFinal, setMyFinal] = useState<{ rank: number; score: number } | null>(null);
+  const [myFinal, setMyFinal] = useState<{ rank: number; score: number; total: number | null } | null>(null);
   // Set only while the presenter has the leaderboard "on screen" — mirrors
   // the big-screen moment onto every phone at the same instant.
   const [leaderboardView, setLeaderboardView] = useState<BoardRow[] | null>(null);
@@ -259,7 +301,18 @@ export default function Play() {
   const [index, setIndex] = useState(0);
   const [totalSlides, setTotalSlides] = useState(0);
   // A phone-sized bottom sheet: answering, asking questions, or reacting.
-  const [tab, setTab] = useState<"answer" | "qa">("answer");
+  const [tab, setTab] = useState<Tab>("answer");
+  // The reaction bar and the tablist, during a live question, fold into one
+  // pill; this is whether the player has unfolded them (UX-PLAN 2.4). Reset
+  // on every slide, so each question starts with the thumb zone clear.
+  const [chromeOpen, setChromeOpen] = useState(false);
+  // "14 of 32 have answered" — the server's coalesced count for the slide on
+  // screen, host-paced decks only. Null until the first answer of a slide.
+  const [roomProgress, setRoomProgress] = useState<{
+    slideId: string;
+    answered: number;
+    total: number;
+  } | null>(null);
   // The self-paced clock has run out. Measured: at that point the server stops
   // awarding the speed half and the question stays open and answerable.
   const [speedExpired, setSpeedExpired] = useState(false);
@@ -355,7 +408,11 @@ export default function Play() {
           // refusal bare, still reaches the ending rather than an error.
           if (Array.isArray(res.entries)) setFinalEntries(res.entries);
           if (typeof res.myRank === "number") {
-            setMyFinal({ rank: res.myRank, score: res.myScore ?? 0 });
+            setMyFinal({
+              rank: res.myRank,
+              score: res.myScore ?? 0,
+              total: typeof res.totalPlayers === "number" ? res.totalPlayers : null,
+            });
           }
           setEnded(true);
           return;
@@ -367,6 +424,9 @@ export default function Play() {
       // Before any board is applied below: `roomSawStandings` runs off this.
       // A server that predates it leaves us on the id comparison (`isMyRow`).
       myPkey.current = typeof res.myPkey === "string" ? res.myPkey : null;
+      // What the wall will call this player. A server that predates the
+      // field leaves it unset and the lobby simply says nothing extra.
+      if (typeof res.name === "string" && res.name) setRoomName(res.name);
       setStatus(res.status);
       setTotalSlides(res.totalSlides ?? 0);
       const nextPacing = res.pacing === "AUDIENCE" ? "AUDIENCE" : "PRESENTER";
@@ -581,6 +641,14 @@ export default function Play() {
       setAnswered(false);
       setMyAnswer(null);
       setSubmitError("");
+      // The Q&A tab was a one-way door: `setTab` was written only by the
+      // tablist and by the self-paced `goto`, so a host-paced player who
+      // tapped it once saw no further questions all session and scored zero
+      // (UX-PLAN 2.1). A new slide is the room asking for an answer, so the
+      // phone comes back to the answer — and the per-slide chrome resets.
+      setTab("answer");
+      setChromeOpen(false);
+      setRoomProgress(null);
     };
 
     const onReveal = (payload: any) => {
@@ -595,6 +663,9 @@ export default function Play() {
         if (slide && payload.slideId === slide.id) {
           const next = { raw: payload ?? {}, aggregate: payload?.aggregate };
           setReveal(next);
+          // The reveal is the room's moment; a phone on the Q&A tab is pulled
+          // back to it the way a new slide pulls it back (UX-PLAN 2.1).
+          setTab("answer");
           // Kept for the self-paced walk-back, same reason as the answer: the
           // `participant:goto` ack carries no reveal, so a revisited slide
           // would otherwise say "answer coming up" about an answer this player
@@ -651,6 +722,17 @@ export default function Play() {
     };
 
     const onCount = (payload: any) => setParticipants(payload?.participants ?? []);
+    // Two integers about the room, coalesced server-side; kept only when
+    // they describe the slide this phone is on, so a late frame for the
+    // previous question cannot put its numbers under this one.
+    const onAnswered = (payload: any) => {
+      const slide = currentSlideRef.current;
+      if (!slide || payload?.slideId !== slide.id) return;
+      const answered = Number(payload.answered);
+      const total = Number(payload.total);
+      if (!Number.isFinite(answered) || !Number.isFinite(total)) return;
+      setRoomProgress({ slideId: slide.id, answered, total });
+    };
     const onLeaderboardShow = (payload: any) => {
       const entries: BoardRow[] = payload.entries ?? [];
       setLeaderboardView(entries);
@@ -665,7 +747,13 @@ export default function Play() {
       // server leaves the fields off entirely, and that falls back below.
       setMyFinal(
         typeof payload?.myRank === "number"
-          ? { rank: payload.myRank, score: payload.myScore ?? 0 }
+          ? {
+              rank: payload.myRank,
+              score: payload.myScore ?? 0,
+              // "#11 of 34". Null on a server that predates it; the screen
+              // then shows the bare rank it always showed.
+              total: typeof payload.totalPlayers === "number" ? payload.totalPlayers : null,
+            }
           : null
       );
     };
@@ -673,6 +761,7 @@ export default function Play() {
     socket.on("slide:changed", onSlideChanged);
     socket.on("slide:reveal", onReveal);
     socket.on("participant:count", onCount);
+    socket.on("answered:count", onAnswered);
     socket.on("leaderboard:show", onLeaderboardShow);
     socket.on("leaderboard:hide", onLeaderboardHide);
     socket.on("session:ended", onEnded);
@@ -686,6 +775,7 @@ export default function Play() {
       socket.off("slide:changed", onSlideChanged);
       socket.off("slide:reveal", onReveal);
       socket.off("participant:count", onCount);
+      socket.off("answered:count", onAnswered);
       socket.off("leaderboard:show", onLeaderboardShow);
       socket.off("leaderboard:hide", onLeaderboardHide);
       socket.off("session:ended", onEnded);
@@ -758,6 +848,34 @@ export default function Play() {
   useEffect(() => {
     initSound({ role: "participant" });
   }, []);
+
+  // Validate the code before asking for a name. A refusal goes back to `/join`
+  // with the code AND the reason, so the error lands next to the digits that
+  // caused it instead of on a dead-end screen whose one button emptied the
+  // field. `UNREACHABLE` — no answer, or a server that predates the event —
+  // is not the player's fault and not a verdict on the code, so the gate
+  // opens anyway and `participant:join` keeps every check it has.
+  useEffect(() => {
+    if (joined || gate !== "checking") return;
+    let alive = true;
+    peekSession(code ?? "").then((res) => {
+      if (!alive) return;
+      if (res.ok) {
+        setRoomTitle(res.title);
+        setGate("ready");
+        return;
+      }
+      if (res.code === "UNREACHABLE") {
+        setGate("ready");
+        return;
+      }
+      const state: JoinState = { code, error: res.code };
+      navigate("/join", { replace: true, state });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [joined, gate, code, navigate]);
 
   // When a self-paced countdown reaches zero, say what that actually meant.
   //
@@ -840,15 +958,18 @@ export default function Play() {
     return () => window.clearInterval(id);
   }, [joined, queued, connectionStatus]);
 
-  function submit(value: unknown) {
+  // Resolves `true` once the server accepted the answer, `false` when it was
+  // refused or abandoned — so a module that has already drawn the pick on the
+  // tile (multipleChoice) knows whether to leave it there. It never rejects.
+  function submit(value: unknown): Promise<boolean> {
     // `answered` is the reconnect lock (M7). The server upserts responses, so
     // without it one stray tap on a resumed phone rewrites an already-scored
     // answer as a fresh, late, zero-point one.
-    if (!currentSlide || reveal || answered) return;
+    if (!currentSlide || reveal || answered) return Promise.resolve(false);
     setSubmitError("");
     // Queued and retried if the socket is down — venue Wi-Fi drops constantly,
     // and a silently lost answer is the worst possible failure for a player.
-    submitWithRetry(
+    return submitWithRetry(
       getSocket(),
       "participant:submit",
       {
@@ -861,14 +982,14 @@ export default function Play() {
     ).then((res: any) => {
       // Abandoned before it ever reached the server — the slide moved on, or
       // the player tapped a different answer for this same slide.
-      if (!res) return;
+      if (!res) return false;
       if (res.error) {
         // Never swallowed. A rejected answer that produces no visible change
         // is indistinguishable from a dead screen, and the player has no way
         // to know their answer is not counting. The strip is suppressed once
         // the reveal lands — by then the reveal itself is the explanation.
         setSubmitError(res.error);
-        return;
+        return false;
       }
       // Under host pacing, before the reveal, this ack is now `{ ok, isQuiz }`
       // and nothing else — the verdict is embargoed on the WIRE rather than
@@ -891,16 +1012,34 @@ export default function Play() {
       if (res.isQuiz && typeof res.correct === "boolean") {
         playSound(res.correct ? "correct" : "wrong");
       }
+      return true;
     });
   }
 
   if (!joined) {
+    if (gate === "checking") {
+      return (
+        <div className={cn(PHONE_SHELL, "items-center justify-center px-6 text-center")}>
+          <Bloom />
+          <p className="relative z-10 text-subhead text-ink-subtle" role="status">
+            Checking your code…
+          </p>
+        </div>
+      );
+    }
     return (
       <NicknameGate
         initialName={name}
+        roomTitle={roomTitle}
+        renaming={renaming}
+        onCancel={renaming ? () => {
+          setRenaming(false);
+          setJoined(true);
+        } : undefined}
         onJoin={(n) => {
           setNickname(n);
           setName(n);
+          setRenaming(false);
           // Persisted before the emit: the seat is what makes a reload land
           // back in the room instead of here (B4).
           takeSeat(code);
@@ -920,7 +1059,7 @@ export default function Play() {
     // top ten, so it is the fallback and not the source.
     const myPlace =
       myFinal ??
-      (mine ? { rank: finalEntries.indexOf(mine) + 1, score: mine.score } : null);
+      (mine ? { rank: finalEntries.indexOf(mine) + 1, score: mine.score, total: null } : null);
     return (
       <SessionEnded
         entries={finalEntries}
@@ -947,7 +1086,9 @@ export default function Play() {
           className="relative z-10"
           onClick={() => {
             leaveSeat();
-            navigate("/join");
+            // The digits travel back with them (UX-PLAN 3.1).
+            const state: JoinState = { code };
+            navigate("/join", { state });
           }}
         >
           Try another code
@@ -986,7 +1127,28 @@ export default function Play() {
   }
 
   if (status === "LOBBY" || !currentSlide) {
-    return <Lobby name={name} code={code ?? ""} participants={participants} />;
+    return (
+      <Lobby
+        name={roomName ?? name}
+        typedName={name}
+        code={code ?? ""}
+        participantId={participantId.current}
+        participants={participants}
+        tab={tab}
+        onTab={setTab}
+        onRename={() => {
+          setRenaming(true);
+          setJoined(false);
+        }}
+        onLeave={() => {
+          // F2: leaving is not ending. The seat is released so a reload does
+          // not re-enter a room the player walked out of; the socket's own
+          // disconnect is what takes them off the wall.
+          leaveSeat();
+          navigate("/join");
+        }}
+      />
+    );
   }
 
   // What rank, if any, this player may be shown right now. See the embargo
@@ -1012,6 +1174,16 @@ export default function Play() {
   // A countdown is an invitation to answer. Anyone already locked in — this
   // round or before a reconnect — must not be watching one tick down.
   const showTimer = isQuiz && !feedback && !reveal && !answered && !speedExpired;
+  // Is the room waiting on THIS phone for an answer? While it is, the thumb
+  // zone belongs to the answer and to nothing else (PULSE T4): the reaction
+  // bar and the tablist fold into one pill, and unfold at the reveal — which
+  // is when a reaction is worth something anyway — or once this player has
+  // answered. Any slide with an input counts, timed or not: a six-option poll
+  // needs the space as much as a six-option quiz does.
+  const live = !!slideType(currentSlide.type)?.Player && !answered && !feedback && !reveal;
+  const chromeCollapsed = live && !chromeOpen && tab === "answer";
+  // The count under the holding card, only while it describes this slide.
+  const progress = roomProgress?.slideId === currentSlide.id ? roomProgress : null;
 
   return (
     <div className={PHONE_SHELL}>
@@ -1037,9 +1209,7 @@ export default function Play() {
               {index + 1} of {totalSlides}
             </p>
           )}
-          <p className="font-display font-bold text-body leading-snug text-ink-muted line-clamp-3">
-            {currentSlide.question}
-          </p>
+          <QuestionText key={currentSlide.id} text={currentSlide.question} />
           {speedExpired && isQuiz && !feedback && !reveal && !answered && (
             <p className="text-caption2 font-semibold uppercase track-label text-ink-subtle mt-1.5">
               Speed bonus used up — your answer still counts
@@ -1058,7 +1228,13 @@ export default function Play() {
         )}
       </header>
 
-      <div className="relative z-10 flex-1 min-h-0 flex flex-col justify-center px-4 pb-2 overflow-y-auto">
+      <div
+        role="tabpanel"
+        id={`phone-panel-${tab}`}
+        aria-labelledby={`phone-tab-${tab}`}
+        className="relative z-10 flex-1 min-h-0 flex flex-col px-4 pb-2 overflow-y-auto"
+        style={SAFE_CENTER}
+      >
         {tab === "qa" ? (
           <QaPanel joinCode={code ?? ""} participantId={participantId.current} name={name} />
         ) : (
@@ -1083,6 +1259,7 @@ export default function Play() {
                 feedback={feedback}
                 pacing={pacing}
                 rank={visibleRank}
+                progress={progress}
               />
             ) : answered ? (
               // Resumed onto a slide the server already has our answer for.
@@ -1093,6 +1270,7 @@ export default function Play() {
                 slide={currentSlide}
                 isQuiz={isQuiz}
                 myAnswer={myAnswer}
+                progress={progress}
               />
             ) : (
               <AnswerInput key={currentSlide.id} slide={currentSlide} onSubmit={submit} />
@@ -1122,7 +1300,7 @@ export default function Play() {
         </div>
       )}
 
-      <footer className="relative z-10 shrink-0 px-4 pb-4 pt-1 flex flex-col gap-2">
+      <footer className="relative z-10 shrink-0 px-4 pt-1 flex flex-col gap-2" style={SAFE_BOTTOM}>
         {/* The server's own words for why the answer did not count. Suppressed
             once the reveal is up: the reveal already says the window closed,
             and "Time's up" twice reads as a fault rather than a result. */}
@@ -1132,28 +1310,24 @@ export default function Play() {
           </p>
         )}
         <ConnectionBanner />
-        <ReactionBar joinCode={code ?? ""} />
-        <div className="flex gap-1.5" role="tablist" aria-label="Phone view">
-          {(
-            [
-              ["answer", "Answer"],
-              ["qa", "Ask a question"],
-            ] as const
-          ).map(([key, label]) => (
-            <button
-              key={key}
-              role="tab"
-              aria-selected={tab === key}
-              onClick={() => setTab(key)}
-              className={cn(
-                "flex-1 h-11 rounded-md text-subhead font-semibold transition-colors duration-fast",
-                tab === key ? "bg-surface-2 text-ink shadow-line" : "text-ink-subtle hover:text-ink"
-              )}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        {chromeCollapsed ? (
+          // One quiet 44px affordance in place of eight non-answer targets
+          // (six reactions, two tabs) while the question is live (UX-PLAN 2.4).
+          <button
+            type="button"
+            aria-expanded={false}
+            aria-controls="phone-chrome"
+            onClick={() => setChromeOpen(true)}
+            className="h-11 w-full rounded-md text-subhead font-semibold text-ink-subtle hover:text-ink transition-colors duration-fast press"
+          >
+            Reactions &amp; questions
+          </button>
+        ) : (
+          <div id="phone-chrome" className="flex flex-col gap-2">
+            <ReactionBar joinCode={code ?? ""} />
+            <PhoneTabs tab={tab} onChange={setTab} liveDot={live} />
+          </div>
+        )}
       </footer>
     </div>
   );
@@ -1161,10 +1335,18 @@ export default function Play() {
 
 function NicknameGate({
   initialName,
+  roomTitle,
+  renaming = false,
   onJoin,
+  onCancel,
 }: {
   initialName: string;
+  /** The deck's title from `session:peek`, when the check reached the server. */
+  roomTitle?: string;
+  /** Reached from the lobby's "Change name" rather than from the join. */
+  renaming?: boolean;
   onJoin: (name: string) => void;
+  onCancel?: () => void;
 }) {
   const [value, setValue] = useState(initialName);
   const av = avatarFor(getAvatarIndex());
@@ -1203,10 +1385,20 @@ function NicknameGate({
           </p>
         </div>
 
-        <h1 className="font-display text-large-title font-bold leading-none">
-          What should we call you?
-        </h1>
+        <div className="flex flex-col gap-2">
+          {roomTitle && !renaming && (
+            <p className="text-caption font-semibold uppercase track-label text-ink-subtle truncate">
+              Joining {roomTitle}
+            </p>
+          )}
+          <h1 className="font-display text-large-title font-bold leading-none">
+            {renaming ? "Change your name" : "What should we call you?"}
+          </h1>
+        </div>
 
+        {/* The same keyboard guards the answer field carries (typeAnswer.tsx):
+            autocorrect rewriting a proper noun here is projected on a wall.
+            Capitalisation is left to the keyboard — it is a name. */}
         <Input
           className="h-16 text-center text-title2 font-display font-bold rounded-lg"
           placeholder="Nickname"
@@ -1214,33 +1406,70 @@ function NicknameGate({
           onChange={(e) => setValue(e.target.value)}
           maxLength={24}
           autoFocus
+          autoComplete="nickname"
+          autoCorrect="off"
+          spellCheck={false}
+          enterKeyHint="go"
           aria-label="Your nickname"
         />
 
         <Button type="submit" variant="primary" size="xl" disabled={!value.trim()}>
-          Join the game
+          {renaming ? "Save name" : "Join the game"}
         </Button>
+        {onCancel && (
+          <Button type="button" variant="ghost" size="md" onClick={onCancel}>
+            Keep {initialName}
+          </Button>
+        )}
       </motion.form>
     </div>
   );
 }
 
+// The lobby used to be a dead room with no door: greeting, bubbles, a count
+// (UX-PLAN 4.4). Lobbies run 2–10 minutes and are where Q&A is MOST useful,
+// so reactions and the question tab mount here too; `Leave` releases the seat
+// (F2: leaving is not ending); the sound toggle is the one place a player can
+// unmute, which is what makes every participant `playSound` call reachable.
 function Lobby({
   name,
+  typedName,
   code,
+  participantId,
   participants,
+  tab,
+  onTab,
+  onRename,
+  onLeave,
 }: {
+  /** What the room calls this player — the server's spelling once it has answered. */
   name: string;
+  /** What they typed, to say so when the two differ. */
+  typedName: string;
   code: string;
+  participantId: string;
   participants: LobbyParticipant[];
+  tab: Tab;
+  onTab: (t: Tab) => void;
+  onRename: () => void;
+  onLeave: () => void;
 }) {
   return (
-    <div className={cn(PHONE_SHELL, "px-5 py-7 text-center")}>
+    <div className={cn(PHONE_SHELL, "text-center")}>
       <Bloom />
-      <div className="relative z-10 shrink-0">
+      <div className="relative z-10 shrink-0 px-5 pt-7">
         <p className="font-display text-title1 font-bold leading-tight">
           You're in, {name}
         </p>
+        {/* The server rewrote what they typed — a filtered word, or a name over
+            the cap — and used to do it silently: the phone said "You're in,
+            Dave" while the wall said "Anonymous" (UX-PLAN 3.4). The
+            normalisation is shown, and the fix is one tap away. */}
+        {name !== typedName && (
+          <p className="text-footnote text-ink-muted mt-1.5">
+            The room will see you as <span className="font-semibold text-ink">{name}</span>.
+          </p>
+        )}
         <p className="text-ink-subtle mt-1.5 text-subhead">Waiting for the host to start…</p>
         {/* The code they are actually in, echoed back.
             Join codes are six digits and rooms next door have them too, so a
@@ -1255,17 +1484,210 @@ function Lobby({
         )}
       </div>
 
-      <div className="relative z-10 flex-1 min-h-0 my-3">
-        <PlayerBubbles participants={participants} />
-      </div>
+      {tab === "qa" ? (
+        <div
+          role="tabpanel"
+          id="phone-panel-qa"
+          aria-labelledby="phone-tab-qa"
+          className="relative z-10 flex-1 min-h-0 my-3 px-4 overflow-y-auto text-left"
+        >
+          <QaPanel joinCode={code} participantId={participantId} name={name} />
+        </div>
+      ) : (
+        <div
+          role="tabpanel"
+          id="phone-panel-answer"
+          aria-labelledby="phone-tab-answer"
+          className="relative z-10 flex-1 min-h-0 my-3 px-5 flex flex-col"
+        >
+          {/* The field's own 360px floor was sized for a lobby whose only
+              footer was the player count; with reactions and tabs below it
+              the bubbles would spill under them. It takes what is left. */}
+          <div className="flex-1 min-h-0 overflow-hidden">
+            <PlayerBubbles participants={participants} className="min-h-0" />
+          </div>
+          <p className="shrink-0 text-ink-muted text-subhead font-semibold">
+            <span className="nums text-accent text-title3">
+              <NumberTicker value={participants.length} />
+            </span>{" "}
+            {participants.length === 1 ? "player" : "players"} ready
+          </p>
+        </div>
+      )}
 
-      <p className="relative z-10 shrink-0 text-ink-muted text-subhead font-semibold">
-        <span className="nums text-accent text-title3">
-          <NumberTicker value={participants.length} />
-        </span>{" "}
-        {participants.length === 1 ? "player" : "players"} ready
-      </p>
+      <footer className="relative z-10 shrink-0 px-4 pt-1 flex flex-col gap-2" style={SAFE_BOTTOM}>
+        <div className="flex items-center justify-between gap-2">
+          <SoundToggle />
+          <div className="flex items-center gap-1">
+            {/* `md`, not `sm`: 44px is the touch floor (DESIGN.md §6). */}
+            <Button variant="ghost" size="md" onClick={onRename}>
+              Change name
+            </Button>
+            <Button variant="ghost" size="md" onClick={onLeave}>
+              Leave
+            </Button>
+          </div>
+        </div>
+        <ReactionBar joinCode={code} />
+        <PhoneTabs tab={tab} onChange={onTab} liveDot={false} lobby />
+      </footer>
     </div>
+  );
+}
+
+/**
+ * The participant's one sound control. Participants default muted — two
+ * hundred phones chiming on every join is a disaster (lib/sound.ts) — but a
+ * default with no toggle made every participant cue dead code. Every cue has
+ * a visual twin, so this is a preference, never a channel.
+ */
+function SoundToggle() {
+  const muted = useSyncExternalStore(subscribeMuted, isMuted, isMuted);
+  return (
+    <Button
+      variant="ghost"
+      size="md"
+      aria-pressed={!muted}
+      onClick={() => {
+        // The toggle is a user gesture, which is the only place a context
+        // can be created.
+        unlockAudio();
+        toggleMuted();
+      }}
+    >
+      {muted ? "Sound off" : "Sound on"}
+    </Button>
+  );
+}
+
+const TABS: readonly (readonly [Tab, string])[] = [
+  ["answer", "Answer"],
+  ["qa", "Ask a question"],
+];
+
+/**
+ * The phone's two tabs, as the ARIA tabs pattern asks for them: each tab
+ * names its panel, only the selected tab is in the Tab order, and Left/Right/
+ * Home/End move between them and select as they go. `lib/arrowFocus.ts` was
+ * not reused: it listens on `window`, which is right for a popup that owns
+ * focus and wrong for a tablist that shares the screen with a textarea.
+ */
+function PhoneTabs({
+  tab,
+  onChange,
+  liveDot,
+  lobby = false,
+}: {
+  tab: Tab;
+  onChange: (t: Tab) => void;
+  /** A question is live and unanswered: the Answer tab carries a dot. */
+  liveDot: boolean;
+  /** In the lobby there is nothing to answer yet; the first tab is the room. */
+  lobby?: boolean;
+}) {
+  return (
+    <div
+      className="flex gap-1.5"
+      role="tablist"
+      aria-label="Phone view"
+      onKeyDown={(e) => {
+        const i = TABS.findIndex(([k]) => k === tab);
+        let next: number;
+        if (e.key === "ArrowRight") next = (i + 1) % TABS.length;
+        else if (e.key === "ArrowLeft") next = (i - 1 + TABS.length) % TABS.length;
+        else if (e.key === "Home") next = 0;
+        else if (e.key === "End") next = TABS.length - 1;
+        else return;
+        e.preventDefault();
+        const key = TABS[next][0];
+        onChange(key);
+        (e.currentTarget.querySelector(`#phone-tab-${key}`) as HTMLElement | null)?.focus();
+      }}
+    >
+      {TABS.map(([key, label]) => {
+        const selected = tab === key;
+        return (
+          <button
+            key={key}
+            id={`phone-tab-${key}`}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            aria-controls={`phone-panel-${key}`}
+            tabIndex={selected ? 0 : -1}
+            onClick={() => onChange(key)}
+            className={cn(
+              "flex-1 h-11 rounded-md text-subhead font-semibold transition-colors duration-fast",
+              selected ? "bg-surface-2 text-ink shadow-line" : "text-ink-subtle hover:text-ink"
+            )}
+          >
+            {key === "answer" && lobby ? "Room" : label}
+            {key === "answer" && liveDot && (
+              <>
+                <span
+                  aria-hidden="true"
+                  className="ml-1.5 inline-block w-1.5 h-1.5 rounded-pill bg-accent align-middle"
+                />
+                <span className="sr-only">, question live</span>
+              </>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * The question, clamped to three lines by default and expandable by a tap.
+ * The clamp stays: the phone is a controller and the shared screen has the
+ * question (DESIGN.md §7). But a remote player with no shared screen is
+ * exactly who a clamp with no way past it strands (UX-PLAN 2.8). Measured
+ * rather than assumed: the button only appears when the text actually
+ * overflows, so a two-line question is a plain paragraph.
+ */
+function QuestionText({ text }: { text: string }) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setOverflows(el.scrollHeight > el.clientHeight + 1);
+  }, [text]);
+  const cls = "font-display font-bold text-body leading-snug text-ink-muted";
+  if (!overflows && !expanded) {
+    return (
+      <p ref={ref} className={cn(cls, "line-clamp-3")}>
+        {text}
+      </p>
+    );
+  }
+  return (
+    <button
+      type="button"
+      aria-expanded={expanded}
+      onClick={() => setExpanded((v) => !v)}
+      className="block w-full text-left"
+    >
+      <p ref={ref} className={cn(cls, !expanded && "line-clamp-3")}>
+        {text}
+      </p>
+      <span className="mt-1 block text-caption2 font-semibold uppercase track-label text-ink-subtle">
+        {expanded ? "Show less" : "Read the whole question"}
+      </span>
+    </button>
+  );
+}
+
+/** "14 of 32 have answered" — the cheapest honest tension-holder there is (UX-PLAN 4.3). */
+function RoomProgress({ progress }: { progress: { answered: number; total: number } | null }) {
+  if (!progress) return null;
+  return (
+    <p className="nums text-ink-subtle text-subhead" aria-live="polite">
+      <span className="font-semibold text-ink-muted">{progress.answered}</span> of{" "}
+      <span className="font-semibold text-ink-muted">{progress.total}</span> have answered
+    </p>
   );
 }
 
@@ -1347,6 +1769,12 @@ function PlayerLeaderboard({
   );
 }
 
+// The ending, made personal (UX-PLAN 4.2, PULSE T5). It used to be identical
+// for 1st and last: confetti for everyone, a podium of (usually) strangers,
+// and the player's own line smaller underneath. Now the player's own result
+// is the accent — first, largest, and bounded: `#11 of 34` is a result where
+// `#11` was a ranking. Confetti is the winner's, so it fires for a podium
+// finish only; everyone else gets a calm screen that is still about them.
 function SessionEnded({
   entries,
   myPlace,
@@ -1354,43 +1782,59 @@ function SessionEnded({
 }: {
   entries: LeaderboardEntry[];
   /** This player's own finish. `null` only for someone who never answered. */
-  myPlace: { rank: number; score: number } | null;
+  myPlace: { rank: number; score: number; total: number | null } | null;
   onLeave: () => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
+  const podiumFinish = !!myPlace && myPlace.rank <= 3;
   useEffect(() => {
+    if (!podiumFinish) return;
+    // `burstFrom` is already a no-op under reduced motion.
     const id = window.setTimeout(() => burstFrom(rootRef.current, 110), 320);
     return () => window.clearTimeout(id);
-  }, []);
+  }, [podiumFinish]);
 
   return (
     <div
       ref={rootRef}
-      className={cn(PHONE_SHELL, "items-center justify-center px-5 py-7 gap-7 text-center overflow-y-auto")}
+      className={cn(PHONE_SHELL, "items-center px-5 pt-7 gap-6 text-center overflow-y-auto")}
+      style={{ ...SAFE_CENTER, ...SAFE_BOTTOM }}
     >
       <Bloom />
-      <p className="relative z-10 font-display text-title1 font-bold leading-tight">
+      <p className="relative z-10 font-display text-title2 font-bold leading-tight">
         That's a wrap
       </p>
-      {entries.length > 0 && (
-        <div className="relative z-10">
-          <Podium entries={entries} />
-        </div>
-      )}
       {/* Gated on the player's own result, NOT on finding themselves in the
-       * board above — which is how 11th place used to end a whole game with a
+       * board below — which is how 11th place used to end a whole game with a
        * podium of strangers and no line of their own. */}
-      {myPlace && (
+      {myPlace ? (
         <div className="relative z-10 flex flex-col items-center gap-1">
           <p className="text-ink-subtle text-footnote font-semibold uppercase track-label">
             You finished
           </p>
           <p className="nums font-display text-display font-bold text-accent leading-none">
             #{myPlace.rank}
+            {myPlace.total !== null && (
+              <span className="text-title2 text-ink-muted font-semibold">
+                {" "}of {myPlace.total}
+              </span>
+            )}
           </p>
           <p className="text-ink-muted text-subhead">
             <span className="nums font-bold text-ink">{myPlace.score.toLocaleString()}</span> points
           </p>
+        </div>
+      ) : (
+        <p className="relative z-10 text-ink-subtle text-subhead max-w-[26ch]">
+          You didn't answer any questions this time, so there's no score to show.
+        </p>
+      )}
+      {entries.length > 0 && (
+        <div className="relative z-10 w-full max-w-sm flex flex-col gap-3">
+          <p className="text-ink-subtle text-footnote font-semibold uppercase track-label">
+            Podium
+          </p>
+          <Podium entries={entries} />
         </div>
       )}
       {/* This screen had no controls at all — not one. A player whose host ran
@@ -1412,8 +1856,11 @@ function FeedbackCard({
   feedback,
   pacing,
   rank,
+  progress,
 }: {
   feedback: SubmitFeedback;
+  /** How many of the room have answered — see `RoomProgress`. */
+  progress: { answered: number; total: number } | null;
   /**
    * Which kind of deck this is. The holding card at the bottom of this
    * function is correct for PRESENTER and was never right for AUDIENCE — see
@@ -1442,6 +1889,7 @@ function FeedbackCard({
         </span>
         <p className="font-display text-title2 font-bold">Answer locked in</p>
         <p className="text-ink-subtle text-subhead">Waiting for the next question…</p>
+        <RoomProgress progress={progress} />
       </motion.div>
     );
   }
@@ -1468,6 +1916,9 @@ function FeedbackCard({
       </span>
       <p className="font-display text-title2 font-bold">Locked in</p>
       <p className="text-ink-subtle text-subhead">Hold tight — answer coming up.</p>
+      {/* The one bound on the wait: the stage has always shown this count,
+          and the phone never had it (UX-PLAN 4.3). */}
+      <RoomProgress progress={progress} />
     </motion.div>
   );
 }
@@ -1597,10 +2048,12 @@ function AlreadyAnsweredCard({
   slide,
   isQuiz,
   myAnswer,
+  progress,
 }: {
   slide: CurrentSlide;
   isQuiz: boolean;
   myAnswer: unknown;
+  progress: { answered: number; total: number } | null;
 }) {
   const def = slideType(slide.type);
   // Gap 2: the server has always sent `myAnswer` back on the join ack; the
@@ -1663,6 +2116,7 @@ function AlreadyAnsweredCard({
           ? "It's already scored — hold tight."
           : "Waiting for the next question…"}
       </p>
+      <RoomProgress progress={progress} />
     </motion.div>
   );
 }
@@ -1779,7 +2233,7 @@ function AnswerInput({
   onSubmit,
 }: {
   slide: CurrentSlide;
-  onSubmit: (value: unknown) => void;
+  onSubmit: (value: unknown) => Promise<boolean>;
 }) {
   const def = slideType(slide.type);
   // Content slides have no player input. Without this the phone would be a

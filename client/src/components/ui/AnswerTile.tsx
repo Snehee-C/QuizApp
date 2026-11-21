@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { motion } from "motion/react";
 import { slotFor } from "../../lib/answers";
 import { Shape } from "./Shape";
@@ -13,6 +14,15 @@ interface AnswerTileProps {
   state?: State;
   /** Stage tiles are bigger, carry no (nobody touches a projector). */
   stage?: boolean;
+  /**
+   * Phone only. Five or six options have to share a 375×667 screen with the
+   * question and one footer pill, and the comfortable tile — 44px chip inside
+   * 20px of padding, 84px tall — cannot: six of them need 544px of a 447px
+   * column. Dense keeps every channel and every ratio, and trims the chrome
+   * around them: 36px chip, 12px padding, 60px tile. Still 16px over the
+   * 44px touch floor (DESIGN.md §6).
+   */
+  dense?: boolean;
   disabled?: boolean;
   className?: string;
 }
@@ -61,12 +71,24 @@ export function AnswerTile({
   onClick,
   state = "idle",
   stage = false,
+  dense = false,
   disabled,
   className,
 }: AnswerTileProps) {
   const slot = slotFor(index);
   const Tag = onClick ? motion.button : motion.div;
   const chosen = state === "chosen";
+  // The stagger belongs to the ENTRANCE only. It used to live in the shared
+  // transition, so every later animation on slot F — the chosen keyline, the
+  // correct stamp, the wrong dim — also started 225ms late, which is more
+  // than twice the budget a tap has to answer in (PULSE T1). After the first
+  // commit the delay is zero; the mount animation that is already running
+  // keeps the transition it started with.
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+  }, []);
+  const delay = mounted.current ? 0 : index * 0.045;
 
   return (
     <Tag
@@ -101,14 +123,16 @@ export function AnswerTile({
         // moments (DESIGN.md §4). A selection is not one of them — it is a
         // press, so it answers on the press spring.
         ...(state === "correct" ? spring.pop : chosen ? spring.fast : spring.default),
-        delay: index * 0.045,
+        delay,
       }}
       className={cn(
         "answer-tile relative flex items-center text-left w-full overflow-hidden",
         "font-ui font-semibold",
         stage
           ? "rounded-xl gap-5 px-7 py-6 text-stage-answer"
-          : "rounded-lg gap-4 px-5 py-5 text-title3 min-h-[88px] flex-1 max-h-[22vh]",
+          : dense
+            ? "rounded-lg gap-3 px-4 py-3 text-title3 min-h-11 flex-1 max-h-[22vh]"
+            : "rounded-lg gap-4 px-5 py-5 text-title3 min-h-[88px] flex-1 max-h-[22vh]",
         !stage && onClick && !disabled && "press",
         state === "correct" && "shadow-glow z-10",
         state === "wrong" && "saturate-[0.25]",
@@ -157,7 +181,7 @@ export function AnswerTile({
       <span
         className={cn(
           "answer-chip shrink-0 grid place-items-center rounded-md",
-          stage ? "w-[1.6em] h-[1.6em]" : "w-11 h-11"
+          stage ? "w-[1.6em] h-[1.6em]" : dense ? "w-9 h-9" : "w-11 h-11"
         )}
         // Chosen inverts the chip — solid ink with the shape knocked out of it,
         // the hollow-to-filled flip a checkbox makes, minus the check glyph
