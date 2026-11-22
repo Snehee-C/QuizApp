@@ -15,7 +15,7 @@ import {
 import { registerQaHandlers } from "./qa.js";
 import { filterNickname, filterText, type FilterMode } from "../services/contentFilter.js";
 import { clampTimeScale } from "../timeScale.js";
-import { monoFromWall, withinNetworkGrace } from "../sessionClock.js";
+import { monoFromWall } from "../sessionClock.js";
 import { createThrottle } from "../coalesce.js";
 
 // In-memory live state per active session (keyed by joinCode).
@@ -103,12 +103,6 @@ interface LiveSession {
   revealTimer: ReturnType<typeof setTimeout> | null;
   // slideIds already revealed — revealing is one-shot per slide
   revealedSlides: Set<string>;
-  // When each reveal fired, on the monotonic clock. Only ever read by the
-  // network grace below, which needs to know not THAT a question closed but
-  // HOW LONG AGO. Deliberately not persisted: a reveal that predates a restart
-  // is definitively old, and an absent entry means no grace, which is the safe
-  // direction to fail.
-  revealedAtMono: Map<string, number>;
   // The exact `slide:reveal` frame we emitted, per slideId. A reveal is a
   // one-shot broadcast, so a phone that was offline for it — or a host who
   // navigates back onto the slide — has no way to learn the question is closed.
@@ -1086,7 +1080,6 @@ async function revealSlide(io: Server, joinCode: string, slide: LiveSession["sli
   const s = live.get(joinCode);
   if (!s) return;
   s.revealedSlides.add(slide.id);
-  s.revealedAtMono.set(slide.id, monoNow());
   // A reveal is irreversible, so it is session state rather than UI state: a
   // room rebuilt after a restart must not re-open a question the audience has
   // already been shown the answer to.
@@ -1155,7 +1148,6 @@ function emptyLiveShell(): Pick<
   LiveSession,
   | "revealTimer"
   | "revealedSlides"
-  | "revealedAtMono"
   | "revealPayloads"
   | "participantSockets"
   | "presenterSockets"
@@ -1173,7 +1165,6 @@ function emptyLiveShell(): Pick<
   return {
     revealTimer: null,
     revealedSlides: new Set(),
-    revealedAtMono: new Map(),
     revealPayloads: new Map(),
     participantSockets: new Map(),
     presenterSockets: new Set(),
@@ -2869,41 +2860,17 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       return reject(cb, "TOO_LATE", "You've already answered this one");
     }
 
-    // ---- Once revealed the window has closed, but not to the millisecond ----
+    // ---- Once revealed, the question is closed ----
     //
-    // The reveal fires at exactly `startedAt + limit`, and this check used to
-    // reject anything arriving after it. An answer tapped at 19.9s on a 20s
-    // question and delivered at 20.1s was therefore thrown away — the player
-    // did everything right and the network spent their last tenth of a second.
-    // On venue Wi-Fi that is not an edge case, and it is indistinguishable, to
-    // the person it happens to, from the app losing their answer.
-    //
-    // So a frame that lands within `NETWORK_GRACE_MS` of the close is still
-    // accepted. It buys nothing: grading runs unchanged below, and because
-    // `speedPoints` clamps elapsed to the full window, an answer admitted here
-    // scores the floor — exactly what the slowest honest answer scores. The
-    // grace recovers the ANSWER, never the speed bonus.
-    //
-    // Bounded by the server's own measurement, never a client's claim. The only
-    // input is when this frame arrived, which the client cannot forge: holding
-    // an answer back to think about it past the buzzer still misses the window,
-    // because the window is measured from the close rather than from anything
-    // the phone says about itself.
-    //
-    // A reveal with no recorded instant gets no grace at all. That is the
-    // rehydrate case — a question closed before this process existed — and
-    // treating "I do not know when it closed" as "it closed long ago" is the
-    // direction that cannot reopen a settled question.
-    //
-    // One honest side effect: the room has already SEEN the reveal, and the
-    // aggregate the stage holds is the frozen one. An answer admitted here
-    // updates the stored responses and the next `results:updated`, so a bar can
-    // still move slightly while the reveal animation is playing. A quietly
-    // discarded answer seemed the worse of the two.
+    // No grace after the close. There was one — 750ms, so an answer tapped at
+    // 19.9s and delivered at 20.1s still counted — but the reveal hands every
+    // phone the answer key, so for those 750ms any client could read the key
+    // and submit it: 500 points instead of 0, on every question, by script.
+    // Distinguishing an honest late frame from that needs the phone's word for
+    // when it tapped, which is the one input this check cannot trust. A
+    // delayed honest tap loses its answer; nobody can buy a correct one.
     if (s.revealedSlides.has(slideId)) {
-      if (!withinNetworkGrace(arrivedMono, s.revealedAtMono.get(slideId))) {
-        return reject(cb, "TOO_LATE", "Time's up");
-      }
+      return reject(cb, "TOO_LATE", "Time's up");
     }
 
     // ---- Pay back whatever a delivery gap cost, and nothing more ----

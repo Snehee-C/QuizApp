@@ -2,7 +2,7 @@
 //
 // Covers the clock arithmetic a live session scores on, and the one scoring
 // fail-safe that turned out to be a blocker. Nothing here needs a database.
-import { monoFromWall, withinNetworkGrace } from "./sessionClock.js";
+import { monoFromWall } from "./sessionClock.js";
 import { speedPoints, MAX_POINTS, MIN_POINTS } from "./slides/types.js";
 
 let pass = 0;
@@ -15,23 +15,6 @@ function check(name: string, got: unknown, want: unknown) {
     console.log(`FAIL ${name}\n  got  ${JSON.stringify(got)}\n  want ${JSON.stringify(want)}`);
   }
 }
-
-// ── The network grace ──────────────────────────────────────────────────────
-
-check("grace: on time", withinNetworkGrace(1_000, 1_000, 750), true);
-check("grace: just inside", withinNetworkGrace(1_749, 1_000, 750), true);
-check("grace: exactly at the bound", withinNetworkGrace(1_750, 1_000, 750), true);
-check("grace: one ms past", withinNetworkGrace(1_751, 1_000, 750), false);
-check("grace: long past", withinNetworkGrace(30_000, 1_000, 750), false);
-// A frame that arrived before the close is not late; it should never reach the
-// test, but reading a negative as "in grace" is both true and the safe answer.
-check("grace: arrived before the close", withinNetworkGrace(900, 1_000, 750), true);
-
-// THE REHYDRATE CASE. No record of when the question closed means it closed
-// before this process existed. Unknown must read as "long ago", never as
-// "just now" — the other way round reopens every settled question in a
-// recovered room.
-check("grace: unknown close is NOT grace", withinNetworkGrace(1_000, undefined, 750), false);
 
 // ── Wall clock onto the monotonic scale ────────────────────────────────────
 
