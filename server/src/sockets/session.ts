@@ -1,5 +1,5 @@
 import type { Server, Socket } from "socket.io";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { prisma } from "../db.js";
 import { verifyToken } from "../auth.js";
 import {
@@ -335,6 +335,8 @@ export type RejectCode =
   | "EMPTY_DECK"
   | "NO_LIVE_SESSION"
   | "BAD_PARTICIPANT"
+  | "SEAT_TAKEN"
+  | "SEAT_UNVERIFIED"
   | "HOST_PACED"
   | "NAV_FAILED"
   | "FILTERED"
@@ -347,6 +349,118 @@ export type RejectCode =
 
 function reject(cb: Function | undefined, code: RejectCode, error: string) {
   cb?.({ error, code });
+}
+
+// ---- Seat secrets ----
+//
+// A `participantId` used to be the whole of a seat: `participant:join` bound
+// the socket to whatever id it was handed, so knowing someone's id was enough
+// to BE them — take their seat, read their result, overwrite their answers
+// (submit upserts by it). And ids are not secret: the presenter holds every
+// one, the CSV export prints them, and for most of this app's life the phones'
+// own leaderboard carried ten of them.
+//
+// So a seat now has a secret. The phone mints 256 random bits beside its id
+// and sends them on every join; the join that CLAIMS a seat stores only their
+// SHA-256, and every later join for the seat must present the same secret.
+// The phone mints it, not the server, so there is no window between claiming
+// a seat and learning its secret: a phone that emits its join twice before the
+// first ack lands (a reconnect mid-join) sends the same secret both times. A
+// client that sends none — or one too short to be one — is given a secret the
+// server minted, in that one ack. Everything
+// downstream — submit, goto, Q&A — already trusts `socket.data.participantId`
+// rather than the payload, so this one gate covers them all.
+//
+// A seat with no hash on record (created before the column existed, i.e. a
+// room that was live across the deploy) is claimed by its next join: trust on
+// first use, which is exactly what the room had before, once.
+
+const SEAT_SECRET_MIN_LEN = 32;
+const SEAT_SECRET_MAX_LEN = 128;
+
+function wellFormedSecret(secret: unknown): secret is string {
+  return (
+    typeof secret === "string" &&
+    secret.length >= SEAT_SECRET_MIN_LEN &&
+    secret.length <= SEAT_SECRET_MAX_LEN
+  );
+}
+
+function hashSeatSecret(secret: string): string {
+  return createHash("sha256").update(secret).digest("hex");
+}
+
+function seatSecretMatches(secret: unknown, storedHash: string): boolean {
+  if (!wellFormedSecret(secret)) return false;
+  const given = Buffer.from(hashSeatSecret(secret), "hex");
+  const stored = Buffer.from(storedHash, "hex");
+  return given.length === stored.length && timingSafeEqual(given, stored);
+}
+
+type SeatCheck =
+  | { ok: true; issued?: string }
+  | { ok: false; reason: "taken" };
+
+/**
+ * Verify the caller holds this seat, claiming it if nobody does yet. A claim
+ * adopts the caller's own secret; only when the caller sent none is one
+ * minted, and then `issued` carries it — the one time a server-made secret
+ * exists in plaintext, so it must go straight back in the ack.
+ *
+ * Two phones racing to claim the same unclaimed seat both try a conditional
+ * write; exactly one lands, and the loser re-reads and is verified (and
+ * refused) like any later join. Throws on a database failure: the caller
+ * fails CLOSED, because "could not check" must not mean "let them in".
+ */
+async function claimOrVerifySeat(
+  sessionId: string,
+  participantId: string,
+  secret: unknown
+): Promise<SeatCheck> {
+  const where = { sessionId_participantId: { sessionId, participantId } };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const row = await prisma.participant.findUnique({ where, select: { seatSecretHash: true } });
+    if (row?.seatSecretHash) {
+      return seatSecretMatches(secret, row.seatSecretHash) ? { ok: true } : { ok: false, reason: "taken" };
+    }
+    const own = wellFormedSecret(secret) ? secret : null;
+    const issued = own ? undefined : randomBytes(32).toString("base64url");
+    const seatSecretHash = hashSeatSecret(own ?? issued!);
+    if (!row) {
+      try {
+        await prisma.participant.create({ data: { sessionId, participantId, seatSecretHash } });
+        return { ok: true, issued };
+      } catch (e: any) {
+        // P2002: somebody created the row between our read and our write.
+        if (e?.code !== "P2002") throw e;
+        continue;
+      }
+    }
+    const { count } = await prisma.participant.updateMany({
+      where: { sessionId, participantId, seatSecretHash: null },
+      data: { seatSecretHash },
+    });
+    if (count === 1) return { ok: true, issued };
+  }
+  // Lost the race twice, which means the seat now has a hash we did not set.
+  const row = await prisma.participant.findUnique({ where, select: { seatSecretHash: true } });
+  return row?.seatSecretHash && seatSecretMatches(secret, row.seatSecretHash)
+    ? { ok: true }
+    : { ok: false, reason: "taken" };
+}
+
+/**
+ * Read-only: may this caller read this seat's private result? For the
+ * finished-room refusal, which hands back a rank and a score and claims
+ * nothing. An unclaimed seat answers as it did before secrets existed.
+ */
+async function holdsSeat(sessionId: string, participantId: string, secret: unknown): Promise<boolean> {
+  const row = await prisma.participant.findUnique({
+    where: { sessionId_participantId: { sessionId, participantId } },
+    select: { seatSecretHash: true },
+  });
+  if (!row) return false;
+  return row.seatSecretHash ? seatSecretMatches(secret, row.seatSecretHash) : true;
 }
 
 // The secret the room-facing participant key is derived under. Falls back to
@@ -2283,7 +2397,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   });
 
   // ---- Participant: join by code ----
-  socket.on("participant:join", async ({ joinCode, participantId, name, avatar }, cb) => {
+  socket.on("participant:join", async ({ joinCode, participantId, seatSecret, name, avatar }, cb) => {
     const ip = clientIp(socket);
     // Checked before the code is resolved, deliberately: a throttled caller
     // must not be able to read a wrong code off the shape of the refusal.
@@ -2318,10 +2432,16 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // board — deliberately `entries`, never `fullEntries`: every row carries a
       // `participantId`, which is the whole of what this very handler needs to
       // take that seat, so a refusal is the last place to widen it.
+      //
+      // The PUBLIC board goes to anyone with the code; THIS seat's rank and
+      // score only to the phone holding the seat's secret. Otherwise the
+      // refusal is a results oracle: any id, read off an export or an old
+      // board, returns that player's placing.
       if (typeof participantId === "string" && participantId) {
         try {
           const { entries, fullEntries } = await computeLeaderboard(s);
-          const i = fullEntries.findIndex((e) => e.participantId === participantId);
+          const mine = await holdsSeat(s.sessionId, participantId, seatSecret);
+          const i = mine ? fullEntries.findIndex((e) => e.participantId === participantId) : -1;
           return cb?.({
             error: "Session has ended",
             code: "SESSION_ENDED",
@@ -2343,6 +2463,21 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
     }
     if (typeof participantId !== "string" || !participantId) {
       return reject(cb, "BAD_PARTICIPANT", "Invalid participant");
+    }
+    // Before anything binds this socket to the id: see "Seat secrets" above.
+    let seat: SeatCheck;
+    try {
+      seat = await claimOrVerifySeat(s.sessionId, participantId, seatSecret);
+    } catch (e) {
+      console.error("could not verify seat", e);
+      return reject(cb, "SEAT_UNVERIFIED", "Couldn't confirm your seat. Try again.");
+    }
+    if (!seat.ok) {
+      // Charged to this device only, like a finished room: 256 random bits are
+      // not guessable at any rate, so this is bookkeeping, not the defence —
+      // and a venue's shared IP must not pay for one confused phone.
+      recordJoinFailure(ip, participantId, false);
+      return reject(cb, "SEAT_TAKEN", "That seat belongs to another device.");
     }
     // They are in. Whatever they fumbled on the way here was a fumble, so give
     // the budget back — to them and to the IP they share with the room.
@@ -2506,6 +2641,10 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // by id. With this the client can switch that comparison to `pkey` and
       // the last ten bearer tokens come off the wire. See the audit note.
       myPkey: publicKeyFor(s, participantId),
+      // Present only when the server MINTED the secret: a claiming join that
+      // brought none of its own. The phone keeps it and sends it on every later
+      // join; see "Seat secrets".
+      ...(seat.issued ? { seatSecret: seat.issued } : {}),
       revealed,
       // Only ever populated once the slide is revealed, so this cannot become a
       // second path by which the answer key reaches a participant early.

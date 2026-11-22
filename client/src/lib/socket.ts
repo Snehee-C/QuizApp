@@ -38,6 +38,70 @@ export function getParticipantId(): string {
   return id;
 }
 
+// The secret that proves this phone holds its seat in a room (server: "Seat
+// secrets" in sockets/session.ts). Minted HERE, beside the id, and sent on
+// every join — the server stores the hash of whatever the claiming join
+// presented. Minting it on the server instead left a window: a phone emits its
+// join twice before the first ack lands (a reconnect mid-join; StrictMode in
+// dev), the first claims the seat, and the second — still holding no secret —
+// is refused its own seat.
+//
+// One per device, like the id it belongs to: a different hash row per session,
+// and it never leaves this phone except to the server. `getRandomValues`, not
+// `randomUUID`, because it exists outside secure contexts (see `randomId`).
+const SEAT_SECRET_KEY = "menti_seat_secret";
+let seatSecretInMemory: string | null = null;
+
+function randomSecret(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function getSeatSecret(): string {
+  if (seatSecretInMemory) return seatSecretInMemory;
+  let secret: string | null = null;
+  try {
+    secret = localStorage.getItem(SEAT_SECRET_KEY);
+  } catch {
+    /* fall through to a fresh one */
+  }
+  if (!secret) secret = setSeatSecret(randomSecret());
+  seatSecretInMemory = secret;
+  return secret;
+}
+
+/** Adopt a secret — for a server that minted one (a join that sent none). */
+export function setSeatSecret(secret: string): string {
+  // Memory first: a phone whose storage refuses the write must still survive
+  // a Wi-Fi blip, and every reconnect re-joins.
+  seatSecretInMemory = secret;
+  try {
+    localStorage.setItem(SEAT_SECRET_KEY, secret);
+  } catch {
+    /* this page keeps the seat; a reload starts over (see below) */
+  }
+  return secret;
+}
+
+/**
+ * Abandon this device's id and secret and mint new ones. Only for a seat the
+ * server refuses as belonging to another device (`SEAT_TAKEN`) — in practice a
+ * phone that kept its id but lost its secret. The id is worthless without it,
+ * so the phone starts over as a new player rather than sitting on an error no
+ * reload can get past.
+ */
+export function resetParticipantId(): string {
+  const id = randomId();
+  try {
+    localStorage.setItem("menti_participant_id", id);
+  } catch {
+    /* the new id still works for this page's life */
+  }
+  setSeatSecret(randomSecret());
+  return id;
+}
+
 // The participant's preset avatar index, derived deterministically from their
 // stable participant ID so it stays the same across renders and reloads.
 export function getAvatarIndex(): number {

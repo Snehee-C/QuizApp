@@ -137,6 +137,13 @@ model Participant {
   // Refreshed on every (re)join. Not a presence flag — presence is a live
   // socket, which is not a thing a database row can know.
   lastSeenAt    DateTime @default(now())
+  // SHA-256 (hex) of the seat secret issued on this seat's first join. The
+  // participantId alone is not a credential — it is visible to the presenter,
+  // in exports, and historically on every phone's leaderboard — so every later
+  // join must present the secret that only the claiming phone was handed.
+  // Null only for seats created before the column existed; the first join
+  // after the migration claims them.
+  seatSecretHash String?
 
   @@unique([sessionId, participantId])
   @@index([sessionId])

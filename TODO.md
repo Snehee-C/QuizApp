@@ -56,6 +56,18 @@ Pre-existing, not introduced by any wave. Recorded because it currently
 constrains an unrelated design decision, which is how an implicit security
 assumption usually announces itself.
 
+Status: **done** — seat secrets (`sockets/session.ts`, "Seat secrets"). The
+phone mints 256 random bits beside its id and sends them on every join; the
+claiming join stores only their SHA-256 on `Participant.seatSecretHash`, and
+every later join must present the same secret (`SEAT_TAKEN` otherwise). The
+finished-room refusal gives the public board to anyone but a seat's rank and
+score only to its holder. Seats from before the migration are claimed by
+their next join. A phone that lost its secret starts over as a new player
+rather than dead-ending. Checked against a live server: with only the id, an
+attacker was refused the seat, the submit, Q&A, and the result (against the
+old server the same script took the seat, renamed it, and zeroed its score).
+Not done here: widening the phones' board past ten rows, which this unblocks.
+
 ---
 
 ## Known gaps

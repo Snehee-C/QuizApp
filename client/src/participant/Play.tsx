@@ -5,6 +5,9 @@ import {
   getAvatarIndex,
   getNickname,
   getParticipantId,
+  getSeatSecret,
+  resetParticipantId,
+  setSeatSecret,
   getSocket,
   setNickname,
 } from "../lib/socket";
@@ -360,6 +363,10 @@ export default function Play() {
   useEffect(() => {
     if (!joined) return;
     const socket = getSocket();
+    // One fresh seat per mount at most (see SEAT_TAKEN in `applyJoinAck`): a
+    // second refusal is not this phone's lost secret, and looping would mint
+    // ids forever.
+    let seatReset = false;
 
     // The room has just been shown the standings. This is the ONLY thing that
     // lifts the rank embargo in a presenter-paced deck, and it is lifted by
@@ -385,6 +392,16 @@ export default function Play() {
       // countdown run after this handler returns, so the offset has to be
       // recorded before the state that depends on it (lib/serverClock.ts).
       noteServerNow(res?.serverNow, rttMs);
+      // This id's seat belongs to another device — in practice, this phone
+      // lost its secret (storage cleared or refused) but kept its id.
+      // The id is worthless without it, so start over as a new player, once,
+      // rather than land on an error no reload can get past.
+      if (res?.code === "SEAT_TAKEN" && !seatReset) {
+        seatReset = true;
+        participantId.current = resetParticipantId();
+        emitJoin(isRejoin);
+        return;
+      }
       if (res?.error) {
         // Drop the seat: a stale one would otherwise brick this phone on the
         // dead-end error screen on every single reload.
@@ -421,6 +438,9 @@ export default function Play() {
         return;
       }
       setError("");
+      // Issued only on the join that claimed the seat (server: "Seat secrets").
+      // Only a server that minted the secret itself sends one back.
+      if (typeof res.seatSecret === "string") setSeatSecret(res.seatSecret);
       // Before any board is applied below: `roomSawStandings` runs off this.
       // A server that predates it leaves us on the id comparison (`isMyRow`).
       myPkey.current = typeof res.myPkey === "string" ? res.myPkey : null;
@@ -561,6 +581,7 @@ export default function Play() {
         {
           joinCode: code,
           participantId: participantId.current,
+          seatSecret: getSeatSecret(),
           name,
           avatar: getAvatarIndex(),
         },
