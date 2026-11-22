@@ -200,11 +200,11 @@ export default function Dashboard() {
                         <Link to={`/edit/${p.id}`} className="min-w-0" title={`Edit "${p.title}"`}>
                           <p className="font-semibold text-title3 leading-snug truncate">{p.title}</p>
                           <p className="nums text-footnote text-ink-subtle mt-1">
-                            <SlideMeta n={n} updatedAt={p.updatedAt} />
+                            <SlideMeta deck={p} />
                           </p>
                         </Link>
                         <div className="flex items-center gap-1.5">
-                          <PresentButton id={p.id} slides={n} size="md" />
+                          <PresentButton id={p.id} slides={n} broken={p.brokenSlides ?? 0} size="md" />
                           <Link to={`/edit/${p.id}`}>
                             <Button variant="ghost" size="md">
                               Edit
@@ -270,7 +270,7 @@ export default function Dashboard() {
                           {copying === p.id ? (
                             "Copying…"
                           ) : (
-                            <SlideMeta n={n} updatedAt={p.updatedAt} />
+                            <SlideMeta deck={p} />
                           )}
                         </p>
                       </Link>
@@ -285,7 +285,7 @@ export default function Dashboard() {
                             Edit
                           </Button>
                         </Link>
-                        <PresentButton id={p.id} slides={n} size="sm" />
+                        <PresentButton id={p.id} slides={n} broken={p.brokenSlides ?? 0} size="sm" />
                         <MoreMenu
                           label={`More actions for "${p.title}"`}
                           actions={[
@@ -313,15 +313,41 @@ export default function Dashboard() {
   );
 }
 
-/** "12 slides · updated 3 d ago" — the count, and the key the list is sorted by. */
-function SlideMeta({ n, updatedAt }: { n: number; updatedAt: string }) {
+/** "~12 min", "~1 h 20 min". Never "0 min": a deck with slides takes some. */
+function formatEstimate(sec: number): string {
+  const min = Math.max(1, Math.round(sec / 60));
+  return min < 60 ? `~${min} min` : `~${Math.floor(min / 60)} h${min % 60 ? ` ${min % 60} min` : ""}`;
+}
+
+/**
+ * "12 slides · ~14 min · updated 3 d ago · 2 slides need fixing" — what a host
+ * needs before pressing Present (UX-PLAN 6.2): how long it runs, so a 30-minute
+ * slot can be checked against a 50-minute deck before the room is waiting, and
+ * whether it will work, in the editor's own words for the same count. Plus the
+ * key the list is sorted by.
+ */
+function SlideMeta({ deck }: { deck: Presentation }) {
+  const n = deck._count?.slides ?? 0;
+  const broken = deck.brokenSlides ?? 0;
   return (
     <>
       {n} slide{n === 1 ? "" : "s"}
+      {n > 0 && deck.estimateSec != null && (
+        <span title="Every countdown at full length, plus an allowance for each reveal and for slides without a timer">
+          {" · "}
+          {formatEstimate(deck.estimateSec)}
+        </span>
+      )}
       {" · "}
-      updated {formatRelative(updatedAt)}
+      updated {formatRelative(deck.updatedAt)}
       {/* The reason the row's Present is off, said where the count is. */}
       {n === 0 && <span className="text-ink-muted"> — add a slide first</span>}
+      {broken > 0 && (
+        <span className="text-warn">
+          {" · "}
+          {broken} {broken === 1 ? "slide needs" : "slides need"} fixing
+        </span>
+      )}
     </>
   );
 }
@@ -332,7 +358,25 @@ function SlideMeta({ n, updatedAt }: { n: number; updatedAt: string }) {
  * EMPTY_DECK on a projector that is already live (UX-PLAN 1.6), so the button
  * is off here, with the reason on hover and in the row's metadata.
  */
-function PresentButton({ id, slides, size }: { id: string; slides: number; size: "sm" | "md" }) {
+function PresentButton({
+  id,
+  slides,
+  broken,
+  size,
+}: {
+  id: string;
+  slides: number;
+  broken: number;
+  size: "sm" | "md";
+}) {
+  const navigate = useNavigate();
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const t = window.setTimeout(() => setArmed(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [armed]);
+
   if (slides === 0) {
     return (
       // The wrapper carries the tooltip: a disabled button takes no pointer
@@ -342,6 +386,28 @@ function PresentButton({ id, slides, size }: { id: string; slides: number; size:
           Present
         </Button>
       </span>
+    );
+  }
+  // A deck with a broken slide still launches — a host may know the slide
+  // and plan to skip it — but not on one unconsidered press: a broken slide
+  // is a question the room cannot answer, discovered in front of the room.
+  // Same two-press shape as the stage's End (Present.tsx `EndButton`), and
+  // the reason is already on the row beside it.
+  if (broken > 0) {
+    return (
+      <Button
+        variant="primary"
+        size={size}
+        onClick={() => (armed ? navigate(`/present/${id}`) : setArmed(true))}
+        aria-live="polite"
+        title={
+          armed
+            ? "Press again to present with the broken slides"
+            : `${broken} ${broken === 1 ? "slide" : "slides"} can't be answered as written — fix in the editor first, or press twice to present anyway`
+        }
+      >
+        {armed ? "Present anyway?" : "Present"}
+      </Button>
     );
   }
   return (

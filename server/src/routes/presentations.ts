@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../db.js";
 import { requireAuth, type AuthedRequest } from "../auth.js";
-import { VALID_SLIDE_TYPES, configIssues } from "../slides/registry.js";
+import { VALID_SLIDE_TYPES, configIssues, isTimed, timeLimitSec } from "../slides/registry.js";
 import type { ConfigIssue } from "../slides/types.js";
 import { clampTimeScale } from "../timeScale.js";
 
@@ -24,14 +24,69 @@ const LIVE_SLIDES = { deletedAt: null } as const;
 const LIVE_SLIDE_COUNT = { _count: { select: { slides: { where: LIVE_SLIDES } } } } as const;
 
 // List my presentations
+//
+// Each row carries the two facts a host needs BEFORE pressing Present, and
+// which used to exist only inside the editor (UX-PLAN 6.2):
+//
+//   - `brokenSlides`: slides with a `broken` config issue — the kind no further
+//     typing resolves, e.g. an answer key pointing past the options. The same
+//     rule the editor's deck check counts, run here so the launch surface can
+//     say it. `incomplete` is deliberately not counted: it is what every
+//     half-written slide looks like, and a list row that nags about drafts is
+//     wallpaper (see `configAdvice` below).
+//   - `estimateSec`: what the deck will take in a room. See `estimateDeckSec`.
 presentationsRouter.get("/", async (req: AuthedRequest, res) => {
   const items = await prisma.presentation.findMany({
     where: { ownerId: req.auth!.userId },
     orderBy: { updatedAt: "desc" },
-    include: LIVE_SLIDE_COUNT,
+    include: {
+      ...LIVE_SLIDE_COUNT,
+      slides: { where: LIVE_SLIDES, select: { type: true, config: true } },
+    },
   });
-  res.json(items);
+  res.json(
+    items.map(({ slides, ...deck }) => {
+      const parsed = slides.map((s) => ({ type: s.type, config: safeParseConfig(s.config) }));
+      return {
+        ...deck,
+        brokenSlides: parsed.filter((s) => configIssues(s.type, s.config).some((i) => i.kind === "broken"))
+          .length,
+        estimateSec: estimateDeckSec(parsed, deck),
+      };
+    })
+  );
 });
+
+// What a slide costs a room beyond its own countdown. Allowances, not
+// measurements, and named as such so the row can say "~": a reveal, the
+// distribution and a word from the host after every timed question; and for a
+// slide with no countdown at all (headings, polls, word clouds) a flat figure,
+// since nothing in the deck says how long the host will talk over it.
+const REVEAL_ALLOWANCE_SEC = 15;
+const UNTIMED_SLIDE_SEC = 30;
+
+/**
+ * The deck's running time, in seconds: every countdown at the length it will
+ * actually run — the clamped limit the session arms, times the deck's
+ * relaxed-timing scale — plus the allowances above. A self-paced deck has no
+ * shared reveal to wait for (the server arms none), so it is countdowns and
+ * untimed slides only.
+ */
+function estimateDeckSec(
+  slides: { type: string; config: unknown }[],
+  deck: { timeScale: number; pacing: string }
+): number {
+  const scale = clampTimeScale(deck.timeScale);
+  const reveal = deck.pacing === "AUDIENCE" ? 0 : REVEAL_ALLOWANCE_SEC;
+  return slides.reduce(
+    (sec, s) =>
+      sec +
+      (isTimed(s.type, s.config)
+        ? Math.round(timeLimitSec(s.type, s.config) * scale) + reveal
+        : UNTIMED_SLIDE_SEC),
+    0
+  );
+}
 
 // Create a presentation
 presentationsRouter.post("/", async (req: AuthedRequest, res) => {

@@ -133,6 +133,10 @@ export interface Presentation {
   createdAt: string;
   updatedAt: string;
   _count?: { slides: number };
+  /** List rows only: slides with a `broken` config issue (server-computed). */
+  brokenSlides?: number;
+  /** List rows only: estimated running time in a room, seconds. */
+  estimateSec?: number;
 }
 
 export interface TemplateSummary extends Presentation {

@@ -50,10 +50,12 @@ two real audits are now CI gates.
   winner — and the winner's hue now floods the screen as DESIGN.md §5 always
   said; the list under it is places 4–8 instead of a repeat of 1–3; the four
   buttons are `xl` + `text-stage-label` and arrive after the moment.
+- **6.2, two of three.** Deck rows show `~N min` (countdowns × `timeScale`,
+  plus 15 s per reveal and 30 s per untimed slide, computed server-side) and
+  `N slides need fixing` in warn; Present on such a deck takes two presses.
 
 **Still open**, in cost order:
-- **6.2** deck health (`⚠ 2 issues`), authored-duration estimate and
-  last-presented date on the deck list — only `updated …` landed.
+- **6.2** last-presented date on the deck list.
 - **The 24 px-floor and contrast audits are not scripts** (`DESIGN.md` §6 now
   says so). Measurement debt below.
 - 6.8 leftovers: `DeckTransfer` `onDrop` not gated on `importing`;
