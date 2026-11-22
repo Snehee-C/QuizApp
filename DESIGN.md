@@ -329,9 +329,10 @@ invisible by nature and both still need to become gates:
 - **The 24px floor** — *not yet a script.* It should walk the whole deck at
   1920×1080 and measure *computed* font sizes outside the control-bar
   `<footer>`. Last run by hand (November 2026) it passed on the lobby,
-  question, self-paced and failure screens and **failed on the final-results
-  screen**: `Podium`/`LeaderboardList` labels at 11–16px and the four
-  `size="lg"` buttons at 17px. Open in `UX-PLAN.md`.
+  question, self-paced and failure screens and failed on the final-results
+  screen (`Podium`/`LeaderboardList` at 11–16px, four 17px buttons). That
+  screen has since been moved onto the ladder and re-walked: nothing under
+  24px at 1920×1080. Still a hand run, not a gate.
 - **The contrast audit** — *not yet a script.* It must resolve every colour
   through a canvas (computed style serialises as `oklch()`, and an `rgb()`
   regex silently reads channel numbers as bytes) and account for absolutely

@@ -45,14 +45,15 @@ two real audits are now CI gates.
   the leaving frame is lifted out of flow and exits in 160 ms while the new
   one enters. Key press → new question at ≥0.5 opacity on the stage: median
   **437 ms → 108 ms** over the nine transitions of the 90s example deck.
+- **Final results on the ladder.** Nothing under 24 px at 1920×1080 (walked
+  every visible text node). The podium counts up — #3, #2, a beat, the
+  winner — and the winner's hue now floods the screen as DESIGN.md §5 always
+  said; the list under it is places 4–8 instead of a repeat of 1–3; the four
+  buttons are `xl` + `text-stage-label` and arrive after the moment.
 
 **Still open**, in cost order:
 - **6.2** deck health (`⚠ 2 issues`), authored-duration estimate and
   last-presented date on the deck list — only `updated …` landed.
-- **The final-results screen fails the 24 px stage floor** (pre-existing,
-  measured by hand): `Podium`/`LeaderboardList` labels at 11–16 px and four
-  17 px buttons on a projected surface. It is a signature moment and needs a
-  design pass, not a size bump.
 - **The 24 px-floor and contrast audits are not scripts** (`DESIGN.md` §6 now
   says so). Measurement debt below.
 - 6.8 leftovers: `DeckTransfer` `onDrop` not gated on `importing`;

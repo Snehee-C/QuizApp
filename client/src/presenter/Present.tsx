@@ -22,7 +22,13 @@ import {
   type SpeakerTransport,
 } from "../components/SpeakerWindow";
 import { slideType } from "../slides/registry";
-import { Podium, LeaderboardList, type LeaderboardEntry } from "../components/Podium";
+import {
+  Podium,
+  LeaderboardList,
+  PODIUM_STAGE_TIMING,
+  winnerHue,
+  type LeaderboardEntry,
+} from "../components/Podium";
 import { BarRaceLeaderboard } from "../components/BarRaceLeaderboard";
 import { PlayerBubbles } from "../components/PlayerBubbles";
 import { useStageScale } from "../components/stageScale";
@@ -1796,6 +1802,11 @@ function EndButton({ onEnd }: { onEnd: () => void }) {
 
 // The end of the session. No cartoon 1-2-3 blocks: the winner's own colour
 // floods the screen (DESIGN.md §5).
+//
+// The podium counts up to the winner (PODIUM_STAGE_TIMING); everything else
+// on this screen keys off the moment their card lands.
+const WINNER_LANDS_MS = PODIUM_STAGE_TIMING.winner * 1000 + 120;
+
 function FinalResults({
   entries,
   canExport,
@@ -1815,11 +1826,14 @@ function FinalResults({
   onEdit: () => void;
   onBack: () => void;
 }) {
+  const winner = entries[0];
+
   useEffect(() => {
     if (entries.length === 0) return;
-    // Two bursts 180ms apart — the difference between a celebration and clip art.
-    const a = window.setTimeout(() => burstAt(window.innerWidth / 2, window.innerHeight * 0.42, 90), 240);
-    const b = window.setTimeout(() => burstAt(window.innerWidth / 2, window.innerHeight * 0.36, 130), 420);
+    // Two bursts 180ms apart — the difference between a celebration and clip
+    // art — fired as the winner's card arrives, not before it exists.
+    const a = window.setTimeout(() => burstAt(window.innerWidth / 2, window.innerHeight * 0.4, 90), WINNER_LANDS_MS);
+    const b = window.setTimeout(() => burstAt(window.innerWidth / 2, window.innerHeight * 0.34, 130), WINNER_LANDS_MS + 180);
     return () => {
       window.clearTimeout(a);
       window.clearTimeout(b);
@@ -1827,8 +1841,25 @@ function FinalResults({
   }, [entries.length]);
 
   return (
-    <div className="h-[100dvh] flex flex-col items-center justify-center gap-9 px-stage-safe bg-canvas text-ink overflow-hidden">
+    <div className="relative h-[100dvh] flex flex-col items-center justify-center gap-[max(16px,3.2vh)] px-stage-safe bg-canvas text-ink overflow-hidden">
       <StageBloom />
+      {/* "The winner's avatar hue floods the screen" (DESIGN.md §5) — until
+          now it flooded a card. A wash, not a fill: it sits behind the
+          podium and is gone well before the top label and the rows, so no
+          text on this screen is read against it. It arrives with the card,
+          so the colour is the reveal rather than a spoiler of it. */}
+      {winner && (
+        <motion.div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 z-0"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: PODIUM_STAGE_TIMING.winner, duration: 0.9, ease: [0, 0, 0.2, 1] }}
+          style={{
+            background: `radial-gradient(52% 46% at 50% 38%, color-mix(in oklch, ${winnerHue(winner)}, transparent 62%) 0%, transparent 100%)`,
+          }}
+        />
+      )}
       <p className="relative z-10 text-stage-label font-semibold uppercase track-label text-ink-subtle">
         Final results
       </p>
@@ -1837,9 +1868,18 @@ function FinalResults({
           <div className="relative z-10">
             <Podium entries={entries} stage />
           </div>
-          <div className="relative z-10 w-full max-w-2xl">
-            <LeaderboardList entries={entries.slice(0, 8)} />
-          </div>
+          {/* Places 4–8: the podium already says 1–3, and five rows is what
+              reads at the back of the room (the standings rule above). They
+              wait for the winner — nobody looks down while first is landing. */}
+          {entries.length > 3 && (
+            <div className="relative z-10 w-full max-w-[min(64rem,72vw)]">
+              <LeaderboardList
+                entries={entries.slice(3, 8)}
+                firstPlace={4}
+                delay={PODIUM_STAGE_TIMING.winner + 0.6}
+              />
+            </div>
+          )}
         </>
       ) : (
         <p className="relative z-10 text-stage-name text-ink-muted">No quiz scores in this session.</p>
@@ -1857,27 +1897,38 @@ function FinalResults({
           All four are quiet. The winner's colour is the subject here
           (DESIGN.md §5) and a row of accent buttons underneath would argue
           with it — these are chrome at the edge of a celebration, not the
-          celebration. */}
-      <div className="relative z-10 flex flex-wrap items-center justify-center gap-2.5">
-        <Button variant="secondary" size="lg" onClick={onAgain}>
+          celebration.
+
+          Stage-sized all the same (the fatal screen's xl + stage-label): the
+          host is driving a projected surface, often from the room, and 17px
+          was the last text on any stage screen under the 24px floor. They
+          arrive after the moment — a row of controls on screen while first
+          place lands is the interface talking over the subject (P2). */}
+      <motion.div
+        className="relative z-10 flex flex-wrap items-center justify-center gap-3"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ delay: PODIUM_STAGE_TIMING.winner + 1.1, duration: 0.32 }}
+      >
+        <Button variant="secondary" size="xl" className="text-stage-label" onClick={onAgain}>
           Present again
         </Button>
         {/* Hidden rather than disabled when there is no session to export:
             a dead control invites a press and explains nothing. */}
         {canExport && (
-          <Button variant="secondary" size="lg" disabled={exportBusy} onClick={onExport}>
+          <Button variant="secondary" size="xl" className="text-stage-label" disabled={exportBusy} onClick={onExport}>
             {exportBusy ? "Preparing…" : "Download results"}
           </Button>
         )}
-        <Button variant="ghost" size="lg" onClick={onEdit}>
+        <Button variant="ghost" size="xl" className="text-stage-label" onClick={onEdit}>
           Edit deck
         </Button>
         {/* Named for where it goes, like every other door (F1, 6.8): "Done"
             was the one unnamed exit in the product. */}
-        <Button variant="ghost" size="lg" onClick={onBack}>
+        <Button variant="ghost" size="xl" className="text-stage-label" onClick={onBack}>
           ← Decks
         </Button>
-      </div>
+      </motion.div>
       {/* A failed download says so where the button is — stage ladder,
           because this screen is projected. */}
       {exportError && (
