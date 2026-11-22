@@ -40,6 +40,12 @@ two real audits are now CI gates.
   title back to its pre-edit value (2 of 7 runs). `autosave.unsaved(key)`
   now exposes in-flight + pending fields and `load()` overlays them.
 
+**Closed since** (measured in a headless Chromium against the dev stack):
+- **Stage lag.** `AnimatePresence` on the stage is `popLayout`, not `wait`;
+  the leaving frame is lifted out of flow and exits in 160 ms while the new
+  one enters. Key press → new question at ≥0.5 opacity on the stage: median
+  **437 ms → 108 ms** over the nine transitions of the 90s example deck.
+
 **Still open**, in cost order:
 - **6.2** deck health (`⚠ 2 issues`), authored-duration estimate and
   last-presented date on the deck list — only `updated …` landed.
@@ -49,11 +55,6 @@ two real audits are now CI gates.
   design pass, not a size bump.
 - **The 24 px-floor and contrast audits are not scripts** (`DESIGN.md` §6 now
   says so). Measurement debt below.
-- **Stage trails the phones by ~320 ms** on every slide change
-  (`AnimatePresence mode="wait"` exit before enter, `Present.tsx`): phones
-  show tiles while the projector is still fading the previous frame. A T1/T3
-  wrinkle — the room's shared clock starts before the room can see the
-  question. Decide whether the exit should overlap or the phones should wait.
 - 6.8 leftovers: `DeckTransfer` `onDrop` not gated on `importing`;
   `SaveIndicator` shows nothing (rather than `Nothing to save yet`) before the
   first save.

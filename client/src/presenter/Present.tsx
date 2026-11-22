@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { forwardRef, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
 import { motion, AnimatePresence } from "motion/react";
@@ -1062,7 +1062,17 @@ export default function Present() {
       </header>
 
       <main className="relative z-10 flex-1 min-h-0 flex flex-col px-stage-safe pb-2">
-        <AnimatePresence mode="wait">
+        {/* popLayout, not wait. `wait` played the old frame's whole exit
+         * before the new one mounted, so the stage trailed the phones by
+         * ~320ms on every slide change: tiles were live and the server clock
+         * was running while the projector still showed the last question —
+         * and the phone deliberately does not mirror the question, so in a
+         * speed-scored window the room could not read what it was answering.
+         * popLayout lifts the leaving frame out of flow (absolute, against
+         * this `relative` main) and mounts the new one on the same frame.
+         * Every direct child must take a ref — see RaceRow in
+         * BarRaceLeaderboard for what happens silently when one cannot. */}
+        <AnimatePresence mode="popLayout">
           {status === "LOBBY" ? (
             <LobbyStage
               key="lobby"
@@ -1231,26 +1241,30 @@ function StageBloom() {
 
 // ── Lobby: the screen that is projected longest, and the one every
 // competitor wastes (DESIGN.md §5). Join code is the hero. ─────────────
-function LobbyStage({
+const LobbyStage = forwardRef<
+  HTMLElement,
+  {
+    joinCode: string | null;
+    joinUrl: string;
+    joinOrigin: string;
+    unreachable: boolean;
+    participants: Participant[];
+    participantCount: number;
+  }
+>(function LobbyStage({
   joinCode,
   joinUrl,
   joinOrigin,
   unreachable,
   participants,
   participantCount,
-}: {
-  joinCode: string | null;
-  joinUrl: string;
-  joinOrigin: string;
-  unreachable: boolean;
-  participants: Participant[];
-  participantCount: number;
-}) {
+}, ref) {
   const stageK = useStageScale();
   // Show the address phones must type, which is not necessarily this page's.
   const host = `${joinOrigin.replace(/^https?:\/\//, "")}${window.location.pathname}#/join`;
   return (
     <motion.section
+      ref={ref}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
@@ -1309,20 +1323,9 @@ function LobbyStage({
       </div>
     </motion.section>
   );
-}
+});
 
-function QuestionStage({
-  slide,
-  aggregate,
-  startedAt,
-  isQuiz,
-  revealed,
-  revealPayload,
-  revealBadgeRef,
-  timeLimit,
-  selfPaced,
-  answered,
-}: {
+type QuestionStageProps = {
   slide: CurrentSlide | null;
   aggregate: any;
   startedAt: number | null;
@@ -1338,7 +1341,20 @@ function QuestionStage({
    */
   selfPaced: boolean;
   answered: number;
-}) {
+};
+
+const QuestionStage = forwardRef<HTMLElement, QuestionStageProps>(function QuestionStage({
+  slide,
+  aggregate,
+  startedAt,
+  isQuiz,
+  revealed,
+  revealPayload,
+  revealBadgeRef,
+  timeLimit,
+  selfPaced,
+  answered,
+}, ref) {
   // Before the early return: a hook may not sit behind a condition.
   const stageK = useStageScale();
   if (!slide) return null;
@@ -1349,9 +1365,13 @@ function QuestionStage({
 
   return (
     <motion.section
+      ref={ref}
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -12 }}
+      // The leaving frame now overlaps the arriving one (popLayout above), so
+      // it gets out of the way at half the entrance: two questions legible at
+      // once for a third of a second is a worse read than one fading in.
+      exit={{ opacity: 0, y: -12, transition: { duration: 0.16, ease: [0.4, 0, 1, 1] } }}
       transition={{ duration: 0.32, ease: [0, 0, 0.2, 1] }}
       // No ceiling on either of these (see tailwind.config.js, the stage
       // ladder): the headline box capped at 280px from 1555px of height up, so
@@ -1418,7 +1438,7 @@ function QuestionStage({
       </div>
     </motion.section>
   );
-}
+});
 
 // The one place glassmorphism is allowed in the product: a floating control
 // bar that is not content and that the audience is not reading (DESIGN.md §7).

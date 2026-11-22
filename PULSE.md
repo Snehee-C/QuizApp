@@ -229,8 +229,9 @@ this document.
   the server did not ack.
 - **T3 failed on self-paced decks.** The stage ran a countdown the server
   deliberately did not arm. *Now:* an AUDIENCE deck renders no ring and says
-  so. *Still open:* the stage trails the phones by ~320 ms on every slide
-  change, so the shared clock starts before the room can read the question.
+  so. The stage no longer trails the phones on a slide change: the old frame
+  exits while the new one enters, and the question is readable ~108 ms after
+  the press instead of ~437 ms.
 - **T4 failed by inventory.** Eight non-answer targets in the thumb zone
   during a live question; the Q&A tab was a one-way door. *Now:* one pill
   while the question is live, six options fit a 375 × 667 phone without
