@@ -41,29 +41,38 @@ function reject(cb: Function | undefined, code: RejectCode, error: string) {
 // Reaction flood control: one participant may fire a handful per second, no
 // more. Without this a single held finger becomes a denial-of-service on every
 // other phone in the room.
-const REACTION_WINDOW_MS = 1000;
-const REACTION_MAX_PER_WINDOW = 5;
-const reactionBuckets = new Map<string, { count: number; resetAt: number }>();
-
-function reactionAllowed(key: string): boolean {
-  const now = Date.now();
-  // One entry per (session, participant) and nothing ever removed them, so the
-  // map was a slow accumulation of every person who had ever tapped an emoji
-  // on this process. A window that has expired carries no information, so drop
-  // the expired ones whenever the map gets large — the same sweep the join
-  // throttle already does, for the same reason.
-  if (reactionBuckets.size > 1000) {
-    for (const [k, rec] of reactionBuckets) if (now >= rec.resetAt) reactionBuckets.delete(k);
-  }
-  const b = reactionBuckets.get(key);
-  if (!b || now >= b.resetAt) {
-    reactionBuckets.set(key, { count: 1, resetAt: now + REACTION_WINDOW_MS });
+//
+// The same fixed window now guards Q&A, which had none: every `qa:ask` is a
+// row written and a personalised re-render pushed to every socket in the room,
+// so one looping phone could flood the host's moderation queue and slow the
+// live room for everybody. A person asks a few questions an hour; the limits
+// are set where no honest thumb reaches them.
+function fixedWindowLimiter(windowMs: number, max: number): (key: string) => boolean {
+  const buckets = new Map<string, { count: number; resetAt: number }>();
+  return (key) => {
+    const now = Date.now();
+    // One entry per (session, participant) and nothing ever removed them, so
+    // the map was a slow accumulation of every person who had ever tapped on
+    // this process. A window that has expired carries no information, so drop
+    // the expired ones whenever the map gets large — the same sweep the join
+    // throttle already does, for the same reason.
+    if (buckets.size > 1000) {
+      for (const [k, rec] of buckets) if (now >= rec.resetAt) buckets.delete(k);
+    }
+    const b = buckets.get(key);
+    if (!b || now >= b.resetAt) {
+      buckets.set(key, { count: 1, resetAt: now + windowMs });
+      return true;
+    }
+    if (b.count >= max) return false;
+    b.count++;
     return true;
-  }
-  if (b.count >= REACTION_MAX_PER_WINDOW) return false;
-  b.count++;
-  return true;
+  };
 }
+
+const reactionAllowed = fixedWindowLimiter(1000, 5);
+const askAllowed = fixedWindowLimiter(60_000, 5);
+const voteAllowed = fixedWindowLimiter(10_000, 20);
 
 /** Only these reach the stage — anything else is dropped rather than rendered. */
 export const ALLOWED_REACTIONS = ["heart", "fire", "clap", "laugh", "wow", "think"] as const;
@@ -166,6 +175,9 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
     ) {
       return reject(cb, "NOT_JOINED", "Join the session first");
     }
+    if (!askAllowed(`${joinCode}:${participantId}`)) {
+      return reject(cb, "RATE_LIMITED", "That's a lot of questions — give it a minute.");
+    }
     const raw = String(text ?? "").trim().slice(0, MAX_QUESTION_LEN);
     if (!raw) return reject(cb, "EMPTY_QUESTION", "Write a question first");
     // A question is read aloud and projected, so it gets the same treatment as
@@ -195,6 +207,9 @@ export function registerQaHandlers(io: Server, socket: Socket, deps: QaDeps) {
       socket.data.joinCode !== joinCode
     ) {
       return reject(cb, "NOT_JOINED", "Join the session first");
+    }
+    if (!voteAllowed(`${joinCode}:${participantId}`)) {
+      return reject(cb, "RATE_LIMITED", "Slow down a moment.");
     }
     const q = await prisma.question.findFirst({
       where: { id: questionId, sessionId: live.sessionId },

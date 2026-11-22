@@ -1,5 +1,5 @@
 import type { Server, Socket } from "socket.io";
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { prisma } from "../db.js";
 import { verifyToken } from "../auth.js";
 import {
@@ -365,15 +365,31 @@ function reject(cb: Function | undefined, code: RejectCode, error: string) {
 // SHA-256, and every later join for the seat must present the same secret.
 // The phone mints it, not the server, so there is no window between claiming
 // a seat and learning its secret: a phone that emits its join twice before the
-// first ack lands (a reconnect mid-join) sends the same secret both times. A
-// client that sends none — or one too short to be one — is given a secret the
-// server minted, in that one ack. Everything
+// first ack lands (a reconnect mid-join) sends the same secret both times.
+//
+// A join with NO secret (a phone still running the bundle from before this
+// existed — a tab left open across the deploy) neither claims a seat nor gets
+// into a claimed one. Minting it one would be worse than useless: that bundle
+// cannot store what it is handed, so its next reconnect would arrive without
+// the secret and be refused the seat the server had just locked for it. Left
+// unclaimed, it behaves exactly as it did before, until it reloads into the
+// current bundle and claims for real. Everything
 // downstream — submit, goto, Q&A — already trusts `socket.data.participantId`
 // rather than the payload, so this one gate covers them all.
 //
 // A seat with no hash on record (created before the column existed, i.e. a
 // room that was live across the deploy) is claimed by its next join: trust on
 // first use, which is exactly what the room had before, once.
+
+// Client ids are UUIDs (36 chars). The cap is generous, and it exists because
+// an id is persisted, used as a key in five maps and the join throttle, and
+// broadcast — an uncapped one is memory and rows of whatever size a frame
+// allows, rotated per join.
+const MAX_PARTICIPANT_ID_LEN = 64;
+
+function badParticipantId(participantId: unknown): boolean {
+  return typeof participantId === "string" && participantId.length > MAX_PARTICIPANT_ID_LEN;
+}
 
 const SEAT_SECRET_MIN_LEN = 32;
 const SEAT_SECRET_MAX_LEN = 128;
@@ -397,15 +413,12 @@ function seatSecretMatches(secret: unknown, storedHash: string): boolean {
   return given.length === stored.length && timingSafeEqual(given, stored);
 }
 
-type SeatCheck =
-  | { ok: true; issued?: string }
-  | { ok: false; reason: "taken" };
+type SeatCheck = { ok: true } | { ok: false; reason: "taken" };
 
 /**
- * Verify the caller holds this seat, claiming it if nobody does yet. A claim
- * adopts the caller's own secret; only when the caller sent none is one
- * minted, and then `issued` carries it — the one time a server-made secret
- * exists in plaintext, so it must go straight back in the ack.
+ * Verify the caller holds this seat, claiming it with the caller's own secret
+ * if nobody does yet. A caller with no secret passes only an unclaimed seat,
+ * and does not claim it (see "Seat secrets").
  *
  * Two phones racing to claim the same unclaimed seat both try a conditional
  * write; exactly one lands, and the loser re-reads and is verified (and
@@ -423,13 +436,12 @@ async function claimOrVerifySeat(
     if (row?.seatSecretHash) {
       return seatSecretMatches(secret, row.seatSecretHash) ? { ok: true } : { ok: false, reason: "taken" };
     }
-    const own = wellFormedSecret(secret) ? secret : null;
-    const issued = own ? undefined : randomBytes(32).toString("base64url");
-    const seatSecretHash = hashSeatSecret(own ?? issued!);
+    if (!wellFormedSecret(secret)) return { ok: true };
+    const seatSecretHash = hashSeatSecret(secret);
     if (!row) {
       try {
         await prisma.participant.create({ data: { sessionId, participantId, seatSecretHash } });
-        return { ok: true, issued };
+        return { ok: true };
       } catch (e: any) {
         // P2002: somebody created the row between our read and our write.
         if (e?.code !== "P2002") throw e;
@@ -440,7 +452,7 @@ async function claimOrVerifySeat(
       where: { sessionId, participantId, seatSecretHash: null },
       data: { seatSecretHash },
     });
-    if (count === 1) return { ok: true, issued };
+    if (count === 1) return { ok: true };
   }
   // Lost the race twice, which means the seat now has a hash we did not set.
   const row = await prisma.participant.findUnique({ where, select: { seatSecretHash: true } });
@@ -2369,6 +2381,7 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   // `participant:join` keeps every check it has — defence in depth, and the
   // QR path never comes through here at all.
   socket.on("session:peek", async ({ joinCode, participantId }, cb) => {
+    if (badParticipantId(participantId)) return reject(cb, "BAD_PARTICIPANT", "Invalid participant");
     const ip = clientIp(socket);
     if (tooManyJoinFailures(ip, participantId)) {
       return reject(cb, "RATE_LIMITED", "Too many attempts. Try again in a minute.");
@@ -2398,6 +2411,8 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
 
   // ---- Participant: join by code ----
   socket.on("participant:join", async ({ joinCode, participantId, seatSecret, name, avatar }, cb) => {
+    // Before the throttle, whose keys are built from it.
+    if (badParticipantId(participantId)) return reject(cb, "BAD_PARTICIPANT", "Invalid participant");
     const ip = clientIp(socket);
     // Checked before the code is resolved, deliberately: a throttled caller
     // must not be able to read a wrong code off the shape of the refusal.
@@ -2439,8 +2454,10 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // board, returns that player's placing.
       if (typeof participantId === "string" && participantId) {
         try {
-          const { entries, fullEntries } = await computeLeaderboard(s);
-          const mine = await holdsSeat(s.sessionId, participantId, seatSecret);
+          const [{ entries, fullEntries }, mine] = await Promise.all([
+            computeLeaderboard(s),
+            holdsSeat(s.sessionId, participantId, seatSecret),
+          ]);
           const i = mine ? fullEntries.findIndex((e) => e.participantId === participantId) : -1;
           return cb?.({
             error: "Session has ended",
@@ -2473,16 +2490,27 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       return reject(cb, "SEAT_UNVERIFIED", "Couldn't confirm your seat. Try again.");
     }
     if (!seat.ok) {
-      // Charged to this device only, like a finished room: 256 random bits are
-      // not guessable at any rate, so this is bookkeeping, not the defence —
-      // and a venue's shared IP must not pay for one confused phone.
-      recordJoinFailure(ip, participantId, false);
+      // Deliberately NOT charged to the join throttle. Its device key is
+      // `ip|participantId` — and here the participantId is the one the CALLER
+      // claimed, i.e. the victim's. Behind a venue's shared NAT, ten wrong
+      // secrets would have rate-limited the real owner out of their own seat:
+      // the protection against impersonation turned into a way to kick a
+      // named player. Nothing is lost by it, since 256 random bits are not
+      // guessable at any rate the throttle could matter to.
       return reject(cb, "SEAT_TAKEN", "That seat belongs to another device.");
     }
     // They are in. Whatever they fumbled on the way here was a fumble, so give
     // the budget back — to them and to the IP they share with the room.
     forgiveJoinFailures(ip, participantId);
     s.lastActivityAt = Date.now();
+
+    // The client's socket is an app-wide singleton, so a phone that moves
+    // from one room to another arrives here still seated in the first: still
+    // counted on that wall, still sent its slides and reveals — which the
+    // phone applied to the new room's screen. Leave it first.
+    if (socket.data.role === "participant" && socket.data.joinCode && socket.data.joinCode !== joinCode) {
+      releaseParticipant();
+    }
 
     socket.join(joinCode);
     socket.data.joinCode = joinCode;
@@ -2641,10 +2669,6 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       // by id. With this the client can switch that comparison to `pkey` and
       // the last ten bearer tokens come off the wire. See the audit note.
       myPkey: publicKeyFor(s, participantId),
-      // Present only when the server MINTED the secret: a claiming join that
-      // brought none of its own. The phone keeps it and sends it on every later
-      // join; see "Seat secrets".
-      ...(seat.issued ? { seatSecret: seat.issued } : {}),
       revealed,
       // Only ever populated once the slide is revealed, so this cannot become a
       // second path by which the answer key reaches a participant early.
@@ -3049,10 +3073,34 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
   });
 
   // ---- Disconnect ----
-  socket.on("disconnect", () => {
-    const joinCode = socket.data.joinCode;
-    const s = joinCode ? live.get(joinCode) : undefined;
-    if (!s) return;
+  // ---- Participant: walk out of the room ----
+  //
+  // "Leave" on the phone used to rely on the socket's own disconnect to take
+  // the player off the wall, but that socket is shared by the whole app and
+  // never disconnects on a route change. Same teardown a disconnect does.
+  socket.on("participant:leave", (_args: unknown, cb?: Function) => {
+    if (socket.data.role === "participant") releaseParticipant();
+    cb?.({ ok: true });
+  });
+
+  /**
+   * Take this socket out of the room it is seated in, as a participant: off
+   * the wall (if it still owns the identity), out of the broadcast room, and
+   * no longer bound to the seat, so nothing downstream will act for it.
+   * Shared by a disconnect, an explicit leave, and a join to another room.
+   */
+  function releaseParticipant() {
+    const joinCode = socket.data.joinCode as string | undefined;
+    if (!joinCode) return;
+    const s = live.get(joinCode);
+    if (s) evictIfOwner(s, joinCode);
+    socket.leave(joinCode);
+    delete socket.data.joinCode;
+    delete socket.data.role;
+    delete socket.data.participantId;
+  }
+
+  function evictIfOwner(s: LiveSession, joinCode: string) {
     // Evict only if this socket is still the one that owns the identity. A
     // player can have more than one socket alive — a second tab, a reconnect
     // whose old transport has not timed out yet — and the loser's teardown
@@ -3073,6 +3121,13 @@ export function registerSessionHandlers(io: Server, socket: Socket) {
       s.lastHeardFrom.set(pid, (socket.data.lastPacketAt as number | undefined) ?? Date.now());
       pushParticipants(io, joinCode, s);
     }
+  }
+
+  socket.on("disconnect", () => {
+    const joinCode = socket.data.joinCode;
+    const s = joinCode ? live.get(joinCode) : undefined;
+    if (!s) return;
+    evictIfOwner(s, joinCode);
     // A host window closing gives up its share of the presenter view. If it was
     // the primary, hand that title to whichever window is still open rather
     // than leaving the room with a pointer at a dead socket.

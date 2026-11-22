@@ -7,7 +7,6 @@ import {
   getParticipantId,
   getSeatSecret,
   resetParticipantId,
-  setSeatSecret,
   getSocket,
   setNickname,
 } from "../lib/socket";
@@ -439,8 +438,6 @@ export default function Play() {
       }
       setError("");
       // Issued only on the join that claimed the seat (server: "Seat secrets").
-      // Only a server that minted the secret itself sends one back.
-      if (typeof res.seatSecret === "string") setSeatSecret(res.seatSecret);
       // Before any board is applied below: `roomSawStandings` runs off this.
       // A server that predates it leaves us on the id comparison (`isMyRow`).
       myPkey.current = typeof res.myPkey === "string" ? res.myPkey : null;
@@ -1163,9 +1160,12 @@ export default function Play() {
         }}
         onLeave={() => {
           // F2: leaving is not ending. The seat is released so a reload does
-          // not re-enter a room the player walked out of; the socket's own
-          // disconnect is what takes them off the wall.
+          // not re-enter a room the player walked out of, and the server is
+          // told: the socket is the app's singleton and does not disconnect on
+          // a route change, so without this the player stayed on the wall —
+          // and kept receiving this room's slides — after walking out.
           leaveSeat();
+          getSocket().emit("participant:leave");
           navigate("/join");
         }}
       />

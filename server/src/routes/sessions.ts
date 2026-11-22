@@ -77,8 +77,14 @@ function safeParse(raw: string): any {
   }
 }
 
+// Nicknames and free-text answers are written by the audience and opened by
+// the host in Excel or Sheets, where a cell starting with = + - @ (or a tab or
+// CR, which some importers strip first) is run as a formula — a player named
+// `=HYPERLINK(...)` is a phishing link in the host's spreadsheet. A leading `'`
+// makes the spreadsheet show it as the text it is (OWASP's CSV-injection fix).
 function csvEscape(s: string): string {
-  const needsQuotes = /[",\n]/.test(s);
-  const escaped = s.replace(/"/g, '""');
+  const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+  const needsQuotes = /[",\n\r]/.test(safe);
+  const escaped = safe.replace(/"/g, '""');
   return needsQuotes ? `"${escaped}"` : escaped;
 }

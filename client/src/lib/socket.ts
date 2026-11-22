@@ -71,8 +71,7 @@ export function getSeatSecret(): string {
   return secret;
 }
 
-/** Adopt a secret — for a server that minted one (a join that sent none). */
-export function setSeatSecret(secret: string): string {
+function setSeatSecret(secret: string): string {
   // Memory first: a phone whose storage refuses the write must still survive
   // a Wi-Fi blip, and every reconnect re-joins.
   seatSecretInMemory = secret;
